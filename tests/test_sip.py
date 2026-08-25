@@ -209,3 +209,42 @@ async def test_being_unconfigured_fails_at_startup():
     with pytest.raises(CallUnreachable) as exc:
         await t.start()
     assert "not configured" in str(exc.value)
+
+
+def test_the_real_linphone_challenge_format_parses():
+    """Their actual challenge, captured from sip.linphone.org over UDP.
+
+    Kept as a fixture rather than a live call so the suite stays offline. The
+    live probe that produced it needed no account: an unauthenticated REGISTER
+    is answered with a 401 and this header.
+
+    `opaque` is the reason this test exists. linphone.org sends it, many servers
+    do not, and it has to be echoed back verbatim or the authenticated REGISTER
+    is rejected -- a failure that presents as "it just does not ring".
+    """
+    header = (
+        'Digest realm="sip.linphone.org", nonce="HFE47gAAAADyW23QAAD253sZEAsAAAAA", '
+        'opaque="+GNywA==", algorithm=MD5, qop="auth"'
+    )
+    got = parse_challenge(header)
+    assert got["realm"] == "sip.linphone.org"
+    assert got["nonce"] == "HFE47gAAAADyW23QAAD253sZEAsAAAAA"
+    assert got["opaque"] == "+GNywA=="
+    assert got["algorithm"] == "MD5"
+    assert got["qop"] == "auth"
+
+
+def test_the_authorisation_echoes_opaque_and_uses_qop():
+    # Both are required by linphone.org's challenge above. Dropping either is a
+    # silent authentication failure rather than an error.
+    t = SipTransport(user="bogdan", password="secret", domain="sip.linphone.org",
+                     peer="sip:him@sip.linphone.org")
+    header = t._authorisation(
+        'Digest realm="sip.linphone.org", nonce="abc", opaque="+GNywA==", '
+        'algorithm=MD5, qop="auth"',
+        "REGISTER", "sip:sip.linphone.org", proxy=False,
+    )
+    assert header.startswith("Authorization: Digest ")
+    assert 'opaque="+GNywA=="' in header
+    assert "qop=auth" in header and "nc=00000001" in header and "cnonce=" in header
+    assert 'username="bogdan"' in header

@@ -30,11 +30,22 @@ and `200 OK` obviously counts, though nobody is meant to answer.
 
 - **No media.** See above. If this ever needs to carry audio, the RTP and G.711
   work is in `parked/` and was written against a measured 172 ms jitter path.
-- **TLS is implemented but unverified against linphone.org.** Linphone's own
-  clients default to TLS, and their SIP service does answer on UDP, so UDP is
-  the default here because it is the one that can be smoke-tested without
-  credentials. If UDP is refused in practice, switch `transport` to `"tls"` —
-  the code path exists, it has simply never spoken to their server.
+- **UDP against the real server is VERIFIED, without an account.** An
+  unauthenticated REGISTER to `sip.linphone.org` (176.31.149.179) on UDP 5060
+  from archserver comes back as:
+
+      SIP/2.0 401
+      realm=sip.linphone.org  algorithm=MD5  qop=auth
+      nonce=...  opaque=...
+
+  So the host is reachable, it speaks UDP, and `parse_challenge` handles their
+  actual challenge — including `opaque`, which they send and many servers do
+  not, and which has to be echoed back or the second REGISTER is rejected.
+  What is still unverified is everything *after* authentication succeeds, which
+  needs an account.
+
+- **TLS is implemented and unverified.** UDP is the default precisely because it
+  is the one that could be tested without credentials, and it worked.
 - **No re-registration timer.** A ring registers immediately before inviting,
   which costs one round trip and removes an entire class of "the registration
   silently expired three hours ago" failure. Given a ring happens rarely, that
