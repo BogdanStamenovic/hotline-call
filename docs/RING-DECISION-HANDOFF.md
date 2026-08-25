@@ -145,8 +145,30 @@ Both need home wifi, so they are one sitting:
 
 ## Method note
 
-Five confident readings were wrong across three sessions today; every one was
-caught by someone other than its author, twice by the person who supplied the
-datum. All five were the same error: **a status field read as a signal without
-testing the thing the field supposedly indicates.** The fix each time was a
-control — probe it directly, or compare against a row whose answer you know.
+Six confident readings were wrong across three sessions today; nearly all were
+caught by someone other than their author. Most shared one pattern: **a status
+field read as a signal without testing the thing the field supposedly
+indicates.** Empty `Endpoints` column. A peer absent from the map that answers
+pings anyway. A capabilities-table cell. The fix each time was a **control** —
+probe it directly, or compare against a row whose answer you already know.
+
+**One was a different species and it is the dangerous one.** The "all third
+ways are dead" entry was not a misreading — it was a summary of my OWN
+incomplete work, published as a result while the parent agent was still
+running. **No control row catches that**, because there is nothing to control
+against: the claim was about the state of my own knowledge. A careful reviewer
+has no way in. Guard: before writing "we checked X and found nothing", confirm
+every agent that was checking X has actually reported.
+
+**And the damaging half was the instruction, not the finding.** A wrong entry
+is one bad fact someone trips over. **"Do not re-run this research" steers the
+next person away from the answer and looks like diligence while doing it.**
+Never attach a do-not-revisit instruction to a null result unless you can name
+who finished the search and when.
+
+Telegram was independently re-verified twice before this file was corrected —
+telethon 1.44.0 installed clean in a throwaway venv, `RequestCallRequest`
+present with params `user_id, g_a_hash, protocol, video, random_id`, plus
+`AcceptCallRequest`/`DiscardCallRequest`. Installed rather than read, precisely
+because a guessed raw-GitHub URL 404'd first and "the file is not where I
+guessed" is exactly the null that invites a false finding.
