@@ -1241,7 +1241,7 @@ class Service:
             "delivered": True,
             "queued": queued,
             "interrupted": interrupted,
-            "clientToken": client_token,
+            "client_token": client_token,
             "seq": entry,
         }
 
@@ -2007,6 +2007,12 @@ class Service:
         # "sound because this phone is the only writer" into an equality test,
         # and makes a retry after a timeout detectable as a duplicate rather
         # than delivered twice.
+        #
+        # Spelled `client_token` on the echo as well as on the row, matching
+        # §11. The roster's own additions stay camelCase because that is what
+        # the roster has always been -- `deadReason`, `blockedSince` -- and one
+        # field appearing under two spellings on two endpoints is worse than
+        # either convention.
         self._append(conversation, "you", text, client_token=client_token)
 
         key = f"ios-{conversation}"
@@ -2046,7 +2052,7 @@ class Service:
                 self._close_conversation(conversation)
 
         self.sessions[conversation] = asyncio.ensure_future(run())
-        return {"conversation": conversation, "clientToken": client_token}
+        return {"conversation": conversation, "client_token": client_token}
 
     def conversations(self) -> dict[str, Any]:
         """Everything open, newest first.
@@ -2099,7 +2105,7 @@ class Service:
         except Exception:  # the answer is delivered either way
             log.exception("could not mark %s answered", conversation)
         self._roster_waker.wake()
-        return {"conversation": conversation, "delivered": True, "clientToken": client_token}
+        return {"conversation": conversation, "delivered": True, "client_token": client_token}
 
     # ---- the live feed ---------------------------------------------------
 
