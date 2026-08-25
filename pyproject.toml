@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hotline-ios"
+version = "0.1.0"
+description = "Real ringing calls from a Claude Code session to an iPhone"
+readme = "../README.md"
+# Matches hotline's floor for the same reasons -- this process imports hotline's
+# audio stack in-process, so it has to live in the same interpreter it does.
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Bogdan Stamenovic" }]
+dependencies = []
+
+[project.optional-dependencies]
+# The ring transports. Each is optional so that a box only needs the deps for
+# the outcome it is actually running -- see docs/ARCHITECTURE.md.
+sip = []
+apns = ["cryptography>=42", "httpx[http2]>=0.27"]
+webrtc = ["aiortc>=1.9"]
+dev = [
+  "pytest>=8.0,<10",
+  "pytest-asyncio>=0.23,<2",
+  "ruff>=0.6,<1",
+  "mypy>=1.11,<3",
+]
+
+[project.scripts]
+hotline-call = "hotline_ios.call_cli:main"
+hotline-iosd = "hotline_ios.daemon:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hotline_ios"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_ignores = true
+warn_redundant_casts = true
