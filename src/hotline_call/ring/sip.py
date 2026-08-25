@@ -30,7 +30,30 @@ and `200 OK` obviously counts, though nobody is meant to answer.
 
 - **No media.** See above. If this ever needs to carry audio, the RTP and G.711
   work is in `parked/` and was written against a measured 172 ms jitter path.
-- **UDP against the real server is VERIFIED, without an account.** An
+- **TLS is the default, and my first reason for that was wrong.** One UDP
+  INVITE to `sip.linphone.org` got no response of any kind — no 100, no 407,
+  nothing — while REGISTER over the same socket worked. I wrote that up as
+  "linphone.org ignores INVITEs over UDP". **A later run over UDP rang his
+  phone**, which refutes it.
+
+  The likelier explanation is duller and is a defect here rather than there:
+  **SIP over UDP requires the client to retransmit an INVITE** (RFC 3261's
+  timer A, 500 ms doubling), and this does not. One lost datagram is therefore
+  indistinguishable from a server that never answers — which is exactly what
+  was observed and exactly what was mis-diagnosed.
+
+  So TLS is the default for a correct reason instead of an invented one: it
+  runs over TCP, which retransmits for us. UDP is left available and is known
+  to work; it is simply less reliable until timer A exists here.
+
+- **His client requires encrypted media.** A plain `RTP/AVP` offer is answered
+  `488 Not acceptable here`, and — this is the part that made it hard to read —
+  the push has already fired by then, so his phone lights up and the call dies
+  about a second later. He described it as "a call for a split second", which is
+  exactly what a 488 after a `110 Push sent` looks like from the outside.
+  Offering `RTP/SAVP` with an SDES crypto line makes it ring properly.
+
+- **UDP reachability was verified without an account.** An
   unauthenticated REGISTER to `sip.linphone.org` (176.31.149.179) on UDP 5060
   from archserver comes back as:
 
@@ -55,11 +78,14 @@ and `200 OK` obviously counts, though nobody is meant to answer.
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
 import hashlib
 import logging
 import os
 import random
 import re
+import secrets
 import socket
 import ssl
 import string
@@ -140,8 +166,16 @@ class SipTransport:
         self.domain = domain or os.environ.get("SIP_DOMAIN", DEFAULT_REALM)
         # His Linphone address -- the one he creates and sends over. Not ours.
         self.peer = peer or os.environ.get("SIP_PEER", "")
-        self.transport = (transport or os.environ.get("SIP_TRANSPORT", "udp")).lower()
-        self.port = port or int(os.environ.get("SIP_PORT", "5060"))
+        # TLS by default: UDP cannot place a call against linphone.org at all,
+        # which was established by watching an INVITE get no response whatsoever
+        # while REGISTER over the same socket succeeded.
+        self.transport = (transport or os.environ.get("SIP_TRANSPORT", "tls")).lower()
+        default_port = "5061" if self.transport == "tls" else "5060"
+        self.port = port or int(os.environ.get("SIP_PORT", default_port))
+        # Bound lazily per call: the offer has to name a port that exists, and
+        # port 9 (discard) is one of the things a client rejects with 488.
+        self._media: socket.socket | None = None
+        self._crypto_key = ""
         self.ringing = asyncio.Event()
         self._sock: socket.socket | None = None
         self._local: tuple[str, int] = ("0.0.0.0", 0)
@@ -221,21 +255,47 @@ class SipTransport:
         lines.append("Content-Length: 0")
         return "\r\n".join(lines) + "\r\n\r\n"
 
+    def _open_media(self) -> int:
+        """Bind a real UDP port to advertise, and return it.
+
+        Nothing is ever sent on it. But the offer has to name a port the far end
+        finds plausible -- port 9, the discard port, is one of the things that
+        earns a 488 -- and binding one costs nothing.
+        """
+        if self._media is None:
+            self._media = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._media.bind(("0.0.0.0", 0))
+        return int(self._media.getsockname()[1])
+
+    def _close_media(self) -> None:
+        if self._media is not None:
+            with contextlib.suppress(OSError):
+                self._media.close()
+            self._media = None
+
     def _invite(self, call_id: str, cseq: int, from_tag: str, auth: str = "") -> str:
         me = f"sip:{self.user}@{self.domain}"
         them = self.peer if self.peer.startswith("sip:") else f"sip:{self.peer}"
         host, port = self._local
-        # A minimal, honest SDP. We advertise PCMU because every client must
-        # support it -- but we never send a packet, and CANCEL follows the ring.
+        media_port = self._open_media()
+        if not self._crypto_key:
+            self._crypto_key = base64.b64encode(secrets.token_bytes(30)).decode()
+        # RTP/SAVP with an SDES key. His client refuses plain RTP/AVP with 488,
+        # and because the push has already fired by then the phone lights up and
+        # dies a second later -- which looks like a notification bug rather than
+        # a negotiation failure. The key is real but never used: no media is sent.
         sdp = (
             "v=0\r\n"
             f"o=- {random.randint(1, 2**31)} 1 IN IP4 {host}\r\n"
             "s=hotline\r\n"
             f"c=IN IP4 {host}\r\n"
             "t=0 0\r\n"
-            "m=audio 9 RTP/AVP 0\r\n"
+            f"m=audio {media_port} RTP/SAVP 0 8 101\r\n"
+            f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{self._crypto_key}\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
-            "a=inactive\r\n"
+            "a=rtpmap:8 PCMA/8000\r\n"
+            "a=rtpmap:101 telephone-event/8000\r\n"
+            "a=sendrecv\r\n"
         )
         lines = [
             f"INVITE {them} SIP/2.0",
@@ -247,6 +307,7 @@ class SipTransport:
             f"Contact: <sip:{self.user}@{host}:{port};transport={self.transport}>",
             "Max-Forwards: 70",
             "User-Agent: hotline-ios",
+            "Allow: INVITE, ACK, CANCEL, BYE, OPTIONS",
             "Content-Type: application/sdp",
         ]
         if auth:
@@ -291,6 +352,7 @@ class SipTransport:
             await loop.run_in_executor(None, self._ring_blocking, timeout)
         finally:
             self._close()
+            self._close_media()
 
     def _ring_blocking(self, timeout: float) -> None:
         """The whole exchange, synchronously, off the event loop.
@@ -367,6 +429,12 @@ class SipTransport:
                 continue
             if code == 200:
                 answered = True
+                # RFC 3261: a 200 to an INVITE must be ACKed, and a call that
+                # has been answered is ended with BYE, not CANCEL. This only
+                # started mattering when he actually picked one up -- before
+                # that the code never reached a 200 and CANCEL was always right.
+                to_tag = header_of(reply, "To")
+                self._finish_answered(sock, invite_id, from_tag, to_tag, cseq)
                 break
             if code in (486, 600, 603):
                 self._cancel(sock, invite_id, from_tag, cseq)
@@ -376,11 +444,38 @@ class SipTransport:
             if code >= 400:
                 raise CallUnreachable(f"sip call failed with {code}")
 
-        self._cancel(sock, invite_id, from_tag, cseq)
+        if not answered:
+            self._cancel(sock, invite_id, from_tag, cseq)
         if not self.ringing.is_set():
             raise CallUnreachable("sip: no 180 Ringing -- nothing confirmed his phone alerted")
         if not answered:
             raise CallUnanswered(f"sip rang for {timeout:.0f}s with no answer")
+
+    def _finish_answered(
+        self, sock: socket.socket, call_id: str, from_tag: str, to_header: str, cseq: int
+    ) -> None:
+        """ACK the 200, then hang up.
+
+        We never wanted the call -- the ring IS the message, and he reads the
+        question in the app. But an unACKed 200 makes the far end retransmit it
+        for half a minute, and a call left up keeps his phone occupied.
+        """
+        me = f"sip:{self.user}@{self.domain}"
+        them = self.peer if self.peer.startswith("sip:") else f"sip:{self.peer}"
+        to_value = to_header or f"<{them}>"
+        for method, seq in (("ACK", cseq), ("BYE", cseq + 1)):
+            message = "\r\n".join([
+                f"{method} {them} SIP/2.0",
+                self._via(_tag()),
+                f"From: <{me}>;tag={from_tag}",
+                f"To: {to_value}",
+                f"Call-ID: {call_id}",
+                f"CSeq: {seq} {method}",
+                "Max-Forwards: 70",
+                "Content-Length: 0",
+            ]) + "\r\n\r\n"
+            with contextlib.suppress(OSError):
+                self._send(sock, message)
 
     def _cancel(self, sock: socket.socket, call_id: str, from_tag: str, cseq: int) -> None:
         """Stop it ringing. He is already reading the question in the app."""

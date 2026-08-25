@@ -68,6 +68,7 @@ class FakeRegistrar(threading.Thread):
         self.saw_authenticated_register = False
         self.saw_invite = False
         self.saw_cancel = False
+        self.seen: list[str] = []
 
     def _reply(self, request, addr, status, extra=()):
         lines = [f"SIP/2.0 {status}"]
@@ -112,10 +113,16 @@ class FakeRegistrar(threading.Thread):
             elif method == "CANCEL":
                 self.saw_cancel = True
                 self._reply(request, addr, "200 OK")
+            elif method in ("ACK", "BYE"):
+                self.seen.append(method)
+                if method == "BYE":
+                    self._reply(request, addr, "200 OK")
 
     def stop(self):
         self.stop_flag.set()
         self.sock.close()
+
+    methods_seen: list = []
 
 
 @pytest.fixture
@@ -248,3 +255,61 @@ def test_the_authorisation_echoes_opaque_and_uses_qop():
     assert 'opaque="+GNywA=="' in header
     assert "qop=auth" in header and "nc=00000001" in header and "cnonce=" in header
     assert 'username="bogdan"' in header
+
+
+def test_the_offer_is_encrypted_and_names_a_real_port():
+    """What made it actually ring his phone.
+
+    A plain RTP/AVP offer is answered 488 Not acceptable here -- and because
+    linphone.org has already sent the push by then, the phone lights up and dies
+    about a second later, which reads as a notification bug rather than a
+    negotiation failure. He described exactly that before this was fixed.
+    """
+    t = SipTransport(user="bogdan", password="x", peer="sip:him@sip.linphone.org")
+    t._local = ("10.0.0.1", 5060)
+    try:
+        body = t._invite("cid", 1, "tag").split("\r\n\r\n", 1)[1]
+        media = next(line for line in body.split("\r\n") if line.startswith("m=audio"))
+        assert "RTP/SAVP" in media
+        # Port 9 is the discard port and is one of the things that earns a 488.
+        assert int(media.split()[1]) > 1024
+        assert any(line.startswith("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:")
+                   for line in body.split("\r\n"))
+        assert "a=sendrecv" in body
+    finally:
+        t._close_media()
+
+
+def test_tls_is_the_default_because_udp_has_no_retransmission_here():
+    # NOT because linphone.org ignores UDP INVITEs -- that was my first reading
+    # of one silent attempt, and a later UDP run rang his phone, refuting it.
+    # The real gap is that SIP over UDP requires the client to retransmit an
+    # INVITE (RFC 3261 timer A) and this does not, so a single lost datagram is
+    # indistinguishable from silence. TLS runs over TCP, which retransmits.
+    t = SipTransport(user="u", password="p", peer="sip:x@sip.linphone.org")
+    assert t.transport == "tls"
+    assert t.port == 5061
+    # Asking for udp still works, for probing.
+    assert SipTransport(user="u", password="p", peer="sip:x@y", transport="udp").port == 5060
+
+
+async def test_an_answered_call_is_acked_and_byed_rather_than_cancelled(registrar):
+    """RFC 3261: CANCEL is invalid once a final response has arrived.
+
+    This only started mattering the moment he actually picked one up -- until
+    then the code never reached a 200 and CANCEL was always the right thing.
+    An unACKed 200 makes the far end retransmit it for half a minute, and a call
+    left up keeps his phone occupied for a ring nobody wanted to answer.
+    """
+    registrar.invite_script = [180, 200]
+    t = transport_for(registrar)
+    await t.ring(WHO, timeout=3)
+    # The registrar polls its socket, so give it a moment to see the last
+    # datagram rather than racing it. Bounded, and it fails if BYE never comes.
+    for _ in range(50):
+        if "BYE" in registrar.seen:
+            break
+        await asyncio.sleep(0.05)
+    assert "ACK" in registrar.seen, registrar.seen
+    assert "BYE" in registrar.seen, registrar.seen
+    assert not registrar.saw_cancel
