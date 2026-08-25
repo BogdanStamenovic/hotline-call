@@ -1,0 +1,149 @@
+"""Make an unconfirmed ring an error instead of a silence.
+
+This is the requirement every option shares, and it comes from a platform fact
+neither the spec nor any of the three outcomes anticipated:
+
+**An iOS `NEPacketTunnelProvider` is suspended when the phone locks.** Apple
+Developer Forums thread 756941, answered by an Apple engineer with "100%, no" to
+whether such an extension can keep running while locked; the documented
+lifecycle is `sleepWithCompletionHandler`/`wake()`. Tailscale issues 8183, 14320
+and 334 are the same behaviour observed from outside. It is not a Tailscale bug,
+it is how iOS treats every packet tunnel.
+
+Two consequences, and the second is why this module exists:
+
+1. **The ring must never assume the tailnet is up.** When his phone is locked --
+   which is exactly when a ring matters -- the tunnel is dormant. So the
+   doorbell always leaves the tailnet, at any budget. That was true before this
+   project started and it would have been true at $99 too; paying Apple only
+   changes whose push infrastructure rings the bell.
+
+2. **Every option can fail silently, and they fail silently in different
+   places.** A keepalive socket dies on a phone reboot, a certificate expiry or
+   an audio-session interruption. A vendor push relay can start enforcing a
+   check, or drop a free tier. In all of those the call simply never arrives,
+   and the agent that placed it waits, and Bogdan is never told. **That is worse
+   than the Discord mention it replaced**, because he will have learned to trust
+   it.
+
+So: placing a call is not evidence that it rang. A transport must produce
+positive evidence -- a SIP `180 Ringing`, a push-service accept, an ack from the
+app -- and if it does not produce that evidence in time, this converts the
+silence into `CallUnreachable`, which `hotline-call` already turns into a loud
+fallback to `hotline-page`.
+
+Fails closed on purpose. A transport that never signals `ringing` is treated as
+unreachable rather than trusted, because "I could not tell" has to mean no.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import AsyncIterator, Callable
+
+from .base import CallError, CallTarget, CallUnreachable, MediaStream
+
+log = logging.getLogger("hotline-ios.ring.watch")
+
+DEFAULT_CONFIRM_WITHIN = 8.0
+"""How long a transport gets to prove the device is alerting.
+
+Generous on purpose. The path to his phone is relayed through a DERP server --
+measured at 92-623 ms with 172 ms of jitter, never once establishing a direct
+connection -- and on top of that a suspended tunnel has to be woken by inbound
+traffic before anything at all moves. Eight seconds is slow for a doorbell and
+still far quicker than the silence it replaces.
+"""
+
+
+class ConfirmedRing:
+    """Wraps any `RingTransport` and requires it to prove the phone rang.
+
+    Wrapper rather than a base class so a transport that cannot confirm needs no
+    changes to be handled correctly -- it simply never signals, and is correctly
+    reported as unreachable.
+    """
+
+    def __init__(
+        self,
+        inner: object,
+        *,
+        confirm_within: float = DEFAULT_CONFIRM_WITHIN,
+        on_degrade: Callable[[str], None] | None = None,
+    ) -> None:
+        self.inner = inner
+        self.confirm_within = confirm_within
+        self.on_degrade = on_degrade
+        self.name = f"{getattr(inner, 'name', 'unknown')}+confirmed"
+        self.rings_when_closed = bool(getattr(inner, "rings_when_closed", False))
+
+    async def start(self) -> None:
+        await self.inner.start()  # type: ignore[attr-defined]
+
+    async def stop(self) -> None:
+        await self.inner.stop()  # type: ignore[attr-defined]
+
+    def incoming(self) -> AsyncIterator[tuple[CallTarget, MediaStream]]:
+        return self.inner.incoming()  # type: ignore[attr-defined,no-any-return]
+
+    async def ring(self, target: CallTarget, *, timeout: float = 45.0) -> MediaStream:
+        ringing: asyncio.Event | None = getattr(self.inner, "ringing", None)
+        if ringing is not None:
+            ringing.clear()
+
+        attempt = asyncio.ensure_future(self.inner.ring(target, timeout=timeout))  # type: ignore[attr-defined]
+
+        if ringing is None:
+            # The transport has no way to tell us. Do not silently trust it.
+            self._degrade(f"{getattr(self.inner, 'name', '?')} cannot confirm a ring")
+            attempt.cancel()
+            raise CallUnreachable(
+                f"{getattr(self.inner, 'name', '?')} gives no ring confirmation; "
+                "refusing to report a call as delivered on no evidence"
+            )
+
+        confirmed = asyncio.ensure_future(ringing.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {attempt, confirmed},
+                timeout=self.confirm_within,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            if not confirmed.done():
+                confirmed.cancel()
+
+        # The call can legitimately finish before confirmation lands -- an
+        # instant decline, or a transport that answers in under 8 s. Either way
+        # the attempt itself is the answer and there is nothing to second-guess.
+        if attempt in done:
+            return await attempt
+
+        if not ringing.is_set():
+            attempt.cancel()
+            with_suppress = getattr(asyncio, "CancelledError")
+            try:
+                await attempt
+            except (with_suppress, CallError, Exception):
+                pass
+            self._degrade(
+                f"no ring confirmation from {getattr(self.inner, 'name', '?')} "
+                f"within {self.confirm_within:.0f}s"
+            )
+            raise CallUnreachable(
+                f"the phone never confirmed it was ringing within "
+                f"{self.confirm_within:.0f}s -- treating as undeliverable"
+            )
+
+        return await attempt
+
+    def _degrade(self, why: str) -> None:
+        # Loudly, always. A degradation nobody hears about is the failure mode
+        # this whole module exists to prevent.
+        log.warning("ring degraded: %s", why)
+        if self.on_degrade is not None:
+            try:
+                self.on_degrade(why)
+            except Exception:
+                log.exception("degrade notifier failed")

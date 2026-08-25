@@ -247,6 +247,9 @@ async def test_declined_and_unanswered_are_different_answers():
     with pytest.raises(CallDeclined):
         await declined.ring(CallTarget(device="phone"))
 
+    # An explicit short timeout: ring() defaults to 45 s and the loopback now
+    # actually waits it out, because ringing-out and never-ringing have to be
+    # distinguishable rather than collapsing into one instant exception.
     rang_out = LoopbackTransport(FMT, answer=False)
     with pytest.raises(CallUnanswered):
-        await rang_out.ring(CallTarget(device="phone"))
+        await rang_out.ring(CallTarget(device="phone"), timeout=0.05)

@@ -1,0 +1,20 @@
+[Unit]
+Description=hotline-ios SIP probe (captures what a SIP client emits in REGISTER)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/bodas/data/hotline-ios/server
+Environment=PYTHONPATH=/home/bodas/data/hotline-ios/server/src
+ExecStart=/home/bodas/data/hotline-ios/server/.venv/bin/python -m hotline_ios.sipprobe \
+  --host 100.72.2.62 --port 5060 \
+  --capture /home/bodas/data/hotline-ios/sip-capture.txt
+Restart=always
+RestartSec=5
+# The same reason hotlined has it: this must never take a tmux server -- and
+# therefore every live Claude session -- down with it. See hotline's handoff.
+KillMode=process
+
+[Install]
+WantedBy=default.target

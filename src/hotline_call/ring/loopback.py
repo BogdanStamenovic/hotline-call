@@ -40,12 +40,19 @@ class LoopbackTransport:
         decline: bool = False,
         reachable: bool = True,
         answer_delay: float = 0.0,
+        confirms: bool = True,
+        confirm_delay: float = 0.0,
     ) -> None:
         self.format = fmt or AudioFormat(rate=16_000, channels=1)
         self.answer = answer
         self.decline = decline
         self.reachable = reachable
         self.answer_delay = answer_delay
+        self.confirms = confirms
+        self.confirm_delay = confirm_delay
+        # Positive evidence the device is alerting. A real transport sets this
+        # on a SIP 180, a push-service accept, or an ack from the app.
+        self.ringing = asyncio.Event()
         self.rang: list[CallTarget] = []
         self.streams: list[QueueStream] = []
         self.started = False
@@ -63,9 +70,17 @@ class LoopbackTransport:
         self.rang.append(target)
         if not self.reachable:
             raise CallUnreachable(f"loopback: {target.device} marked unreachable")
+        if self.confirms:
+            if self.confirm_delay:
+                await asyncio.sleep(self.confirm_delay)
+            self.ringing.set()
         if self.decline:
             raise CallDeclined("loopback: declined")
         if not self.answer:
+            # Rang out. Deliberately waits, because the whole point of the
+            # confirmation wrapper is that ringing-out and never-ringing are
+            # different answers and must not collapse into one timeout.
+            await asyncio.sleep(min(timeout, 3600.0))
             raise CallUnanswered(f"loopback: rang out after {timeout:.0f}s")
         if self.answer_delay:
             await asyncio.sleep(self.answer_delay)
