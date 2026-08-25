@@ -160,7 +160,7 @@ class Service:
         """
         try:
             return Store()
-        except Exception as exc:  # noqa: BLE001 - see docstring
+        except Exception as exc:  # see docstring
             log.exception("could not open the store; running without persistence")
             self.degradations.append(
                 f"store unavailable ({type(exc).__name__}: {exc}); "
@@ -177,7 +177,7 @@ class Service:
         """
         try:
             rows = self.store.conversations(limit=200)
-        except Exception:  # noqa: BLE001 - a cold index beats a dead daemon
+        except Exception:  # a cold index beats a dead daemon
             log.exception("could not hydrate conversations from the store")
             return
         cutoff = time.time() - HYDRATE_WINDOW
@@ -192,7 +192,7 @@ class Service:
             for stored in self.store.conversation_tail(str(row["id"])):
                 events.adopt(Entry(seq=stored.seq, kind=stored.kind, text=stored.text,
                                    tool=stored.tool, at=stored.at))
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.exception("could not read conversation %s back", row["id"])
         if row["closed_at"] is not None:
             events.closed = True
@@ -215,7 +215,7 @@ class Service:
             return existing
         try:
             row = self.store.conversation(conversation)
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.exception("could not look up conversation %s", conversation)
             return None
         return self._load_channel(row) if row is not None else None
@@ -250,7 +250,7 @@ class Service:
                 agent, kind, text, conversation_id=conversation, tool=tool, at=at
             )
             entry = Entry(seq=stored.seq, kind=kind, text=text, tool=tool, at=at)
-        except Exception as exc:  # noqa: BLE001 - a full disk must not drop his question
+        except Exception as exc:  # a full disk must not drop his question
             log.exception("could not persist %s event on %s", kind, conversation)
             self.degradations.append(f"event not persisted ({type(exc).__name__}: {exc})")
             seq = (events.latest + 1) if events is not None else 1
@@ -335,7 +335,7 @@ class Service:
                 conversation, name, kind, opened_at=opened,
                 waiting_since=opened if kind == "ring" else None,
             )
-        except Exception as exc:  # noqa: BLE001 - the ring matters more than the record
+        except Exception as exc:  # the ring matters more than the record
             log.exception("could not persist conversation %s", conversation)
             self.degradations.append(
                 f"conversation not persisted ({type(exc).__name__}: {exc})"
@@ -358,7 +358,7 @@ class Service:
                 if agent:
                     self._waker(agent).wake()
                     self._roster_waker.wake()
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.exception("could not close conversation %s in the store", conversation)
 
     def _resolve_transport(self, requested: str) -> Any:
@@ -475,7 +475,7 @@ class Service:
             from hotline.agents import Registry
 
             return Registry().by_name(agent)
-        except Exception:  # noqa: BLE001 - hotline may not be installed at all
+        except Exception:  # hotline may not be installed at all
             log.exception("could not look %s up in the registry", agent)
             return None
 
@@ -506,7 +506,7 @@ class Service:
                 )
             else:
                 self.store.ensure_agent(name)
-        except Exception:  # noqa: BLE001 - annotation is not worth losing a call over
+        except Exception:  # annotation is not worth losing a call over
             log.exception("could not record agent %s", name)
         return name
 
@@ -568,20 +568,25 @@ class Service:
 
     # ---- delegation: what the app is actually for -------------------------
 
-    def agents(self) -> dict[str, Any]:
-        """Who is alive, what each is working on, and which are busy.
+    def _roster_rows(self) -> list[dict[str, Any]]:
+        """Every agent hotline knows about, annotated with what this daemon knows.
 
         Reads hotline's registry and cross-references live sessions, because a
         registry record outlives the process it describes -- a name in the file
         is not evidence anything is running, and showing him a dead agent to
         talk to is worse than showing him none.
+
+        Liveness is computed here, per request, and is not cached anywhere. That
+        is stronger than a heartbeat interval, not weaker: `discover()`
+        re-validates the pid's start time and the control socket every time, so
+        a crashed process reads as gone immediately rather than after a poll.
         """
         try:
             from hotline.agents import Registry
             from hotline.ccsocks import discover
         except Exception:
             log.exception("registry unavailable")
-            return {"agents": []}
+            return []
 
         live: dict[str, Any] = {}  # session_id -> whatever discover() yields
         try:
@@ -590,31 +595,322 @@ class Service:
         except Exception:
             log.exception("could not enumerate live sessions")
 
+        try:
+            registry = Registry()
+            records = list(registry.agents.values())
+        except Exception:
+            log.exception("could not read the registry")
+            records = []
+
+        try:
+            annotations = {row["name"]: row for row in self.store.agents()}
+            blocked = self.store.blocked_since()
+        except Exception:
+            log.exception("could not read agent annotations")
+            annotations, blocked = {}, {}
+
+        now = time.time()
         out: list[dict[str, Any]] = []
-        for agent in Registry().working():
-            session = live.get(agent.session_id)
-            out.append({
-                "name": agent.name,
-                "task": agent.task,
-                "cwd": str(getattr(session, "cwd", "") or ""),
-                "live": session is not None,
-                "busy": bool(getattr(session, "status", "") == "busy"),
-            })
+        declared: set[str] = set()
+        for record in records:
+            declared.add(str(record.session_id))
+            out.append(self._roster_row(
+                str(record.name), str(record.task or ""), live.get(record.session_id),
+                completed_at=record.completed_at, annotations=annotations,
+                blocked=blocked, now=now,
+            ))
         # Live sessions that never declared themselves are still worth talking
         # to -- his own shells, mostly -- so they are listed under their derived
         # name rather than hidden because they skipped a registration step.
-        declared = {a.session_id for a in Registry().working()}
         for session_id, session in live.items():
             if session_id in declared:
                 continue
-            out.append({
-                "name": str(getattr(session, "name", "") or session_id[:8]),
-                "task": "",
-                "cwd": str(getattr(session, "cwd", "") or ""),
-                "live": True,
-                "busy": bool(getattr(session, "status", "") == "busy"),
-            })
-        return {"agents": out}
+            name = str(getattr(session, "name", "") or session_id[:8])
+            out.append(self._roster_row(
+                name, "", session, completed_at=None, annotations=annotations,
+                blocked=blocked, now=now,
+            ))
+        return out
+
+    def _roster_row(
+        self,
+        name: str,
+        task: str,
+        session: Any,
+        *,
+        completed_at: float | None,
+        annotations: dict[str, Any],
+        blocked: dict[str, float],
+        now: float,
+    ) -> dict[str, Any]:
+        annotation = annotations.get(name) or {}
+        busy = bool(getattr(session, "status", "") == "busy")
+        live = session is not None
+        last_tool_at = annotation.get("last_tool_at")
+
+        # Four states, and the two that used to be indistinguishable are the
+        # point: a clean finish and a crash both just vanished identically.
+        # `completed_at` is set by `done` and only by `done`, so it outranks
+        # liveness -- an agent that said it was finished and is still winding
+        # down is finished, not idle.
+        if completed_at is not None:
+            state, dead_reason = "done", "finished and said so"
+        elif live and busy:
+            state, dead_reason = "working", None
+        elif live:
+            state, dead_reason = "idle", None
+        else:
+            state, dead_reason = "dead", "its process is gone and it never said done"
+
+        # Never claimed without evidence. `last_tool_at` is None until something
+        # has actually been observed doing a tool call, and an unobserved agent
+        # is not a stalled one -- `busy` is the session's own word for itself
+        # and is exactly what goes stale when a process hangs.
+        stalled = bool(
+            state == "working"
+            and last_tool_at is not None
+            and now - float(last_tool_at) > STALL_AFTER
+        )
+
+        blocked_since = blocked.get(name)
+        return {
+            "name": name,
+            "task": task,
+            "cwd": str(getattr(session, "cwd", "") or annotation.get("cwd") or ""),
+            "live": live,
+            "busy": busy,
+            # Everything below is additive. The app on his phone decodes the
+            # five fields above and ignores the rest, which is what makes this
+            # shippable without a reinstall on a 7-day provisioning profile.
+            "state": state,
+            "deadReason": dead_reason,
+            "stalled": stalled,
+            "lastToolAt": last_tool_at,
+            "blocked": blocked_since is not None,
+            "blockedSince": blocked_since,
+            "retired": annotation.get("retired_at") is not None,
+            "historyGeneration": int(annotation.get("history_generation") or 0),
+        }
+
+    def _note_roster_changes(self, rows: list[dict[str, Any]]) -> None:
+        """Record what changed since the last time anyone looked.
+
+        A tick is an invalidation, not a fact: it tells a client its cached row
+        is stale and nothing more. So a duplicate tick costs one refetch and is
+        not worth machinery to prevent -- which is why `retire` and `purge` can
+        emit their own without coordinating with this.
+        """
+        snapshot = {
+            row["name"]: {field: row[field] for field in ROSTER_FIELDS} for row in rows
+        }
+        previous = self._roster_snapshot
+        self._roster_snapshot = snapshot
+        if previous is None:
+            # First computation of this process. There is nothing to compare
+            # against, and ticking every agent as "changed" on every restart
+            # would make a restart look like the whole box changed at once.
+            return
+        for name, current in snapshot.items():
+            was = previous.get(name)
+            if was is None:
+                self._tick(name, "appeared")
+            elif was != current:
+                self._tick(name, ", ".join(
+                    f"{field}: {was[field]} -> {current[field]}"
+                    for field in ROSTER_FIELDS if was[field] != current[field]
+                ))
+        for name in previous:
+            if name not in snapshot:
+                self._tick(name, "gone")
+
+    def _tick(self, agent: str, what: str) -> None:
+        try:
+            self.store.append_roster_event(agent, what)
+        except Exception:  # a missed tick costs a stale row, not data
+            log.exception("could not record a roster change for %s", agent)
+            return
+        self._roster_waker.wake()
+
+    def agents(self, *, include_done: bool = False, include_retired: bool = False
+               ) -> dict[str, Any]:
+        """Who is alive, what each is working on, and which are busy.
+
+        The default list is exactly what it has always been -- hotline's working
+        agents plus undeclared live sessions -- because the app installed on his
+        phone renders whatever this returns. Agents that finished, and agents he
+        has retired, are new and are therefore opt-in: they are extra ROWS, and
+        "the response is unchanged, the fields are additive" does not cover
+        quietly filling his list with corpses.
+
+        A done agent whose process is somehow still alive is never hidden. That
+        is the one case worth seeing without asking.
+        """
+        rows = self._roster_rows()
+        self._note_roster_changes(rows)
+        return {"agents": [
+            row for row in rows
+            if (include_done or row["state"] != "done" or row["live"])
+            and (include_retired or not row["retired"])
+        ]}
+
+    def _is_live(self, agent: str) -> bool:
+        return any(row["name"] == agent and row["live"] for row in self._roster_rows())
+
+    # ---- the agent-scoped channel ----------------------------------------
+
+    def _known_agent(self, agent: str) -> str:
+        """Resolve a name, or 404. Same reasoning as `/api/v1/events`' bad call_id.
+
+        An empty feed for a name that does not exist reads to a client exactly
+        like an agent that has said nothing, and the first is a bug in the
+        caller while the second is normal.
+        """
+        from hotline.httpd import HttpError
+
+        name = str(agent or "").strip()
+        if not name:
+            raise HttpError(400, "agent is required")
+        if self._registry_record(name) is not None:
+            return self.resolve_agent(name)
+        try:
+            if self.store.agent(name) is not None:
+                return name
+        except Exception:
+            log.exception("could not look up agent %s", name)
+        raise HttpError(404, f"no agent {name}")
+
+    async def agent_feed(self, agent: str, since: int, wait: float) -> dict[str, Any]:
+        """The live channel for one agent, over the one global sequence.
+
+        Same cursor and long-poll semantics as `/api/v1/events`, which is kept
+        untouched beside it. The difference is what it is scoped to: a ring's
+        Q&A, a delegated `say` and eventually hook-reported tool events all
+        arrive here interleaved and ordered by `seq`, because conversation has
+        stopped being a display concept.
+        """
+        name = self._known_agent(agent)
+        waker = self._waker(name)
+        deadline = time.monotonic() + min(wait, MAX_WAIT)
+        found = self.store.since(name, since)
+        while not found and time.monotonic() < deadline:
+            await waker.sleep(deadline - time.monotonic())
+            found = self.store.since(name, since)
+        return {
+            "agent": name,
+            "events": [event.as_agent_json() for event in found],
+            "cursor": found[-1].seq if found else since,
+            # A channel is closed when its agent is not running. There is no
+            # per-conversation close here to inherit -- the channel outlives
+            # every conversation in it -- so this is the honest end-of-stream
+            # signal, and it is recomputed rather than remembered.
+            "closed": not self._is_live(name),
+            "historyGeneration": self.store.history_generation(name),
+        }
+
+    def history(self, agent: str, before: int | None, limit: int) -> dict[str, Any]:
+        """A page of an agent's past, walking backwards from `before`.
+
+        `before` is exclusive and is the `oldest_seq` of the page you already
+        have, so paging has no off-by-one at either end and meets the live feed
+        exactly once at the other.
+        """
+        name = self._known_agent(agent)
+        events, has_more = self.store.history(name, before=before, limit=limit)
+        return {
+            "agent": name,
+            "events": [event.as_agent_json() for event in events],
+            "oldest_seq": events[0].seq if events else None,
+            "newest_seq": events[-1].seq if events else None,
+            "has_more": has_more,
+            "historyGeneration": self.store.history_generation(name),
+        }
+
+    async def roster_events(self, since: int, wait: float) -> dict[str, Any]:
+        """Wake the phone when the agent list stops being true.
+
+        The stale-list fix. `ContentView` refreshes from `.task` and
+        `.refreshable` only, and `.task` runs once per `Store` identity -- so a
+        foregrounded app shows whatever was true when it launched.
+
+        This long-poll recomputes the roster itself on each pass rather than
+        reading a cache some background loop maintains. There is no such loop by
+        design: liveness is a per-request check, and making the waiting client
+        be the thing that performs it means the cost exists only while somebody
+        is actually listening.
+        """
+        deadline = time.monotonic() + min(wait, MAX_WAIT)
+        while True:
+            self._note_roster_changes(self._roster_rows())
+            found = self.store.roster_since(since)
+            left = deadline - time.monotonic()
+            if found or left <= 0:
+                break
+            await self._roster_waker.sleep(min(ROSTER_POLL, left))
+        return {
+            "events": [
+                {"seq": event.seq, "agent": event.agent_name,
+                 "text": event.text, "at": event.at}
+                for event in found
+            ],
+            "cursor": found[-1].seq if found else since,
+        }
+
+    # ---- retention: a curated deletion surface, not a policy --------------
+
+    def retire(self, agent: str, retired: bool) -> dict[str, Any]:
+        """Visibility only. Reversible, destroys nothing, orthogonal to liveness.
+
+        An agent can be live and retired at once -- retiring is him saying he
+        does not want to look at it, not him saying it is finished.
+        """
+        name = self._known_agent(agent)
+        at = self.store.set_retired(name, retired)
+        self._tick(name, f"retired: {at is not None}")
+        return {"agent": name, "retired": at is not None, "retiredAt": at}
+
+    def purge(
+        self,
+        agent: str,
+        *,
+        scope: str = "history",
+        conversation_id: str | None = None,
+        before_seq: int | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Real `DELETE`. See `store.Store.purge` for what each filter means.
+
+        `dry_run` returns the same counts without touching anything, so the
+        confirmation sheet can read "hotline-80 -- 340 events since Aug 12"
+        rather than a generic warning about data loss.
+
+        One thing to know about `scope="everything"`: hotline's `Registry`, not
+        this store, owns agent identity. Dropping the agents row removes every
+        event, phase and conversation of that agent's and resets its history
+        generation, but if hotline still has the record the next roster
+        computation will recreate an empty annotation row under the same name.
+        What `everything` guarantees is that nothing of the history survives,
+        which is what "delete their fields" asks for.
+        """
+        from hotline.httpd import HttpError
+
+        name = self._known_agent(agent)
+        try:
+            result = self.store.purge(
+                name, scope=scope, conversation_id=conversation_id,
+                before_seq=before_seq, dry_run=dry_run,
+            )
+        except ValueError as exc:
+            raise HttpError(400, str(exc)) from exc
+        if not dry_run:
+            for conversation in list(self.calls):
+                if self.store.conversation(conversation) is None:
+                    self.calls.pop(conversation, None)
+                    self.call_opened.pop(conversation, None)
+                    self.call_agent.pop(conversation, None)
+            # The client's only signal that its whole local cache for this agent
+            # is now a lie. A purge reaches the phone within one roster wake.
+            self._tick(name, f"historyGeneration: {result['history_generation']}")
+        return result
 
     async def say(self, text: str, agent: str | None) -> dict[str, Any]:
         """Send him a turn's worth of instruction and follow the reply.
@@ -646,7 +942,7 @@ class Service:
                     # `stalled` mean something.
                     try:
                         self.store.set_last_tool_at(name, time.time())
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         log.exception("could not record a tool call for %s", name)
 
             try:
@@ -713,7 +1009,7 @@ class Service:
             # He answered, so nothing is blocked on him here any more --
             # whatever else happens to the conversation afterwards.
             self.store.mark_answered(conversation)
-        except Exception:  # noqa: BLE001 - the answer is delivered either way
+        except Exception:  # the answer is delivered either way
             log.exception("could not mark %s answered", conversation)
         self._roster_waker.wake()
         return {"conversation": conversation, "delivered": True}
@@ -798,7 +1094,20 @@ def build_server(service: Service, host: str, port: int) -> Any:
     async def health(request: Any) -> tuple[int, dict[str, Any]]:
         fake = bool(getattr(service.transport, "is_fake", False))
         service.reap()
+        # Checked here, now, not remembered from boot. `db_ok` reports a query
+        # that just ran; a database that has since gone read-only or had its
+        # disk fill has to read as not-ok or this endpoint is lying in exactly
+        # the way it exists to stop.
+        stats = service.store.stats()
+        if not stats["db_ok"]:
+            # Into the field that is actually read, not just a boolean nobody
+            # has written a client for yet. Deduped against the last entry
+            # because /health is polled and this list is unbounded.
+            note = f"store not readable: {stats.get('db_error', 'unknown')}"
+            if not service.degradations or service.degradations[-1] != note:
+                service.degradations.append(note)
         return 200, {
+            **stats,
             # NOT ok when the doorbell is fake. A health check that reports ok
             # while the pager rings nothing is the exact failure this endpoint
             # exists to catch, and it reported ok:true for 2.5 hours.
@@ -832,7 +1141,60 @@ def build_server(service: Service, host: str, port: int) -> Any:
     @server.route("POST", "/api/v1/agents")
     async def agents(request: Any) -> tuple[int, dict[str, Any]]:
         service.authorise(request)
-        return 200, service.agents()
+        body = request.json() or {}
+        return 200, service.agents(
+            include_done=bool(body.get("include_done", False)),
+            include_retired=bool(body.get("include_retired", False)),
+        )
+
+    @server.route("POST", "/api/v1/agents/feed")
+    async def agent_feed(request: Any) -> tuple[int, dict[str, Any]]:
+        service.authorise(request)
+        body = request.json()
+        return 200, await service.agent_feed(
+            str(body.get("agent", "")), int(body.get("since", 0)),
+            float(body.get("wait", 25)),
+        )
+
+    @server.route("POST", "/api/v1/agents/history")
+    async def agent_history(request: Any) -> tuple[int, dict[str, Any]]:
+        service.authorise(request)
+        body = request.json()
+        before = body.get("before")
+        return 200, service.history(
+            str(body.get("agent", "")),
+            int(before) if before is not None else None,
+            int(body.get("limit", 100)),
+        )
+
+    @server.route("POST", "/api/v1/agents/roster-events")
+    async def roster_events(request: Any) -> tuple[int, dict[str, Any]]:
+        service.authorise(request)
+        body = request.json() or {}
+        return 200, await service.roster_events(
+            int(body.get("since", 0)), float(body.get("wait", 25))
+        )
+
+    @server.route("POST", "/api/v1/agents/retire")
+    async def retire(request: Any) -> tuple[int, dict[str, Any]]:
+        service.authorise(request)
+        body = request.json()
+        if "retired" not in body:
+            raise HttpError(400, "retired is required; send it explicitly rather than toggling")
+        return 200, service.retire(str(body.get("agent", "")), bool(body["retired"]))
+
+    @server.route("POST", "/api/v1/agents/purge")
+    async def purge(request: Any) -> tuple[int, dict[str, Any]]:
+        service.authorise(request)
+        body = request.json()
+        before = body.get("before_seq")
+        return 200, service.purge(
+            str(body.get("agent", "")),
+            scope=str(body.get("scope", "history")),
+            conversation_id=str(body["conversation_id"]) if body.get("conversation_id") else None,
+            before_seq=int(before) if before is not None else None,
+            dry_run=bool(body.get("dry_run", False)),
+        )
 
     @server.route("POST", "/api/v1/say")
     async def say(request: Any) -> tuple[int, dict[str, Any]]:
