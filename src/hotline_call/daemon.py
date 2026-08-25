@@ -33,6 +33,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from . import ingest
+from .endpoint import DEFAULT_HOST, DEFAULT_PORT, LOOPBACK, bind_hosts, local_url
 from .events import Entry, EventLog, Waker
 from .ingest import Ingested
 from .ring.base import (
@@ -46,9 +47,6 @@ from .store import UNATTRIBUTED, Store
 
 log = logging.getLogger("hotline-iosd")
 
-DEFAULT_PORT = 8789
-"""One past hotlined's 8788, so the two are obviously siblings."""
-
 MAX_WAIT = 30.0
 TURN_TIMEOUT = 900.0
 """Ceiling on a long-poll. Under most proxy and NAT idle timeouts."""
@@ -60,6 +58,12 @@ The same hour `reap()` keeps them for, so a restart lands in the state the
 process would have been in anyway. Anything older is still in the database and
 still reachable through `/api/v1/agents/history`; this is only about what is
 warm."""
+
+PING_PATH = "/api/v1/ping"
+"""A route that answers and does nothing else, so `/health` can verify local
+reachability without recursing into itself or moving any counter."""
+
+HOOK_PATH = "/api/v1/hook"
 
 ROSTER_POLL = 3.0
 """How often a parked `roster-events` waiter recomputes the roster.
@@ -180,7 +184,66 @@ class Service:
         # None until the first roster computation. A restart must not tick every
         # agent as "changed" just because it has nothing to compare against.
         self._roster_snapshot: dict[str, dict[str, Any]] | None = None
+        # Where this process is actually listening, filled in by `build_server`.
+        # `/health` verifies the local URL rather than remembering that it was
+        # configured, because the two disagreed once and nothing noticed.
+        self.listen_hosts: list[str] = []
+        self.listen_port = DEFAULT_PORT
         self._hydrate()
+
+    # ---- where this daemon can be reached --------------------------------
+
+    def bound_to(self, hosts: Sequence[str], port: int) -> None:
+        self.listen_hosts = list(hosts)
+        self.listen_port = int(port)
+
+    @property
+    def hook_url(self) -> str:
+        """The URL local tooling -- the hook, the statusline wrapper -- must use.
+
+        Read off the port actually being served rather than off a constant, so
+        this cannot report an address the daemon is not on.
+        """
+        return local_url(HOOK_PATH, self.listen_port)
+
+    async def reachable_locally(self, timeout: float = 2.0) -> tuple[bool, str]:
+        """Can something on this box actually reach us on the hook's URL?
+
+        A real request over TCP, made now. Not a boot-time memory and not a
+        reading of the bind list -- the failure this exists to catch is exactly
+        the one where the configuration says one thing and the socket says
+        another.
+
+        It targets `/api/v1/ping` rather than `/health` so that health checking
+        itself does not recurse, and so the probe stays cheap enough to run on
+        every poll.
+        """
+        host, port = LOOPBACK, self.listen_port
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout
+            )
+        except (TimeoutError, OSError) as exc:
+            return False, f"{host}:{port} is not accepting connections ({exc})"
+        try:
+            headers = f"GET {PING_PATH} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+            if self.api_key:
+                headers += f"X-Hotline-Key: {self.api_key}\r\n"
+            writer.write((headers + "Connection: close\r\n\r\n").encode())
+            await asyncio.wait_for(writer.drain(), timeout)
+            status = await asyncio.wait_for(reader.readline(), timeout)
+        except (TimeoutError, OSError) as exc:
+            return False, f"{host}:{port} accepted a connection but did not answer ({exc})"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+        line = status.decode("latin-1", "replace").strip()
+        if " 200 " not in line:
+            return False, f"{host}:{port}{PING_PATH} answered {line!r}"
+        return True, ""
 
     # ---- the store -------------------------------------------------------
 
@@ -1347,10 +1410,25 @@ def _last_from_him(session: Any) -> str:
     return ""
 
 
-def build_server(service: Service, host: str, port: int) -> Any:
+def build_server(service: Service, host: str | Sequence[str], port: int) -> Any:
     from hotline.httpd import HttpError, Server
 
-    server = Server(host, port, log=lambda message: log.info("%s", message))
+    # Loopback is added here rather than at the call site so no caller can build
+    # a server this box cannot reach. See `endpoint.py`: the hook fired into a
+    # closed port for as long as that was possible, and said nothing.
+    hosts = bind_hosts(host) if isinstance(host, str) else list(host)
+    server = Server(hosts, port, log=lambda message: log.info("%s", message))
+    service.bound_to(hosts, port)
+
+    @server.route("GET", PING_PATH)
+    async def ping(request: Any) -> tuple[int, dict[str, Any]]:
+        """Answer, and nothing else.
+
+        Deliberately not behind `authorise`: its entire job is to prove that a
+        local caller can reach this port, and a probe that could fail for a
+        second reason would not answer the question it exists to answer.
+        """
+        return 200, {"ok": True}
 
     @server.route("GET", "/health")
     async def health(request: Any) -> tuple[int, dict[str, Any]]:
@@ -1361,6 +1439,15 @@ def build_server(service: Service, host: str, port: int) -> Any:
         # disk fill has to read as not-ok or this endpoint is lying in exactly
         # the way it exists to stop.
         stats = service.store.stats()
+        # Verified now, over a real connection. The hook is built to fail
+        # silently -- blanket except, always exit 0, a backoff marker -- so an
+        # unreachable URL produces no error anywhere and the map just quietly
+        # stops filling. This is the only place that can notice.
+        hook_ok, hook_why = await service.reachable_locally()
+        if not hook_ok:
+            note = f"local callers cannot reach {service.hook_url}: {hook_why}"
+            if not service.degradations or service.degradations[-1] != note:
+                service.degradations.append(note)
         if not stats["db_ok"]:
             # Into the field that is actually read, not just a boolean nobody
             # has written a client for yet. Deduped against the last entry
@@ -1382,6 +1469,11 @@ def build_server(service: Service, host: str, port: int) -> Any:
             "transports_available": sorted(service.links),
             "active_calls": service.open_calls(),
             "conversations_held": len(service.calls),
+            "listening_on": [f"{h}:{service.listen_port}" for h in service.listen_hosts],
+            # The URL the hook and the statusline wrapper are pointed at, and
+            # whether a request to it just now actually worked.
+            "hook_url": service.hook_url,
+            "hook_reachable": hook_ok,
             # The map's own honesty fields. `unattributed_hook_events` counts
             # nudges dropped because nothing matched the session -- never filed
             # under a guess -- and `ingest_stalled` names the agents whose
@@ -1598,7 +1690,11 @@ def build_links(names: Sequence[str], *, confirm_within: float = 8.0,
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="hotline-iosd")
-    parser.add_argument("--host", default=os.environ.get("HOTLINE_IOS_HOST", "100.72.2.62"))
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("HOTLINE_IOS_HOST", DEFAULT_HOST),
+        help="the address his phone dials; loopback is always bound as well",
+    )
     parser.add_argument(
         "--port", type=int, default=int(os.environ.get("HOTLINE_IOS_PORT", DEFAULT_PORT))
     )

@@ -597,3 +597,79 @@ async def test_a_conversation_is_filed_under_the_agent_that_opened_it():
         assert [e.seq for e in events] == sorted(e.seq for e in events)
     finally:
         await server.close()
+
+
+# ---- reachable from this box, not only from his phone ----------------------
+#
+# The daemon bound the tailnet address alone and the map hook was pointed at
+# loopback. The hook is built to fail silently -- blanket except, always exit 0,
+# a backoff marker file -- so every nudge died into a closed port and nothing on
+# either side said a word. These pin the two halves of the fix: the bind, and
+# the only thing that can notice when it is wrong again.
+
+
+async def test_the_daemon_is_reachable_on_loopback_as_well_as_its_own_address():
+    """`0.0.0.0` would also have fixed the hook. It would also have put a shell
+    with bypassed permissions on whatever wifi this machine is on."""
+    from hotline_ios.endpoint import LOOPBACK
+
+    service = Service(LoopbackTransport(), FakePool())
+    # 127.0.0.2 stands in for the tailnet address: a second loopback-range
+    # address that exists on any Linux box, so the test binds two real sockets
+    # without depending on tailscale being up.
+    server = build_server(service, "127.0.0.2", 18830)
+    await server.start()
+    try:
+        assert server.hosts == ["127.0.0.2", LOOPBACK]
+        assert await asyncio.to_thread(get, 18830, "/api/v1/ping") == {"ok": True}
+        on_tailnet = await asyncio.to_thread(
+            lambda: json.loads(
+                urllib.request.urlopen("http://127.0.0.2:18830/api/v1/ping", timeout=10).read()
+            )
+        )
+        assert on_tailnet == {"ok": True}
+    finally:
+        await server.close()
+
+
+async def test_health_verifies_the_hook_url_rather_than_remembering_it():
+    service = Service(LoopbackTransport(), FakePool())
+    server = await run_server(service, 18831)
+    try:
+        body = await asyncio.to_thread(get, 18831, "/health")
+        assert body["hook_url"] == "http://127.0.0.1:18831/api/v1/hook"
+        assert body["hook_reachable"] is True
+        assert "127.0.0.1:18831" in body["listening_on"]
+        assert not [d for d in body["degradations"] if "cannot reach" in d]
+    finally:
+        await server.close()
+
+
+async def test_an_unreachable_hook_url_is_a_degradation_not_silence():
+    """The whole point. A hook pointed at a closed port is invisible everywhere
+    else by design, so this is the one surface that can report it."""
+    service = Service(LoopbackTransport(), FakePool())
+    server = await run_server(service, 18832)
+    try:
+        # Serving on 18832, but claiming the hook is told about a port nothing
+        # is listening on -- exactly the shape the real defect had.
+        service.listen_port = 18833
+        body = await asyncio.to_thread(get, 18832, "/health")
+        assert body["hook_reachable"] is False
+        assert body["hook_url"] == "http://127.0.0.1:18833/api/v1/hook"
+        assert any("cannot reach" in d for d in body["degradations"]), body["degradations"]
+    finally:
+        await server.close()
+
+
+async def test_the_hook_installer_and_the_daemon_agree_on_the_url():
+    """They were two independent constants that happened to disagree. This fails
+    if anyone writes the address down a second time."""
+    from hotline_ios import hooks
+    from hotline_ios.endpoint import local_url
+
+    assert hooks.DEFAULT_URL == local_url(hooks.HOOK_PATH)
+
+    service = Service(LoopbackTransport(), FakePool())
+    service.bound_to(["100.72.2.62", "127.0.0.1"], 8789)
+    assert service.hook_url == local_url(hooks.HOOK_PATH, 8789)
