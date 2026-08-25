@@ -272,12 +272,45 @@ supposed to make this impossible **does not exist there**. No `.xip` needed,
 and **no Apple ID download needed** — which is the decision I had warned him
 might come back. It probably does not.
 
-### Next move, in order
-1. Re-run `sdk build "$XCODE" <output-dir> --arch x86_64` — one positional and
-   one flag away from an artifact.
-2. Assert on the **artifact**, not the exit code. Step 5 failing on
-   `test -n "$BUNDLE"` is the only reason the no-op was ever caught; keep that
-   deliberately rather than by accident.
-3. Plan B (tar the ~925 MB subtree) stays as the fallback and is cheap.
+### STATUS AS OF 19:12 — THE SDK IS BUILT. DO NOT REBUILD IT.
 
-I have queued nothing and touched nothing in your repo but this file.
+Run **32887877859**, success. Verified by data-89 from the run log, not relayed:
+
+    4. Build the Darwin SDK for Linux    success
+    5. Package the SDK                   success
+    6. upload-artifact                   success
+
+    command:  xtool sdk build "$XCODE" out --arch x86_64     <- arch CORRECT
+    output :  out/darwin.artifactbundle/
+                swift-sdk.json  toolset.json  info.json
+                Developer/Platforms  Developer/Toolchains
+    artifact: name "darwin-sdk"  805,160,094 bytes  (771M tar.gz)
+
+Both hard-won lessons are already IN the workflow — you did not lose them:
+`--arch x86_64` explicit (auto would have silently built arm64 for an x86_64
+box), and the step asserts on the **artifact** rather than the exit code, with
+the reason written beside it.
+
+### Next move, in order — everything above this line is DONE
+
+1. **Download the `darwin-sdk` artifact to archserver** and install it into the
+   *Linux* xtool. `gh run download 32887877859 -R BogdanStamenovic/darwin-sdk-build`.
+2. **Compile something.** Until a binary comes out the far end, "the toolchain
+   works" is a claim, not a fact. The SDK existing is necessary, not sufficient.
+3. Only then is the throwaway repo safe to delete — the artifact lives under it.
+4. Plan B (tar the ~925 MB subtree) is now unnecessary. Do not spend time on it.
+
+### Also still true, post-compaction
+
+- **His phone RINGS.** SIP/Linphone doorbell confirmed twice on the handset,
+  both directions (`180`->`200` answered, `486` declined). Done. Do not redo.
+- **Telegram doorbell is built and unstarted** — still needs `api_id`,
+  `api_hash` and the second account's number from him. `tg-login` is written
+  and tested (`send`/`code`/`pass`/`whoami`/`ringtest`).
+- **Voice is scrapped but DELETE NOTHING** — his word was "stop investing in
+  it". The Siri Shortcut path is explicitly KEPT and is a different thing from
+  the Discord/Whisper/Piper pipeline.
+- **`baresip` is installed** on the box, approved by him, kept only as a
+  known-good SIP client to diff against while the UDP retransmit defect
+  (missing RFC 3261 timer A) is open. It should be removed once nobody needs
+  it; that is data-89's to clean up.
