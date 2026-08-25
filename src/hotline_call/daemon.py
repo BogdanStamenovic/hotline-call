@@ -324,6 +324,47 @@ class Service:
         self.sessions[conversation] = asyncio.ensure_future(run())
         return {"conversation": conversation}
 
+    def conversations(self) -> dict[str, Any]:
+        """Everything open, newest first.
+
+        The app needs this because a ring opens a conversation on the SERVER --
+        the phone was not involved and has no id for it. Without this the
+        question is sitting there and the app cannot find it, which is exactly
+        what happened the first time this was run end to end.
+        """
+        out: list[dict[str, Any]] = []
+        for conversation, events in self.calls.items():
+            entries = list(events.entries)
+            if not entries:
+                continue
+            asked = next((e for e in entries if e.kind == "claude"), entries[0])
+            answered = any(e.kind == "you" for e in entries)
+            out.append({
+                "conversation": conversation,
+                "opened": entries[0].at,
+                "asked": asked.text,
+                "answered": answered,
+                "closed": events.closed,
+                "waiting": not answered and not events.closed,
+            })
+        out.sort(key=lambda row: row["opened"], reverse=True)
+        return {"conversations": out}
+
+    async def reply(self, conversation: str, text: str) -> dict[str, Any]:
+        """His answer to a question a ring opened.
+
+        Distinct from `say`, which starts a new conversation with an agent. This
+        one lands in an existing conversation and is what unblocks the agent
+        waiting on `hotline-call`.
+        """
+        from hotline.httpd import HttpError
+
+        events = self.calls.get(conversation)
+        if events is None:
+            raise HttpError(404, f"no conversation {conversation}")
+        events.append("you", text, at=time.time())
+        return {"conversation": conversation, "delivered": True}
+
     # ---- the live feed ---------------------------------------------------
 
     async def feed(self, call_id: str, since: int, wait: float) -> dict[str, Any]:
@@ -441,6 +482,21 @@ def build_server(service: Service, host: str, port: int) -> Any:
         agent = body.get("agent")
         return 200, await service.say(text, str(agent) if agent else None)
 
+    @server.route("POST", "/api/v1/conversations")
+    async def conversations(request: Any) -> tuple[int, dict[str, Any]]:
+        service.authorise(request)
+        return 200, service.conversations()
+
+    @server.route("POST", "/api/v1/reply")
+    async def reply(request: Any) -> tuple[int, dict[str, Any]]:
+        service.authorise(request)
+        body = request.json()
+        conversation = str(body.get("conversation", ""))
+        text = str(body.get("text", "")).strip()
+        if not conversation or not text:
+            raise HttpError(400, "conversation and text are required")
+        return 200, await service.reply(conversation, text)
+
     @server.route("POST", "/api/v1/hangup")
     async def hangup(request: Any) -> tuple[int, dict[str, Any]]:
         service.authorise(request)
@@ -464,20 +520,100 @@ def build_server(service: Service, host: str, port: int) -> Any:
     return server
 
 
+def build_transport(names: Sequence[str], *, confirm_within: float = 8.0) -> Any:
+    """Assemble the doorbell from a list of names, in order.
+
+    "We will do both" is his instruction, and this is what makes it a
+    configuration rather than a fork: `HOTLINE_IOS_RING=telegram,sip` and the
+    chain falls through from one to the next. Each link is wrapped in
+    `ConfirmedRing` individually rather than the chain as a whole, because the
+    chain can only fall through on evidence -- wrapping the outside would let a
+    silent failure inside look like success.
+    """
+    from .ring.chain import RingChain
+    from .ring.watch import ConfirmedRing
+
+    links: list[Any] = []
+    for name in names:
+        name = name.strip().lower()
+        if not name:
+            continue
+        if name == "telegram":
+            from .ring.telegram import TelegramTransport
+
+            links.append(TelegramTransport())
+        elif name == "loopback":
+            from .ring.loopback import LoopbackTransport
+
+            links.append(LoopbackTransport())
+        else:
+            raise SystemExit(
+                f"hotline-iosd: unknown ring transport {name!r}; "
+                "known: telegram, loopback"
+            )
+    if not links:
+        raise SystemExit("hotline-iosd: no ring transport configured; set HOTLINE_IOS_RING")
+    wrapped = [ConfirmedRing(link, confirm_within=confirm_within) for link in links]
+    return wrapped[0] if len(wrapped) == 1 else RingChain(wrapped)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="hotline-iosd")
-    parser.add_argument("--host", default=os.environ.get("HOTLINE_IOS_HOST", "127.0.0.1"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("HOTLINE_IOS_PORT", DEFAULT_PORT)))
-    parser.add_argument("--transport", default=os.environ.get("HOTLINE_IOS_TRANSPORT", "loopback"))
+    parser.add_argument("--host", default=os.environ.get("HOTLINE_IOS_HOST", "100.72.2.62"))
+    parser.add_argument(
+        "--port", type=int, default=int(os.environ.get("HOTLINE_IOS_PORT", DEFAULT_PORT))
+    )
+    parser.add_argument(
+        "--ring",
+        default=os.environ.get("HOTLINE_IOS_RING", "telegram"),
+        help="comma-separated doorbells, tried in order (telegram, loopback)",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout
     )
-    log.warning(
-        "starting with transport=%s -- no ring transport is chosen yet; see docs/ARCHITECTURE.md",
-        args.transport,
+
+    from hotline.config import load_env
+    from hotline.pool import SessionPool
+
+    load_env()
+    transport = build_transport(args.ring.split(","))
+    allow = {
+        ip.strip()
+        for ip in os.environ.get("HOTLINE_ALLOW_IPS", "").split(",")
+        if ip.strip()
+    }
+    service = Service(
+        transport,
+        SessionPool(),
+        allow_ips=allow,
+        api_key=os.environ.get("HOTLINE_API_KEY", ""),
     )
+
+    async def run() -> None:
+        try:
+            await transport.start()
+        except Exception as exc:
+            # Do NOT die. The daemon still serves the app, the agent list and the
+            # transcript feed without a working doorbell -- and a ringer that
+            # cannot start is exactly the thing that should be visible on
+            # /health rather than fatal at boot.
+            log.error("ring transport did not start: %s", exc)
+            service.degradations.append(str(exc))
+        server = build_server(service, args.host, args.port)
+        await server.start()
+        log.info(
+            "hotline-iosd on %s:%d, ring=%s, rings_when_closed=%s",
+            args.host, args.port, getattr(transport, "name", "?"),
+            getattr(transport, "rings_when_closed", False),
+        )
+        await server.serve_forever()
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        return 0
     return 0
 
 

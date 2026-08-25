@@ -324,3 +324,75 @@ async def test_dismissing_a_conversation_closes_it_and_is_idempotent():
         assert page["closed"] is True
     finally:
         await server.close()
+
+
+def test_the_doorbell_is_assembled_from_a_list_in_order():
+    # "We will do both" as a configuration rather than a fork.
+    from hotline_ios.daemon import build_transport
+
+    one = build_transport(["loopback"])
+    assert one.name == "loopback+confirmed"
+
+    both = build_transport(["loopback", "loopback"])
+    assert "+" in both.name and len(both.links) == 2
+
+
+def test_each_link_is_confirmed_individually_not_the_chain_as_a_whole():
+    # Wrapping the outside would let a silent failure inside look like success,
+    # and the chain can only fall through on evidence.
+    from hotline_ios.daemon import build_transport
+    from hotline_ios.ring.watch import ConfirmedRing
+
+    chain = build_transport(["loopback", "loopback"])
+    assert all(isinstance(link, ConfirmedRing) for link in chain.links)
+
+
+def test_an_unknown_or_empty_doorbell_is_refused_at_startup():
+    from hotline_ios.daemon import build_transport
+
+    with pytest.raises(SystemExit):
+        build_transport(["carrier-pigeon"])
+    with pytest.raises(SystemExit):
+        build_transport([""])
+
+
+async def test_the_app_can_find_a_question_it_did_not_open():
+    """The gap found by running it: a ring opens a conversation on the SERVER.
+
+    The phone was not involved and has no id for it, so without a listing the
+    question sits there and the app cannot find it.
+    """
+    service = Service(LoopbackTransport(), FakePool())
+    server = await run_server(service, 18808)
+    try:
+        await asyncio.to_thread(
+            post, 18808, "/api/v1/call",
+            {"reason": "may I spend money", "source": "the ios build", "wait": False})
+
+        listing = await asyncio.to_thread(post, 18808, "/api/v1/conversations", {})
+        rows = listing["conversations"]
+        assert len(rows) == 1
+        assert rows[0]["waiting"] is True
+        assert "the ios build: may I spend money" in rows[0]["asked"]
+
+        await asyncio.to_thread(
+            post, 18808, "/api/v1/reply",
+            {"conversation": rows[0]["conversation"], "text": "yes, go ahead"})
+
+        after = await asyncio.to_thread(post, 18808, "/api/v1/conversations", {})
+        assert after["conversations"][0]["answered"] is True
+        assert after["conversations"][0]["waiting"] is False
+    finally:
+        await server.close()
+
+
+async def test_replying_to_a_conversation_that_does_not_exist_is_a_404():
+    service = Service(LoopbackTransport(), FakePool())
+    server = await run_server(service, 18809)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            await asyncio.to_thread(
+                post, 18809, "/api/v1/reply", {"conversation": "nope", "text": "hi"})
+        assert exc.value.code == 404
+    finally:
+        await server.close()
