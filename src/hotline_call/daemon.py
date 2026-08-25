@@ -32,7 +32,6 @@ import uuid
 from collections.abc import Sequence
 from typing import Any
 
-from .call import CallSession, TurnEvent
 from .events import EventLog
 from .ring.base import (
     CallDeclined,
@@ -97,9 +96,21 @@ class Service:
             if supplied != self.api_key:
                 raise HttpError(401, "bad or missing X-Hotline-Key")
 
-    # ---- placing a call --------------------------------------------------
+    # ---- ringing him ------------------------------------------------------
 
     async def place(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Ring him, then wait for him to answer in the app.
+
+        This is `hotline-page`'s contract kept intact across a change of
+        doorbell. The ring is a Telegram call; the *answer* comes back through
+        the app, as a typed reply into the conversation this opens. So a blocked
+        agent still gets his words on stdout and does not need to know that the
+        thing which rang and the thing he replied in are different programs.
+
+        The alternative -- ring and exit, and let the reply arrive as an
+        injected message -- would have quietly broken every caller that does
+        `answer=$(hotline-call ...)`, which is all of them.
+        """
         reason = str(body.get("reason", "")).strip()
         if not reason:
             from hotline.httpd import HttpError
@@ -114,83 +125,61 @@ class Service:
             caller_id=str(body.get("source", "Claude")),
         )
         ring_timeout = float(body.get("ring_timeout", 45.0))
-        # A hard ceiling on the whole call, separate from the ring timeout.
-        # Without it a call nobody hangs up blocks the HTTP request forever --
-        # which is exactly what happened the first time this ran against a
-        # transport that never closes its own stream.
-        max_seconds = float(body.get("timeout", 900.0))
+        reply_timeout = float(body.get("timeout", 900.0))
         wait = bool(body.get("wait", True))
 
-        call_id = uuid.uuid4().hex[:12]
+        conversation = uuid.uuid4().hex[:12]
         events = EventLog()
-        self.calls[call_id] = events
-        events.append("state", "ringing", at=time.time())
+        self.calls[conversation] = events
+        # Put the question in the conversation before ringing, so that whenever
+        # he opens the app -- during the ring, or an hour later -- it is already
+        # there and he never answers a phone to silence.
+        events.append("claude", f"{target.caller_id}: {reason}", at=time.time())
+        if str(body.get("context", "")):
+            events.append("summary", str(body["context"])[:1200], at=time.time())
         began = time.monotonic()
 
         try:
-            stream = await self.transport.ring(target, timeout=ring_timeout)
+            await self.transport.ring(target, timeout=ring_timeout)
         except CallDeclined as exc:
             events.append("state", "declined", at=time.time())
             events.close()
-            return self._outcome(call_id, "declined", began, str(exc))
+            return self._outcome(conversation, "declined", began, str(exc))
         except CallUnanswered as exc:
+            # It rang and he did not pick up. The conversation stays OPEN: he
+            # may well open the app five minutes later, and closing it here
+            # would throw away the question he is about to answer.
             events.append("state", "unanswered", at=time.time())
-            events.close()
-            return self._outcome(call_id, "unanswered", began, str(exc))
+            return self._outcome(conversation, "unanswered", began, str(exc))
         except (CallUnreachable, CallError) as exc:
-            # The loud part. A ring that never landed must be visible here, not
-            # only in the caller's exit code.
             self.degradations.append(str(exc))
-            log.warning("call %s undeliverable: %s", call_id, exc)
+            log.warning("call %s undeliverable: %s", conversation, exc)
             events.append("error", str(exc), at=time.time())
             events.close()
-            return self._outcome(call_id, "unreachable", began, str(exc))
-
-        session = CallSession(
-            pool=self.pool,
-            transcriber=self.transcriber,
-            speaker=self.speaker,
-            stream=stream,
-            target=target,
-            key=f"ios-{call_id}",
-            segmenter_factory=self.segmenter_factory,
-            speakable=_speakable(),
-            origin_factory=lambda: _origin(target),
-            on_event=lambda event: self._record(events, event),
-        )
-        # Bind the conversation to a specific agent before the first turn, so
-        # "call hotline-80" reaches hotline-80 rather than whatever is newest.
-        if target.agent:
-            await self._bind(f"ios-{call_id}", target.agent)
-
-        self.sessions[call_id] = session
-        runner = asyncio.ensure_future(session.run())
-        # Announce why the phone rang. Without this he answers to silence and
-        # has to ask, which on a spoken channel costs a whole turn.
-        opening = f"{target.caller_id} here. {reason}"
-        await session.say(opening)
-        events.append("said", opening, at=time.time())
+            return self._outcome(conversation, "unreachable", began, str(exc))
 
         if not wait:
-            return self._outcome(call_id, "ringing", began, "not waiting")
+            return self._outcome(conversation, "ringing", began, "not waiting")
 
-        detail = ""
-        try:
-            await asyncio.wait_for(runner, timeout=max_seconds)
-        except (TimeoutError, asyncio.TimeoutError):
-            # End it rather than leaking the call and the request together.
-            detail = f"call exceeded {max_seconds:.0f}s and was ended"
-            log.warning("call %s: %s", call_id, detail)
-            events.append("error", detail, at=time.time())
-            await session.hangup()
-            runner.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await runner
-        self.sessions.pop(call_id, None)
-        reply = _last_from_him(session)
-        events.close()
-        state = "answered" if reply else "ended"
-        return self._outcome(call_id, state, began, detail, reply, session)
+        reply = await self._await_reply(events, reply_timeout)
+        if not reply:
+            return self._outcome(conversation, "unanswered", began,
+                                 f"rang, but nothing came back within {reply_timeout:.0f}s")
+        return self._outcome(conversation, "answered", began, "", reply)
+
+    async def _await_reply(self, events: EventLog, timeout: float) -> str:
+        """Block until he types something in the app, or time runs out."""
+        deadline = time.monotonic() + timeout
+        cursor = events.latest
+        while time.monotonic() < deadline:
+            found = await events.wait(cursor, min(20.0, deadline - time.monotonic()))
+            for entry in found:
+                cursor = max(cursor, entry.seq)
+                if entry.kind == "you":
+                    return entry.text
+            if events.closed:
+                break
+        return ""
 
     async def _bind(self, key: str, agent: str) -> None:
         try:
@@ -207,9 +196,6 @@ class Service:
             # of the named one. Worth logging, never worth dropping the call.
             log.exception("could not bind %s to %s", key, agent)
 
-    def _record(self, events: EventLog, event: TurnEvent) -> None:
-        events.append(event.kind, event.text, event.tool, event.at)
-
     def _outcome(
         self,
         call_id: str,
@@ -217,10 +203,10 @@ class Service:
         began: float,
         detail: str = "",
         reply: str = "",
-        session: Any = None,
     ) -> dict[str, Any]:
         out: dict[str, Any] = {
             "call_id": call_id,
+            "conversation": call_id,
             "state": state,
             "reply": reply,
             "detail": detail,
@@ -228,25 +214,23 @@ class Service:
             "transport": getattr(self.transport, "name", "?"),
             "rings_when_closed": bool(getattr(self.transport, "rings_when_closed", False)),
         }
-        if session is not None:
-            out["transcript"] = [{"who": who, "text": text} for who, text in session.transcript]
         return out
 
     async def hang_up(self, call_id: str) -> dict[str, Any]:
-        """End a call from the phone's side.
+        """Dismiss a conversation from the phone's side.
 
         Idempotent, and a missing call is not an error: the app can send this
         after the far end has already ended, and turning that race into a 404
         would make the phone show a failure for something that worked.
         """
-        session = self.sessions.pop(call_id, None)
+        pending = self.sessions.pop(call_id, None)
+        if pending is not None:
+            pending.cancel()
         events = self.calls.get(call_id)
-        if session is not None:
-            await session.hangup()
         if events is not None and not events.closed:
             events.append("state", "ended", at=time.time())
             events.close()
-        return {"call_id": call_id, "ended": session is not None}
+        return {"call_id": call_id, "ended": events is not None}
 
     # ---- delegation: what the app is actually for -------------------------
 

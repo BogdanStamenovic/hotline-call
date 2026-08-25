@@ -28,16 +28,9 @@ what he was declining.
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import Callable
 
-from .base import (
-    CallDeclined,
-    CallError,
-    CallTarget,
-    CallUnanswered,
-    CallUnreachable,
-    MediaStream,
-)
+from .base import CallDeclined, CallError, CallTarget, CallUnanswered, CallUnreachable
 
 log = logging.getLogger("hotline-ios.ring.chain")
 
@@ -90,24 +83,14 @@ class RingChain:
             except Exception:
                 log.exception("transport %s failed to stop", getattr(link, "name", "?"))
 
-    def incoming(self) -> AsyncIterator[tuple[CallTarget, MediaStream]]:
-        # Inbound belongs to the first transport that offers it; merging several
-        # would need a policy for which one owns a call he places, and there is
-        # no evidence yet about what that policy should be.
-        for link in self.links:
-            incoming = getattr(link, "incoming", None)
-            if incoming is not None:
-                return incoming()  # type: ignore[no-any-return]
-        raise CallUnreachable("no transport in the chain accepts incoming calls")
-
-    async def ring(self, target: CallTarget, *, timeout: float = 45.0) -> MediaStream:
+    async def ring(self, target: CallTarget, *, timeout: float = 45.0) -> None:
         self.used = None
         failures: list[str] = []
 
         for index, link in enumerate(self.links):
             name = str(getattr(link, "name", f"link{index}"))
             try:
-                stream = await link.ring(target, timeout=timeout)  # type: ignore[attr-defined]
+                await link.ring(target, timeout=timeout)  # type: ignore[attr-defined]
             except CallDeclined:
                 # An answer, not a failure. Stop here.
                 self.used = name
@@ -134,7 +117,7 @@ class RingChain:
                 self.used = name
                 if index:
                     log.warning("rang via %s after %d failed: %s", name, index, "; ".join(failures))
-                return stream
+                return
 
         raise CallUnreachable(
             "every way of reaching him failed -- " + "; ".join(failures)

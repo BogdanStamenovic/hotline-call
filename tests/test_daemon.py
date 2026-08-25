@@ -19,7 +19,7 @@ hotline_httpd = pytest.importorskip(
 )
 
 from hotline_ios.daemon import Service, build_server
-from hotline_ios.ring.base import AudioFormat, CallTarget
+from hotline_ios.ring.base import CallTarget
 from hotline_ios.ring.loopback import LoopbackTransport
 from hotline_ios.ring.watch import ConfirmedRing
 
@@ -41,7 +41,6 @@ class OneShotSegmenter:
         if self.seen == 1:
             yield Utterance(mono, 1.0)
 
-FMT = AudioFormat(rate=16_000, channels=1, frame_ms=20)
 
 
 class Reply:
@@ -87,7 +86,7 @@ async def run_server(service, port):
 
 
 async def test_health_reports_whether_the_ring_survives_a_locked_phone():
-    service = Service(LoopbackTransport(FMT), FakePool())
+    service = Service(LoopbackTransport(), FakePool())
     server = await run_server(service, 18790)
     try:
         body = await asyncio.to_thread(get, 18790, "/health")
@@ -101,7 +100,7 @@ async def test_health_reports_whether_the_ring_survives_a_locked_phone():
 
 
 async def test_an_undeliverable_ring_is_reported_loudly_not_silently():
-    inner = LoopbackTransport(FMT, confirms=False, answer=False)
+    inner = LoopbackTransport(confirms=False, answer=False)
     service = Service(ConfirmedRing(inner, confirm_within=0.2), FakePool())
     server = await run_server(service, 18791)
     try:
@@ -116,7 +115,7 @@ async def test_an_undeliverable_ring_is_reported_loudly_not_silently():
 
 
 async def test_declined_is_not_reported_as_a_failure():
-    service = Service(LoopbackTransport(FMT, decline=True), FakePool())
+    service = Service(LoopbackTransport(decline=True), FakePool())
     server = await run_server(service, 18792)
     try:
         body = await asyncio.to_thread(post, 18792, "/api/v1/call", {"reason": "ping"})
@@ -126,49 +125,76 @@ async def test_declined_is_not_reported_as_a_failure():
         await server.close()
 
 
-async def test_a_full_call_answers_and_returns_what_he_said():
-    transport = LoopbackTransport(FMT)
-    pool = FakePool()
-    speaker = FakeSpeaker()
-    service = Service(transport, pool, transcriber=FakeTranscriber(), speaker=speaker,
-                      segmenter_factory=OneShotSegmenter)
-    server = await run_server(service, 18793)
+async def test_the_question_is_waiting_in_the_app_before_it_even_rings():
+    # He must never answer a phone to silence. Whether he opens the app during
+    # the ring or an hour later, the question is already there.
+    service = Service(LoopbackTransport(), FakePool())
+    server = await run_server(service, 18804)
+    try:
+        body = await asyncio.to_thread(
+            post, 18804, "/api/v1/call",
+            {"reason": "may I spend money on a UI agency", "source": "the ios build",
+             "wait": False})
+        page = await asyncio.to_thread(
+            post, 18804, "/api/v1/events",
+            {"call_id": body["conversation"], "since": 0, "wait": 0})
+        asked = [e for e in page["events"] if e["kind"] == "claude"]
+        assert asked and "the ios build: may I spend money" in asked[0]["text"]
+    finally:
+        await server.close()
+
+
+async def test_ringing_out_leaves_the_conversation_open_for_him():
+    # It rang and he did not pick up. He may open the app five minutes later,
+    # and closing the conversation here would throw away the question he is
+    # about to answer.
+    service = Service(LoopbackTransport(answer=False), FakePool())
+    server = await run_server(service, 18805)
+    try:
+        body = await asyncio.to_thread(
+            post, 18805, "/api/v1/call", {"reason": "ping", "ring_timeout": 0.05}, 20)
+        assert body["state"] == "unanswered"
+        page = await asyncio.to_thread(
+            post, 18805, "/api/v1/events",
+            {"call_id": body["conversation"], "since": 0, "wait": 0})
+        assert page["closed"] is False
+    finally:
+        await server.close()
+
+
+async def test_his_reply_in_the_app_comes_back_on_hotline_calls_stdout():
+    """The contract that must survive a change of doorbell.
+
+    Telegram rings; he answers by typing in the app. A blocked agent still gets
+    his words back, and does not need to know those are two different programs.
+    """
+    service = Service(LoopbackTransport(), FakePool())
+    server = await run_server(service, 18806)
     try:
         async def caller():
             return await asyncio.to_thread(
-                post, 18793, "/api/v1/call",
-                {"reason": "may I spend money on a UI agency", "source": "the ios build"})
+                post, 18806, "/api/v1/call",
+                {"reason": "may I spend money", "timeout": 20}, 40)
 
         task = asyncio.create_task(caller())
-        # Wait for the transport to have a stream, then talk into it.
+        # Find the conversation the ring opened, then answer it as the app would.
         for _ in range(200):
-            if transport.streams:
+            if service.calls:
                 break
             await asyncio.sleep(0.01)
-        stream = transport.streams[0]
-        stream.feed(b"\x10\x00" * 320)
-        for _ in range(300):
-            if pool.asked:
-                break
-            await asyncio.sleep(0.01)
-        await stream.close()
-        body = await asyncio.wait_for(task, timeout=15)
+        conversation = next(iter(service.calls))
+        await asyncio.sleep(0.1)
+        service.calls[conversation].append("you", "yes, go ahead", at=0.0)
 
+        body = await asyncio.wait_for(task, timeout=30)
         assert body["state"] == "answered"
-        assert body["reply"] == "yes go ahead"
-        assert {"who": "claude", "text": "nothing is on fire"} in body["transcript"]
-        # He must hear WHY the phone rang, or he answers to silence.
-        assert any("the ios build here" in s for s in speaker.said), speaker.said
-        # And the turn must be labelled as spoken, because a mishearing on a
-        # bypassPermissions session has no undo.
-        _key, _text, origin = pool.asked[0]
-        assert origin is not None and getattr(origin, "kind", "") == "voice"
+        assert body["reply"] == "yes, go ahead"
     finally:
         await server.close()
 
 
 async def test_the_event_feed_replays_from_a_cursor_without_loss():
-    transport = LoopbackTransport(FMT)
+    transport = LoopbackTransport()
     service = Service(transport, FakePool(), transcriber=FakeTranscriber(), speaker=FakeSpeaker())
     server = await run_server(service, 18794)
     try:
@@ -193,7 +219,7 @@ async def test_the_event_feed_replays_from_a_cursor_without_loss():
 
 
 async def test_a_bad_call_id_is_404_not_an_empty_feed():
-    service = Service(LoopbackTransport(FMT), FakePool())
+    service = Service(LoopbackTransport(), FakePool())
     server = await run_server(service, 18795)
     try:
         with pytest.raises(urllib.error.HTTPError) as exc:
@@ -207,7 +233,7 @@ async def test_a_bad_call_id_is_404_not_an_empty_feed():
 async def test_loopback_is_always_allowed_even_with_an_allowlist_set():
     # A blocked agent runs on THIS box, and must not be locked out of the phone
     # by the allowlist that exists to keep everyone else out.
-    service = Service(LoopbackTransport(FMT), FakePool(),
+    service = Service(LoopbackTransport(), FakePool(),
                       transcriber=FakeTranscriber(), speaker=FakeSpeaker(),
                       allow_ips={"100.108.255.28"})
     server = await run_server(service, 18796)
@@ -215,48 +241,6 @@ async def test_loopback_is_always_allowed_even_with_an_allowlist_set():
         body = await asyncio.to_thread(
             post, 18796, "/api/v1/call", {"reason": "x", "wait": False})
         assert body["state"] == "ringing"
-    finally:
-        await server.close()
-
-
-async def test_a_call_nobody_hangs_up_is_ended_rather_than_leaked():
-    # Found by running it: place() waited on the call forever, so a transport
-    # that never closes its stream blocked the HTTP request indefinitely.
-    service = Service(LoopbackTransport(FMT), FakePool(),
-                      transcriber=FakeTranscriber(), speaker=FakeSpeaker())
-    server = await run_server(service, 18797)
-    try:
-        body = await asyncio.to_thread(
-            post, 18797, "/api/v1/call", {"reason": "hello", "timeout": 0.5}, 20)
-        assert body["state"] == "ended"
-        assert "exceeded" in body["detail"]
-        assert body["waited_seconds"] < 10
-    finally:
-        await server.close()
-
-
-async def test_the_phone_can_hang_up_and_doing_it_twice_is_not_an_error():
-    # The app can send this after the far end already ended -- turning that race
-    # into a 404 would show him a failure for something that worked.
-    transport = LoopbackTransport(FMT)
-    service = Service(transport, FakePool(), transcriber=FakeTranscriber(),
-                      speaker=FakeSpeaker(), segmenter_factory=OneShotSegmenter)
-    server = await run_server(service, 18798)
-    try:
-        body = await asyncio.to_thread(
-            post, 18798, "/api/v1/call", {"reason": "status", "wait": False})
-        call_id = body["call_id"]
-        assert call_id in service.sessions
-
-        first = await asyncio.to_thread(post, 18798, "/api/v1/hangup", {"call_id": call_id})
-        assert first["ended"] is True
-        second = await asyncio.to_thread(post, 18798, "/api/v1/hangup", {"call_id": call_id})
-        assert second["ended"] is False       # idempotent, still a 200
-
-        feed = await asyncio.to_thread(
-            post, 18798, "/api/v1/events", {"call_id": call_id, "since": 0, "wait": 0})
-        assert feed["closed"] is True
-        assert any(e["kind"] == "state" and e["text"] == "ended" for e in feed["events"])
     finally:
         await server.close()
 
@@ -269,7 +253,7 @@ async def test_delegating_returns_a_conversation_and_the_answer_arrives_on_the_f
     network handover.
     """
     pool = FakePool()
-    service = Service(LoopbackTransport(FMT), pool)
+    service = Service(LoopbackTransport(), pool)
     server = await run_server(service, 18801)
     try:
         sent = await asyncio.to_thread(
@@ -299,7 +283,7 @@ async def test_delegating_returns_a_conversation_and_the_answer_arrives_on_the_f
 
 
 async def test_saying_nothing_is_a_400():
-    service = Service(LoopbackTransport(FMT), FakePool())
+    service = Service(LoopbackTransport(), FakePool())
     server = await run_server(service, 18802)
     try:
         with pytest.raises(urllib.error.HTTPError) as exc:
@@ -313,10 +297,30 @@ async def test_the_agent_list_survives_a_missing_registry():
     # It reads hotline's registry and live sessions; neither is guaranteed to be
     # there, and an empty list is a far better answer than a 500 on the one
     # screen he opens first.
-    service = Service(LoopbackTransport(FMT), FakePool())
+    service = Service(LoopbackTransport(), FakePool())
     server = await run_server(service, 18803)
     try:
         body = await asyncio.to_thread(post, 18803, "/api/v1/agents", {})
         assert isinstance(body["agents"], list)
+    finally:
+        await server.close()
+
+
+async def test_dismissing_a_conversation_closes_it_and_is_idempotent():
+    # He can dismiss a question he is not going to answer. Doing it twice is a
+    # 200, not a 404 -- the app can send it just after the agent gave up, and
+    # turning that race into a failure shows him an error for something that
+    # worked.
+    service = Service(LoopbackTransport(), FakePool())
+    server = await run_server(service, 18807)
+    try:
+        body = await asyncio.to_thread(
+            post, 18807, "/api/v1/call", {"reason": "ping", "wait": False})
+        conversation = body["conversation"]
+        await asyncio.to_thread(post, 18807, "/api/v1/hangup", {"call_id": conversation})
+        await asyncio.to_thread(post, 18807, "/api/v1/hangup", {"call_id": conversation})
+        page = await asyncio.to_thread(
+            post, 18807, "/api/v1/events", {"call_id": conversation, "since": 0, "wait": 0})
+        assert page["closed"] is True
     finally:
         await server.close()

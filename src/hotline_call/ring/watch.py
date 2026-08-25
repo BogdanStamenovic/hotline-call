@@ -57,9 +57,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import Callable
 
-from .base import CallError, CallTarget, CallUnreachable, MediaStream
+from .base import CallError, CallTarget, CallUnreachable
 
 log = logging.getLogger("hotline-ios.ring.watch")
 
@@ -101,10 +101,7 @@ class ConfirmedRing:
     async def stop(self) -> None:
         await self.inner.stop()  # type: ignore[attr-defined]
 
-    def incoming(self) -> AsyncIterator[tuple[CallTarget, MediaStream]]:
-        return self.inner.incoming()  # type: ignore[attr-defined,no-any-return]
-
-    async def ring(self, target: CallTarget, *, timeout: float = 45.0) -> MediaStream:
+    async def ring(self, target: CallTarget, *, timeout: float = 45.0) -> None:
         ringing: asyncio.Event | None = getattr(self.inner, "ringing", None)
         if ringing is not None:
             ringing.clear()
