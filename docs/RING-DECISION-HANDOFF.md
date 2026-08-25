@@ -86,15 +86,47 @@ at home it should go direct at single-digit ms.
   **Unfetchable** by two sessions — serves a JS shell containing none of the
   quoted terms — **and contradicted by his own device**. Do not cite it.
 
-## Do not re-run
+## Third-way sweep — COMPLETE (an earlier revision of this file said
+## "do not re-run" and listed Telegram as unresolved; that was wrong)
 
-The "already-installed app" sweep. All dead for free Linux-triggered ringing:
-Signal, Messenger, Viber, Discord, Zoom, Google Meet, FaceTime, Skype (retired
-May 2025). WhatsApp Business Calling API is real but needs Meta verification,
-a WABA number, callee opt-in, and is geo-blocked in several countries.
-**Unresolved, resume here if C ever dies:** Telegram (TDLib/pytgcalls — is 1:1
-outgoing calling released or an unmerged branch?), iOS web push to a home-screen
-PWA, Home Assistant critical alerts.
+**Telegram 1:1 calling is REAL, free, headless, released code.** VERIFIED:
+- `Telegram-iOS` registers `PKPushRegistry` `.voIP` and calls
+  `reportNewIncomingCall` in `CallKitIntegration.swift`, for real **1:1** calls.
+- `phone.requestCall` in Telethon / Pyrogram / gramjs; `createCall` in TDLib.
+  **Released, not an unmerged branch.**
+- Telethon maintainer tested live (issue #3981): recipient's device **rang**;
+  only audio negotiation failed — irrelevant for a doorbell.
+- TDLib maintainer confirms `createCall` rings (issue #2008).
+- `bbimer/tg-alarm-sentinel` (pushed 2026-08-08) exists for exactly this use
+  case and confirms the ring fires on the bare call request.
+- Needs a **real account with a phone number** to call FROM; bot tokens cannot.
+  `pip install telethon`, no ffmpeg/C++ if only the ring is wanted.
+
+**Why it matters:** it is an independent doorbell. C's ring depends on
+Belledonne relaying pushes through an endpoint we do not control; a Telegram
+ring depends on none of that. **Uncorrelated failure modes** — worth wiring in
+even though C ships.
+
+**Unproven:** whether Telegram can carry the AUDIO (1:1 media needs a key
+exchange the live test never completed). Telegram anti-abuse flood limits on
+automated calling. Whether Telegram is even on his phone — nobody has asked.
+
+**Also real, both DOWNGRADES (buzz, not ring):**
+- **Home Assistant critical alerts** — VERIFIED bypass DND + silent (HA docs),
+  fire from a plain `curl` over Tailscale, free self-hosted. Needs the HA app
+  already installed.
+- **iOS PWA web push** — VERIFIED needs NO App Store interaction and NO Apple
+  Developer account (WebKit announcement, standard VAPID). But behaves as an
+  ordinary notification and respects Focus.
+
+**Confirmed dead** for free Linux-triggered ringing: Signal (`signal-cli` is
+text-only), Messenger, Viber, Discord (no endpoint rings a DM), Zoom, Google
+Meet, FaceTime (no API exists at all), Skype (retired 2025-05-05), Shortcuts
+remote triggering (no webhook trigger exists), iMessage-from-Linux (pypush
+blocked by Apple), CalDAV alarms, Emergency Bypass, Safari WebRTC in a
+background tab, and **sideloading Linphone** (no .ipa published, and re-signing
+replaces the Team ID the push is bound to). WhatsApp Business Calling API is
+real but needs Meta verification + WABA + callee opt-in, and is geo-blocked.
 
 ## Standing principle for the degradation ladder
 
