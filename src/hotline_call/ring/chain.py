@@ -61,6 +61,18 @@ class RingChain:
         self.used: str | None = None
 
     @property
+    def is_fake(self) -> bool:
+        """ANY fake link makes the chain fake, deliberately -- not ALL.
+
+        A fake link succeeds instantly, and the chain stops at the first
+        success. So `loopback,sip` never reaches the SIP leg: the fake one
+        answers first and the real doorbell is never tried. Reporting that
+        chain as real because it *contains* a real link would describe a ring
+        that provably cannot happen.
+        """
+        return any(bool(getattr(link, "is_fake", False)) for link in self.links)
+
+    @property
     def rings_when_closed(self) -> bool:
         """True if ANY link can wake a closed app.
 

@@ -159,6 +159,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             return EXIT_UNDELIVERABLE
         return _fall_back(args, reason, str(exc), log)
 
+    # A fake doorbell is not a delivery, whatever the daemon's state field
+    # says. On 2026-08-25 a daemon ran on `loopback` for 2.5 hours and every
+    # caller got exit 0 and "ringing via loopback+confirmed" while he was
+    # never contacted. This is the tool agents reach for precisely when they
+    # cannot afford to be wrong about whether a human was reached, so a fake
+    # ring is treated exactly like an undeliverable one: fall back to
+    # hotline-page, because a mention that arrives beats a call that does not.
+    if outcome.fake:
+        log(
+            f"hotline-call: the daemon's doorbell is {outcome.transport!r}, "
+            "which rings NOTHING. He was not contacted."
+        )
+        if args.no_fallback:
+            print(
+                "hotline-call: error: doorbell is fake; nobody was rung",
+                file=sys.stderr,
+            )
+            return EXIT_UNDELIVERABLE
+        return _fall_back(args, reason, "the daemon's doorbell rings nothing", log)
+
     if args.no_wait:
         log(f"ringing via {outcome.transport} (not waiting)")
         return EXIT_ANSWERED

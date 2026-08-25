@@ -89,7 +89,13 @@ async def test_health_reports_whether_the_ring_survives_a_locked_phone():
     server = await run_server(service, 18790)
     try:
         body = await asyncio.to_thread(get, 18790, "/health")
-        assert body["ok"] is True
+        # NOT ok: this service's doorbell is a loopback, which rings nothing.
+        # This assertion used to read `is True`, and that was the bug -- on
+        # 2026-08-25 /health reported ok:true for 2.5 hours while every page
+        # went nowhere. A health check whose job is to catch a dead pager must
+        # not pass when the pager is a test double.
+        assert body["ok"] is False
+        assert body["fake"] is True
         # The single most important fact about a ring transport, on the health
         # endpoint rather than buried in a doc.
         assert "rings_when_closed" in body
@@ -329,10 +335,10 @@ def test_the_doorbell_is_assembled_from_a_list_in_order():
     # "We will do both" as a configuration rather than a fork.
     from hotline_ios.daemon import build_transport
 
-    one = build_transport(["loopback"])
+    one = build_transport(["loopback"], allow_fake=True)
     assert one.name == "loopback+confirmed"
 
-    both = build_transport(["loopback", "loopback"])
+    both = build_transport(["loopback", "loopback"], allow_fake=True)
     assert "+" in both.name and len(both.links) == 2
 
 
@@ -342,7 +348,7 @@ def test_each_link_is_confirmed_individually_not_the_chain_as_a_whole():
     from hotline_ios.daemon import build_transport
     from hotline_ios.ring.watch import ConfirmedRing
 
-    chain = build_transport(["loopback", "loopback"])
+    chain = build_transport(["loopback", "loopback"], allow_fake=True)
     assert all(isinstance(link, ConfirmedRing) for link in chain.links)
 
 
@@ -410,3 +416,98 @@ def test_both_doorbells_assemble_in_order():
     # Telegram cannot prove a ring landed; SIP gets a literal 180 Ringing. Both
     # are still wrapped, because the chain can only fall through on evidence.
     assert chain.rings_when_closed is True
+
+
+# --- the loopback-lies defect, 2026-08-25 -------------------------------
+#
+# A daemon ran on `loopback` for 2.5 hours. /health said ok:true, every call
+# returned exit 0 and "ringing via loopback+confirmed", and Bogdan was never
+# contacted. Three separate layers each had enough information to catch it and
+# none of them looked. One test per layer.
+
+
+def test_loopback_declares_itself_fake() -> None:
+    from hotline_ios.ring.loopback import LoopbackTransport
+    from hotline_ios.ring.watch import ConfirmedRing
+
+    assert LoopbackTransport().is_fake is True
+    # Confirmation must not launder it: ConfirmedRing proves the doorbell said
+    # it alerted the device, which a loopback does instantly about nothing.
+    assert ConfirmedRing(LoopbackTransport()).is_fake is True
+
+
+def test_a_chain_with_any_fake_link_is_fake() -> None:
+    """ANY, not ALL -- the fake link answers first and the real one never runs."""
+    from hotline_ios.ring.chain import RingChain
+    from hotline_ios.ring.loopback import LoopbackTransport
+    from hotline_ios.ring.watch import ConfirmedRing
+
+    class Real:
+        name = "real"
+        rings_when_closed = True
+        is_fake = False
+
+    chain = RingChain([ConfirmedRing(LoopbackTransport()), ConfirmedRing(Real())])
+    assert chain.is_fake is True
+    assert RingChain([ConfirmedRing(Real()), ConfirmedRing(Real())]).is_fake is False
+
+
+def test_build_transport_refuses_loopback_unless_told_twice() -> None:
+    import pytest
+
+    from hotline_ios.daemon import build_transport
+
+    with pytest.raises(SystemExit) as caught:
+        build_transport(["loopback"], allow_fake=False)
+    assert "rings nothing" in str(caught.value)
+    # Explicit opt-in still works, because the test suite needs it.
+    assert build_transport(["loopback"], allow_fake=True) is not None
+
+
+def test_outcome_reports_a_fake_doorbell() -> None:
+    from hotline_ios.daemon import Service
+    from hotline_ios.ring.loopback import LoopbackTransport
+
+    service = Service(LoopbackTransport(), pool=None)
+    assert service._outcome("c1", "answered", 0.0)["fake"] is True
+
+
+def test_unknown_transport_is_refused_not_ignored() -> None:
+    """`--transport sip` used to reach the body and go no further."""
+    import pytest
+    from hotline.httpd import HttpError
+
+    from hotline_ios.daemon import Service
+    from hotline_ios.ring.loopback import LoopbackTransport
+
+    default = LoopbackTransport()
+    service = Service(default, pool=None)
+    service.set_links({"loopback": default})
+
+    assert service._resolve_transport("") is default
+    assert service._resolve_transport("auto") is default
+    assert service._resolve_transport("loopback") is default
+    with pytest.raises(HttpError):
+        service._resolve_transport("sip")
+
+
+def test_open_calls_ignores_closed_ones_and_reap_drops_them() -> None:
+    """active_calls counted every conversation ever opened, so it only ever grew."""
+    import time as _time
+
+    from hotline_ios.daemon import Service
+    from hotline_ios.events import EventLog
+    from hotline_ios.ring.loopback import LoopbackTransport
+
+    service = Service(LoopbackTransport(), pool=None)
+    for call_id in ("a", "b", "c"):
+        service.calls[call_id] = EventLog()
+        service.call_opened[call_id] = _time.time() - 7200
+    assert service.open_calls() == 3
+    service.calls["a"].close()
+    service.calls["b"].close()
+    assert service.open_calls() == 1
+    # Only the closed and old ones go; the open one stays because he may still
+    # answer it.
+    assert service.reap(older_than=3600) == 2
+    assert set(service.calls) == {"c"}

@@ -16,6 +16,13 @@ from .base import CallDeclined, CallTarget, CallUnanswered, CallUnreachable
 class LoopbackTransport:
     name = "loopback"
     rings_when_closed = True  # a fiction, and the tests say so
+    # The whole point of this class is that it does NOT ring, and on
+    # 2026-08-25 a daemon was left running on it for two and a half hours
+    # while every caller got exit 0 and "ringing via loopback+confirmed".
+    # Nothing above here could tell the difference, because nothing above
+    # here was told. This flag is how it gets told; it is propagated by
+    # ConfirmedRing and RingChain and checked at /health and in the CLI.
+    is_fake = True
 
     def __init__(
         self,

@@ -25,6 +25,7 @@ import argparse
 import asyncio
 import logging
 import os
+import pathlib
 import sys
 import time
 import uuid
@@ -74,10 +75,24 @@ class Service:
         # unusual rate can tune the VAD. None means hotline's Segmenter.
         self.segmenter_factory = segmenter_factory
         self.calls: dict[str, EventLog] = {}
+        # When each conversation was opened, so closed ones can be reaped.
+        # EventLog has no timestamp of its own and adding one there would put
+        # wall-clock into a structure whose tests are all deterministic.
+        self.call_opened: dict[str, float] = {}
+        # name -> transport, so a caller's --transport can be honoured or
+        # refused rather than silently ignored. Populated by set_links(); a
+        # Service built directly in a test just has the one default.
+        self.links: dict[str, Any] = {}
         # Live sessions, so the phone can end a call from its own UI rather
         # than only by the far end hanging up.
         self.sessions: dict[str, Any] = {}
         self.started = time.time()
+        # False until the doorbell's start() has succeeded. A transport that
+        # could not start cannot ring, and /health reporting ok:true in that
+        # state is the same lie as reporting ok:true on a loopback -- it was
+        # doing exactly that with "sip is not configured" sitting in
+        # degradations right beside it.
+        self.ring_ready = False
         self.degradations: list[str] = []
 
     # ---- auth ------------------------------------------------------------
@@ -96,6 +111,56 @@ class Service:
                 raise HttpError(401, "bad or missing X-Hotline-Key")
 
     # ---- ringing him ------------------------------------------------------
+
+    def set_links(self, links: dict[str, Any]) -> None:
+        """Register the individually-addressable doorbells."""
+        self.links = dict(links)
+
+    def open_calls(self) -> int:
+        """Conversations still awaiting an answer.
+
+        `len(self.calls)` counted every conversation ever opened, so three
+        --no-wait smoke tests read as three live calls forever. A number that
+        only goes up is not a signal.
+        """
+        return sum(1 for events in self.calls.values() if not events.closed)
+
+    def reap(self, *, older_than: float = 3600.0) -> int:
+        """Drop closed conversations after an hour.
+
+        Only closed ones: an unanswered call stays, because he may open the app
+        later and answer it, and dropping it would throw away the question he
+        is about to answer.
+        """
+        now = time.time()
+        stale = [
+            call_id
+            for call_id, events in self.calls.items()
+            if events.closed and now - self.call_opened.get(call_id, now) > older_than
+        ]
+        for call_id in stale:
+            self.calls.pop(call_id, None)
+            self.call_opened.pop(call_id, None)
+        return len(stale)
+
+    def _resolve_transport(self, requested: str) -> Any:
+        """Pick the doorbell for one call, or refuse.
+
+        `--transport sip` used to reach the request body and go no further --
+        `place()` read `self.transport` unconditionally. A flag that silently
+        does nothing is worse than no flag at all, because it is reached for
+        exactly when the configured doorbell is already suspect. Now it either
+        works or it is a 400.
+        """
+        requested = (requested or "").strip().lower()
+        if not requested or requested == "auto":
+            return self.transport
+        if requested in self.links:
+            return self.links[requested]
+        from hotline.httpd import HttpError
+
+        known = ", ".join(sorted(self.links)) or "none"
+        raise HttpError(400, f"unknown transport {requested!r}; this daemon has: {known}")
 
     async def place(self, body: dict[str, Any]) -> dict[str, Any]:
         """Ring him, then wait for him to answer in the app.
@@ -127,9 +192,12 @@ class Service:
         reply_timeout = float(body.get("timeout", 900.0))
         wait = bool(body.get("wait", True))
 
+        doorbell = self._resolve_transport(str(body.get("transport", "")))
+
         conversation = uuid.uuid4().hex[:12]
         events = EventLog()
         self.calls[conversation] = events
+        self.call_opened[conversation] = time.time()
         # Put the question in the conversation before ringing, so that whenever
         # he opens the app -- during the ring, or an hour later -- it is already
         # there and he never answers a phone to silence.
@@ -139,32 +207,33 @@ class Service:
         began = time.monotonic()
 
         try:
-            await self.transport.ring(target, timeout=ring_timeout)
+            await doorbell.ring(target, timeout=ring_timeout)
         except CallDeclined as exc:
             events.append("state", "declined", at=time.time())
             events.close()
-            return self._outcome(conversation, "declined", began, str(exc))
+            return self._outcome(conversation, "declined", began, str(exc), transport=doorbell)
         except CallUnanswered as exc:
             # It rang and he did not pick up. The conversation stays OPEN: he
             # may well open the app five minutes later, and closing it here
             # would throw away the question he is about to answer.
             events.append("state", "unanswered", at=time.time())
-            return self._outcome(conversation, "unanswered", began, str(exc))
+            return self._outcome(conversation, "unanswered", began, str(exc), transport=doorbell)
         except (CallUnreachable, CallError) as exc:
             self.degradations.append(str(exc))
             log.warning("call %s undeliverable: %s", conversation, exc)
             events.append("error", str(exc), at=time.time())
             events.close()
-            return self._outcome(conversation, "unreachable", began, str(exc))
+            return self._outcome(conversation, "unreachable", began, str(exc), transport=doorbell)
 
         if not wait:
-            return self._outcome(conversation, "ringing", began, "not waiting")
+            return self._outcome(conversation, "ringing", began, "not waiting", transport=doorbell)
 
         reply = await self._await_reply(events, reply_timeout)
         if not reply:
             return self._outcome(conversation, "unanswered", began,
-                                 f"rang, but nothing came back within {reply_timeout:.0f}s")
-        return self._outcome(conversation, "answered", began, "", reply)
+                                 f"rang, but nothing came back within {reply_timeout:.0f}s",
+                                 transport=doorbell)
+        return self._outcome(conversation, "answered", began, "", reply, transport=doorbell)
 
     async def _await_reply(self, events: EventLog, timeout: float) -> str:
         """Block until he types something in the app, or time runs out."""
@@ -202,7 +271,9 @@ class Service:
         began: float,
         detail: str = "",
         reply: str = "",
+        transport: Any = None,
     ) -> dict[str, Any]:
+        used = transport if transport is not None else self.transport
         out: dict[str, Any] = {
             "call_id": call_id,
             "conversation": call_id,
@@ -210,8 +281,13 @@ class Service:
             "reply": reply,
             "detail": detail,
             "waited_seconds": round(time.monotonic() - began, 1),
-            "transport": getattr(self.transport, "name", "?"),
-            "rings_when_closed": bool(getattr(self.transport, "rings_when_closed", False)),
+            "transport": getattr(used, "name", "?"),
+            "rings_when_closed": bool(getattr(used, "rings_when_closed", False)),
+            # Callers cannot otherwise tell a ring from a no-op: "answered via
+            # loopback+confirmed" and "answered via sip+confirmed" are the same
+            # sentence. This is the field that distinguishes them, and
+            # hotline-call refuses to report success when it is true.
+            "fake": bool(getattr(used, "is_fake", False)),
         }
         return out
 
@@ -292,6 +368,7 @@ class Service:
         conversation = uuid.uuid4().hex[:12]
         events = EventLog()
         self.calls[conversation] = events
+        self.call_opened[conversation] = time.time()
         events.append("you", text, at=time.time())
 
         key = f"ios-{conversation}"
@@ -442,12 +519,21 @@ def build_server(service: Service, host: str, port: int) -> Any:
 
     @server.route("GET", "/health")
     async def health(request: Any) -> tuple[int, dict[str, Any]]:
+        fake = bool(getattr(service.transport, "is_fake", False))
+        service.reap()
         return 200, {
-            "ok": True,
+            # NOT ok when the doorbell is fake. A health check that reports ok
+            # while the pager rings nothing is the exact failure this endpoint
+            # exists to catch, and it reported ok:true for 2.5 hours.
+            "ok": (not fake) and service.ring_ready,
+            "fake": fake,
+            "ring_ready": service.ring_ready,
             "uptime_seconds": round(time.time() - service.started, 1),
             "transport": getattr(service.transport, "name", "?"),
             "rings_when_closed": bool(getattr(service.transport, "rings_when_closed", False)),
-            "active_calls": len(service.calls),
+            "transports_available": sorted(service.links),
+            "active_calls": service.open_calls(),
+            "conversations_held": len(service.calls),
             # Surfaced on the health endpoint on purpose: a ringer that has been
             # silently degrading is exactly what a health check is for.
             "degradations": service.degradations[-5:],
@@ -519,7 +605,12 @@ def build_server(service: Service, host: str, port: int) -> Any:
     return server
 
 
-def build_transport(names: Sequence[str], *, confirm_within: float = 8.0) -> Any:
+def build_transport(
+    names: Sequence[str],
+    *,
+    confirm_within: float = 8.0,
+    allow_fake: bool | None = None,
+) -> Any:
     """Assemble the doorbell from a list of names, in order.
 
     "We will do both" is his instruction, and this is what makes it a
@@ -531,6 +622,9 @@ def build_transport(names: Sequence[str], *, confirm_within: float = 8.0) -> Any
     """
     from .ring.chain import RingChain
     from .ring.watch import ConfirmedRing
+
+    if allow_fake is None:
+        allow_fake = os.environ.get("HOTLINE_IOS_ALLOW_FAKE", "") == "1"
 
     links: list[Any] = []
     for name in names:
@@ -548,6 +642,14 @@ def build_transport(names: Sequence[str], *, confirm_within: float = 8.0) -> Any
         elif name == "loopback":
             from .ring.loopback import LoopbackTransport
 
+            if not allow_fake:
+                raise SystemExit(
+                    "hotline-iosd: refusing to start with the 'loopback' doorbell, "
+                    "which rings nothing. It was left running for 2.5 hours on "
+                    "2026-08-25 and every caller got exit 0 while he was never "
+                    "contacted. If that is genuinely what you want, set "
+                    "HOTLINE_IOS_ALLOW_FAKE=1 -- saying it twice is the point."
+                )
             links.append(LoopbackTransport())
         else:
             raise SystemExit(
@@ -558,6 +660,24 @@ def build_transport(names: Sequence[str], *, confirm_within: float = 8.0) -> Any
         raise SystemExit("hotline-iosd: no ring transport configured; set HOTLINE_IOS_RING")
     wrapped = [ConfirmedRing(link, confirm_within=confirm_within) for link in links]
     return wrapped[0] if len(wrapped) == 1 else RingChain(wrapped)
+
+
+def build_links(names: Sequence[str], *, confirm_within: float = 8.0,
+                allow_fake: bool | None = None) -> dict[str, Any]:
+    """The same doorbells, individually addressable by name.
+
+    So that `--transport sip` on a daemon configured `telegram,sip` selects the
+    SIP leg instead of being ignored. Built by calling build_transport once per
+    name, which keeps one construction path rather than two that can drift.
+    """
+    out: dict[str, Any] = {}
+    for name in names:
+        name = name.strip().lower()
+        if not name:
+            continue
+        out[name] = build_transport([name], confirm_within=confirm_within,
+                                    allow_fake=allow_fake)
+    return out
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -581,7 +701,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     from hotline.pool import SessionPool
 
     load_env()
-    transport = build_transport(args.ring.split(","))
+    # hotline's load_env() defaults to hotline's OWN .env, which has no SIP_* or
+    # TELEGRAM_* in it. Without this the daemon starts, reports a sip doorbell,
+    # and only says "sip is not configured" in a degradations field nobody was
+    # reading. Loaded second so hotline-ios's values win: load_env never
+    # overwrites what is already set.
+    load_env(pathlib.Path(__file__).resolve().parents[3] / ".env")
+    names = args.ring.split(",")
+    # Build each doorbell ONCE and compose the default from those same objects,
+    # so `--transport sip` selects the very transport the chain would use rather
+    # than a second copy of it -- and so starting the chain starts them all.
+    links = build_links(names)
+    if not links:
+        raise SystemExit("hotline-iosd: no ring transport configured; set HOTLINE_IOS_RING")
+    if len(links) == 1:
+        transport: Any = next(iter(links.values()))
+    else:
+        from .ring.chain import RingChain
+
+        transport = RingChain(list(links.values()))
     allow = {
         ip.strip()
         for ip in os.environ.get("HOTLINE_ALLOW_IPS", "").split(",")
@@ -594,9 +732,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         api_key=os.environ.get("HOTLINE_API_KEY", ""),
     )
 
+    service.set_links(links)
+
     async def run() -> None:
         try:
             await transport.start()
+            service.ring_ready = True
         except Exception as exc:  # noqa: BLE001 - see comment
             # Do NOT die. The daemon still serves the app, the agent list and the
             # transcript feed without a working doorbell -- and a ringer that
@@ -611,6 +752,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.host, args.port, getattr(transport, "name", "?"),
             getattr(transport, "rings_when_closed", False),
         )
+        if getattr(transport, "is_fake", False):
+            log.error(
+                "THIS DOORBELL RINGS NOTHING (%s). Callers will be told so and "
+                "hotline-call will fall back to hotline-page.",
+                getattr(transport, "name", "?"),
+            )
+            service.degradations.append(
+                f"doorbell {getattr(transport, 'name', '?')} is fake; nobody is being rung"
+            )
         await server.serve_forever()
 
     try:

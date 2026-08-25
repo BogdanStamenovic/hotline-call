@@ -21,6 +21,25 @@ from hotline_ios.ring.sip import (
     status_of,
 )
 
+
+async def eventually(predicate, *, within: float = 2.0) -> bool:
+    """Wait for something the registrar THREAD observes, up to a deadline.
+
+    `ring()` returning does not mean the fake registrar has read what was sent
+    to it -- CANCEL goes out on a socket and is seen by another thread, so
+    asserting on it immediately is a race. It failed about one run in three
+    under full-suite load and passed alone every time, which is the signature.
+    Polling for the observation keeps the assertion meaningful; deleting it
+    would have "fixed" the flake by no longer checking that he stops being rung.
+    """
+    deadline = asyncio.get_running_loop().time() + within
+    while asyncio.get_running_loop().time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.01)
+    return predicate()
+
+
 WHO = CallTarget(device="phone", reason="the build is stuck", caller_id="the ios build")
 NONCE = "dcd98b7102dd2f0e8b11d0f600bfb0c093"
 
@@ -151,7 +170,7 @@ async def test_a_ring_is_confirmed_by_180_ringing(registrar):
     assert registrar.saw_authenticated_register
     assert registrar.saw_invite
     # And it stops ringing afterwards rather than buzzing him indefinitely.
-    assert registrar.saw_cancel
+    assert await eventually(lambda: registrar.saw_cancel)
 
 
 async def test_183_counts_as_ringing_too(registrar):

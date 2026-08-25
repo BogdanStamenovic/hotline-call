@@ -95,6 +95,17 @@ class ConfirmedRing:
         self.name = f"{getattr(inner, 'name', 'unknown')}+confirmed"
         self.rings_when_closed = bool(getattr(inner, "rings_when_closed", False))
 
+    @property
+    def is_fake(self) -> bool:
+        """Confirming a fake ring confirms a fake ring.
+
+        `ConfirmedRing` proves the doorbell *said* it alerted the device. A
+        loopback says so instantly and truthfully about nothing, so the
+        confirmation is real and the ring is not. Wrapping must not launder
+        one into the other.
+        """
+        return bool(getattr(self.inner, "is_fake", False))
+
     async def start(self) -> None:
         await self.inner.start()  # type: ignore[attr-defined]
 

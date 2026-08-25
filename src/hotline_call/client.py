@@ -29,6 +29,9 @@ class CallOutcome:
     waited_seconds: float = 0.0
     transport: str = ""
     detail: str = ""
+    # True when the doorbell was a test double. Not a detail: it is the
+    # difference between "he was rung" and "nothing happened".
+    fake: bool = False
 
 
 def _post(path: str, payload: dict[str, Any], *, url: str, timeout: float) -> dict[str, Any]:
@@ -82,6 +85,7 @@ def place_call(
         transcript=data.get("transcript"),
         waited_seconds=float(data.get("waited_seconds", 0.0)),
         transport=str(data.get("transport", "")),
+        fake=bool(data.get("fake", False)),
         detail=str(data.get("detail", "")),
     )
 
