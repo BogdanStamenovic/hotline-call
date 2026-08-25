@@ -109,6 +109,13 @@ client retry-after-timeout safe -- the second request is told the first one
 landed rather than firing a second keystroke into a session that has already
 been cancelled."""
 
+PENDING_DURATIONS = 64
+"""How many not-yet-placed tool durations to hold per agent.
+
+One per tool call in flight plus slack. Past this the oldest is dropped and
+counted on `/health` -- a bound that says so beats an unbounded dict that grows
+quietly on an agent whose transcript has stopped being readable."""
+
 SPAWN_TIMEOUT = 45.0
 """How long `resume` and `new` wait for a fresh session to register itself.
 
@@ -211,6 +218,14 @@ class Service:
         # than ignored: the app renders no duration bar for those rows, and a
         # rising number here is the only way to tell that from "nothing ran".
         self.tool_durations_unmatched = 0
+        # agent -> {tool_use_id: duration_ms} that arrived before the row they
+        # belong to existed. Measured on a real session: `PostToolUse` landed
+        # 244 ms after `PreToolUse` for a trivial Bash call, which is less than
+        # it takes the nudge in front of it to read the transcript and commit.
+        # Dropping those would mean fast tools -- most of them -- never getting
+        # a duration bar, which would look like the feature working badly rather
+        # than a race.
+        self._pending_durations: dict[str, dict[str, float]] = {}
         # agent -> why its offset stopped advancing. Non-empty means the map is
         # knowingly behind for that agent rather than knowingly complete.
         self.ingest_stalled: dict[str, str] = {}
@@ -865,14 +880,17 @@ class Service:
             "blockedSince": blocked_since,
             "retired": annotation.get("retired_at") is not None,
             "historyGeneration": int(annotation.get("history_generation") or 0),
-            # §11's first ask: the strip's ELAPSED cell. Already a column; the
-            # registry's own value wins because it survives this database being
-            # purged, and the annotation is the fallback for a live session that
-            # never declared itself.
-            "declaredAt": (
-                float(getattr(record, "declared_at", None) or 0.0) or None
-                if record is not None else None
-            ) or (float(annotation["declared_at"]) if annotation.get("declared_at") else None),
+            # §11's first ask: the strip's ELAPSED cell.
+            #
+            # The registry's own value first, because that is when the agent
+            # declared itself and it survives this database being purged. Then
+            # the session's `startedAt` -- a live session that never declared
+            # itself still started at a knowable moment, and the annotation
+            # below it records only when this store first noticed the name,
+            # which for one of his own shells can be hours late and would draw
+            # an ELAPSED of a few seconds on something that has been running all
+            # day.
+            "declaredAt": _declared_at(record, session, annotation),
             "controls": self._controls(
                 name, session, live=live, panes=panes, record=record
             ),
@@ -1573,7 +1591,27 @@ class Service:
         """
         from hotline import transcript
 
-        offset, sidechains = self.store.read_position(agent)
+        # Passed the session so a position belonging to a different transcript
+        # is discarded rather than applied to this one. An agent outlives its
+        # sessions -- `resume` hands it a new one -- and a byte offset into the
+        # wrong file makes the channel go silent for good.
+        offset, sidechains = self.store.read_position(agent, session_id)
+        size = transcript.size_of(session_id)
+        if offset > size:
+            # A position past the end of the file it names. `_read_slice` seeks
+            # there, reads nothing, and leaves the offset where it was, so this
+            # is not a slow channel -- it is a channel that has stopped forever
+            # and says nothing about it.
+            #
+            # Two ways to get here. A transcript that was rotated or truncated,
+            # and -- the one that actually happened -- a position written before
+            # positions recorded which session they belonged to, carried onto
+            # the shorter transcript of a respawn under the same name.
+            self._degrade(
+                f"transcript position for {agent} ({offset}) was past the end of "
+                f"{session_id[:12]}'s transcript ({size}); restarted its read"
+            )
+            offset, sidechains = 0, {}
         if offset == 0 and not sidechains:
             offset = _first_offset(session_id)
         found = transcript.events_since(session_id, offset, sidechains=sidechains)
@@ -1603,7 +1641,8 @@ class Service:
         # The only place an output rate can come from: the prose itself is not
         # stored, so it is counted as it goes past. See `vitals.py`.
         self.rates.observe(agent, result.text_samples)
-        self.store.set_read_position(agent, found.offset, found.sidechains)
+        self.store.set_read_position(agent, found.offset, found.sidechains, session_id)
+        self._flush_durations(agent)
         if result.last_tool_at is not None:
             # An honestly-observed tool call, which is what makes `stalled` mean
             # something. Never set from "the session says it is busy".
@@ -1699,6 +1738,30 @@ class Service:
             "phases_opened": result.phases_opened, "phases_closed": result.phases_closed,
         }
 
+    def _flush_durations(self, agent: str) -> None:
+        """Apply durations that arrived before their row did. Called after a read.
+
+        Anything still unmatched stays parked until the map is bounded out from
+        under it, at which point it is counted rather than forgotten: the app
+        draws no duration bar for those rows, and a rising number is the only
+        way to tell that from "nothing ran".
+        """
+        parked = self._pending_durations.get(agent)
+        if not parked:
+            return
+        for tool_use_id in list(parked):
+            try:
+                if self.store.set_duration(tool_use_id, parked[tool_use_id]):
+                    del parked[tool_use_id]
+            except Exception:
+                log.exception("could not apply a parked duration for %s", agent)
+                return
+        while len(parked) > PENDING_DURATIONS:
+            parked.pop(next(iter(parked)))
+            self.tool_durations_unmatched += 1
+        if not parked:
+            self._pending_durations.pop(agent, None)
+
     def _record_duration(self, agent: str, body: dict[str, Any]) -> dict[str, Any]:
         """Attach `PostToolUse.duration_ms` to the row the transcript already wrote.
 
@@ -1717,8 +1780,12 @@ class Service:
             log.exception("could not record a tool duration for %s", agent)
             return {"timed": False, "reason": "the store refused it"}
         if not matched:
-            self.tool_durations_unmatched += 1
-        return {"timed": matched}
+            # Not a failure yet: the row is usually written by the nudge in
+            # front of this one, which may still be mid-read. Parked and
+            # applied after the next read of this agent's transcript.
+            self._pending_durations.setdefault(agent, {})[tool_use_id] = float(duration)
+            return {"timed": False, "parked": True}
+        return {"timed": True}
 
     async def poll_once(self) -> dict[str, Any]:
         """One sweep of every live session that maps to a known agent.
@@ -2047,6 +2114,20 @@ class Service:
             "gap": events.gap(since),
             "dropped": events.dropped,
         }
+
+
+def _declared_at(record: Any, session: Any, annotation: dict[str, Any]) -> float | None:
+    declared = getattr(record, "declared_at", None)
+    if isinstance(declared, int | float) and declared:
+        return float(declared)
+    started = getattr(session, "started_at", None)
+    if isinstance(started, int | float) and started:
+        # The descriptor writes milliseconds; everything else on this wire is
+        # epoch seconds, and mixing the two would put the ELAPSED cell fifty
+        # thousand years out rather than visibly wrong.
+        return float(started) / 1000.0
+    noticed = annotation.get("declared_at")
+    return float(noticed) if noticed else None
 
 
 def _as_int(value: Any) -> int | None:
