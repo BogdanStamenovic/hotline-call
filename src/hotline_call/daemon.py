@@ -32,7 +32,7 @@ import uuid
 from collections.abc import Sequence
 from typing import Any
 
-from .events import EventLog
+from .events import Entry, EventLog, Waker
 from .ring.base import (
     CallDeclined,
     CallError,
@@ -40,6 +40,7 @@ from .ring.base import (
     CallUnanswered,
     CallUnreachable,
 )
+from .store import UNATTRIBUTED, Store
 
 log = logging.getLogger("hotline-iosd")
 
@@ -49,6 +50,38 @@ DEFAULT_PORT = 8789
 MAX_WAIT = 30.0
 TURN_TIMEOUT = 900.0
 """Ceiling on a long-poll. Under most proxy and NAT idle timeouts."""
+
+HYDRATE_WINDOW = 3600.0
+"""How far back a restart reads conversations into its in-memory index.
+
+The same hour `reap()` keeps them for, so a restart lands in the state the
+process would have been in anyway. Anything older is still in the database and
+still reachable through `/api/v1/agents/history`; this is only about what is
+warm."""
+
+ROSTER_POLL = 3.0
+"""How often a parked `roster-events` waiter recomputes the roster.
+
+There is no background heartbeat -- liveness is a per-request check, which is
+stronger than an interval. But a change in liveness is only *observed* when
+somebody computes the roster, so the long-poll does that computation itself
+while it waits. The cost is one `discover()` per interval per waiting client and
+exactly nothing when nobody is listening."""
+
+STALL_AFTER = 600.0
+"""Busy with no tool call for this long reads as stalled.
+
+A guess, and labelled as one: it is a `stalled` flag, not a liveness claim --
+liveness is already checked properly. Tune it once the transcript hook is
+feeding `last_tool_at` from something other than the daemon's own turns."""
+
+ROSTER_FIELDS = ("task", "live", "busy", "state", "stalled", "blocked",
+                 "retired", "historyGeneration")
+"""What counts as a roster change worth waking a phone for.
+
+Deliberately excludes `blockedSince` and `cwd`: a timestamp that only moves
+because the thing it describes moved is not independently newsworthy, and
+ticking on it would make the invalidation stream fire on its own output."""
 
 
 class Service:
@@ -63,6 +96,7 @@ class Service:
         api_key: str = "",
         page_fallback: Any = None,
         segmenter_factory: Any = None,
+        store: Store | None = None,
     ) -> None:
         self.transport = transport
         self.pool = pool
@@ -74,11 +108,20 @@ class Service:
         # Injectable so a test can be deterministic, and so a transport with an
         # unusual rate can tune the VAD. None means hotline's Segmenter.
         self.segmenter_factory = segmenter_factory
+        # The in-memory INDEX over persisted rows, not the record itself. The
+        # store is the record. This holds the conversations that are warm --
+        # recent or still open -- because that is what `EventLog`'s long-poll
+        # wake and its `gap`/`dropped` accounting need to work against, and
+        # those already work. `reap()` evicts from here and deletes nothing:
+        # deletion from the database is `purge` and nothing else (§3).
         self.calls: dict[str, EventLog] = {}
         # When each conversation was opened, so closed ones can be reaped.
         # EventLog has no timestamp of its own and adding one there would put
         # wall-clock into a structure whose tests are all deterministic.
         self.call_opened: dict[str, float] = {}
+        # conversation -> the agent it belongs to, so an append does not have to
+        # go back to the database to find out where to file itself.
+        self.call_agent: dict[str, str] = {}
         # name -> transport, so a caller's --transport can be honoured or
         # refused rather than silently ignored. Populated by set_links(); a
         # Service built directly in a test just has the one default.
@@ -94,6 +137,128 @@ class Service:
         # degradations right beside it.
         self.ring_ready = False
         self.degradations: list[str] = []
+        self.store = store if store is not None else self._open_store()
+        # One wake per agent for the agent-scoped feed, and one for the roster.
+        # Same broadcast primitive `EventLog` uses; see `events.Waker`.
+        self._agent_wakers: dict[str, Waker] = {}
+        self._roster_waker = Waker()
+        # None until the first roster computation. A restart must not tick every
+        # agent as "changed" just because it has nothing to compare against.
+        self._roster_snapshot: dict[str, dict[str, Any]] | None = None
+        self._hydrate()
+
+    # ---- the store -------------------------------------------------------
+
+    def _open_store(self) -> Store:
+        """Open the durable store, or run without one rather than not run.
+
+        A daemon that refuses to boot because its database will not open is
+        worse than one that rings his phone and forgets afterwards -- ringing is
+        the job. So a failure here degrades to an in-memory database, which
+        keeps every code path identical, and says so in the two places that are
+        actually read: the log and `/health`.
+        """
+        try:
+            return Store()
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            log.exception("could not open the store; running without persistence")
+            self.degradations.append(
+                f"store unavailable ({type(exc).__name__}: {exc}); "
+                "nothing is being persisted and history will be empty"
+            )
+            return Store(":memory:")
+
+    def _hydrate(self) -> None:
+        """Warm the in-memory index from the database at boot.
+
+        This is the whole point of the store from his side: an unanswered
+        question used to die with the process, so a daemon restart threw away
+        the thing he was about to answer.
+        """
+        try:
+            rows = self.store.conversations(limit=200)
+        except Exception:  # noqa: BLE001 - a cold index beats a dead daemon
+            log.exception("could not hydrate conversations from the store")
+            return
+        cutoff = time.time() - HYDRATE_WINDOW
+        for row in rows:
+            if row["closed_at"] is not None and float(row["opened_at"]) < cutoff:
+                continue
+            self._load_channel(row)
+
+    def _load_channel(self, row: dict[str, Any]) -> EventLog:
+        events = EventLog()
+        try:
+            for stored in self.store.conversation_tail(str(row["id"])):
+                events.adopt(Entry(seq=stored.seq, kind=stored.kind, text=stored.text,
+                                   tool=stored.tool, at=stored.at))
+        except Exception:  # noqa: BLE001
+            log.exception("could not read conversation %s back", row["id"])
+        if row["closed_at"] is not None:
+            events.closed = True
+        conversation = str(row["id"])
+        self.calls[conversation] = events
+        self.call_opened[conversation] = float(row["opened_at"])
+        self.call_agent[conversation] = str(row["agent_name"])
+        return events
+
+    def _channel(self, conversation: str) -> EventLog | None:
+        """The in-memory log for a conversation, reading it back in if it is cold.
+
+        A conversation reaped out of the index -- or opened by a previous
+        process -- is still answerable, which it was not before. A conversation
+        that never existed is still None, so `/api/v1/events` and `/api/v1/reply`
+        keep their 404.
+        """
+        existing = self.calls.get(conversation)
+        if existing is not None:
+            return existing
+        try:
+            row = self.store.conversation(conversation)
+        except Exception:  # noqa: BLE001
+            log.exception("could not look up conversation %s", conversation)
+            return None
+        return self._load_channel(row) if row is not None else None
+
+    def _waker(self, agent: str) -> Waker:
+        waker = self._agent_wakers.get(agent)
+        if waker is None:
+            waker = self._agent_wakers[agent] = Waker()
+        return waker
+
+    def _append(
+        self,
+        conversation: str,
+        kind: str,
+        text: str,
+        tool: str | None = None,
+        at: float | None = None,
+    ) -> Entry:
+        """Persist one event, then index it. The store assigns the sequence.
+
+        Order matters: the database is what hands out `seq`, so it has to be
+        written first. If it cannot be, the conversation continues on a number
+        one past whatever the index already holds -- monotonic within the
+        conversation, which is all a client's `since` cursor requires -- and the
+        failure is recorded rather than swallowed.
+        """
+        at = time.time() if at is None else at
+        agent = self.call_agent.get(conversation, UNATTRIBUTED)
+        events = self._channel(conversation)
+        try:
+            stored = self.store.append_event(
+                agent, kind, text, conversation_id=conversation, tool=tool, at=at
+            )
+            entry = Entry(seq=stored.seq, kind=kind, text=text, tool=tool, at=at)
+        except Exception as exc:  # noqa: BLE001 - a full disk must not drop his question
+            log.exception("could not persist %s event on %s", kind, conversation)
+            self.degradations.append(f"event not persisted ({type(exc).__name__}: {exc})")
+            seq = (events.latest + 1) if events is not None else 1
+            entry = Entry(seq=seq, kind=kind, text=text, tool=tool, at=at)
+        if events is not None:
+            events.adopt(entry)
+        self._waker(agent).wake()
+        return entry
 
     # ---- auth ------------------------------------------------------------
 
@@ -126,11 +291,17 @@ class Service:
         return sum(1 for events in self.calls.values() if not events.closed)
 
     def reap(self, *, older_than: float = 3600.0) -> int:
-        """Drop closed conversations after an hour.
+        """Evict closed conversations from the in-memory index after an hour.
 
         Only closed ones: an unanswered call stays, because he may open the app
         later and answer it, and dropping it would throw away the question he
         is about to answer.
+
+        **This deletes nothing.** It used to be the only thing bounding memory
+        and it still is, but the rows survive in the store and `_channel()`
+        reads a reaped conversation straight back in. Real deletion is `purge`
+        and only `purge` -- an automatic retention policy is exactly what §3
+        decided against.
         """
         now = time.time()
         stale = [
@@ -141,7 +312,54 @@ class Service:
         for call_id in stale:
             self.calls.pop(call_id, None)
             self.call_opened.pop(call_id, None)
+            self.call_agent.pop(call_id, None)
         return len(stale)
+
+    def _open_conversation(self, agent: str | None, kind: str) -> tuple[str, EventLog]:
+        """Mint a conversation, persist it, and index it. One place, two callers.
+
+        `kind` is `"ring"` or `"say"` and it is what decides whether the agent
+        counts as blocked on him: a ring is an agent waiting for an answer, a
+        `say` is him giving one an instruction. Getting that backwards would put
+        a blocked pin on every agent he ever talked to.
+        """
+        conversation = uuid.uuid4().hex[:12]
+        name = self.resolve_agent(agent)
+        opened = time.time()
+        events = EventLog()
+        self.calls[conversation] = events
+        self.call_opened[conversation] = opened
+        self.call_agent[conversation] = name
+        try:
+            self.store.open_conversation(
+                conversation, name, kind, opened_at=opened,
+                waiting_since=opened if kind == "ring" else None,
+            )
+        except Exception as exc:  # noqa: BLE001 - the ring matters more than the record
+            log.exception("could not persist conversation %s", conversation)
+            self.degradations.append(
+                f"conversation not persisted ({type(exc).__name__}: {exc})"
+            )
+        # No explicit roster tick here. A ring changes `blocked`, which the
+        # roster diff already watches; waking the parked long-poll makes it
+        # recompute now rather than at the next interval, and keeping one source
+        # of ticks is worth more than saving it three seconds.
+        self._roster_waker.wake()
+        return conversation, events
+
+    def _close_conversation(self, conversation: str) -> None:
+        """Close it in the index and in the store, and tell the roster."""
+        events = self._channel(conversation)
+        if events is not None and not events.closed:
+            events.close()
+        try:
+            if self.store.close_conversation(conversation):
+                agent = self.call_agent.get(conversation)
+                if agent:
+                    self._waker(agent).wake()
+                    self._roster_waker.wake()
+        except Exception:  # noqa: BLE001
+            log.exception("could not close conversation %s in the store", conversation)
 
     def _resolve_transport(self, requested: str) -> Any:
         """Pick the doorbell for one call, or refuse.
@@ -194,35 +412,32 @@ class Service:
 
         doorbell = self._resolve_transport(str(body.get("transport", "")))
 
-        conversation = uuid.uuid4().hex[:12]
-        events = EventLog()
-        self.calls[conversation] = events
-        self.call_opened[conversation] = time.time()
+        conversation, events = self._open_conversation(agent, "ring")
         # Put the question in the conversation before ringing, so that whenever
         # he opens the app -- during the ring, or an hour later -- it is already
         # there and he never answers a phone to silence.
-        events.append("claude", f"{target.caller_id}: {reason}", at=time.time())
+        self._append(conversation, "claude", f"{target.caller_id}: {reason}")
         if str(body.get("context", "")):
-            events.append("summary", str(body["context"])[:1200], at=time.time())
+            self._append(conversation, "summary", str(body["context"])[:1200])
         began = time.monotonic()
 
         try:
             await doorbell.ring(target, timeout=ring_timeout)
         except CallDeclined as exc:
-            events.append("state", "declined", at=time.time())
-            events.close()
+            self._append(conversation, "state", "declined")
+            self._close_conversation(conversation)
             return self._outcome(conversation, "declined", began, str(exc), transport=doorbell)
         except CallUnanswered as exc:
             # It rang and he did not pick up. The conversation stays OPEN: he
             # may well open the app five minutes later, and closing it here
             # would throw away the question he is about to answer.
-            events.append("state", "unanswered", at=time.time())
+            self._append(conversation, "state", "unanswered")
             return self._outcome(conversation, "unanswered", began, str(exc), transport=doorbell)
         except (CallUnreachable, CallError) as exc:
             self.degradations.append(str(exc))
             log.warning("call %s undeliverable: %s", conversation, exc)
-            events.append("error", str(exc), at=time.time())
-            events.close()
+            self._append(conversation, "error", str(exc))
+            self._close_conversation(conversation)
             return self._outcome(conversation, "unreachable", began, str(exc), transport=doorbell)
 
         if not wait:
@@ -249,14 +464,58 @@ class Service:
                 break
         return ""
 
+    def _registry_record(self, agent: str) -> Any:
+        """hotline's registry entry for a name, or None. The one lookup.
+
+        Was inlined in `_bind`; conversations now need the same answer at open
+        time, and two copies of "ask the registry what this name really is"
+        would be two chances to disagree about what `hotline-80` means.
+        """
+        try:
+            from hotline.agents import Registry
+
+            return Registry().by_name(agent)
+        except Exception:  # noqa: BLE001 - hotline may not be installed at all
+            log.exception("could not look %s up in the registry", agent)
+            return None
+
+    def resolve_agent(self, agent: str | None) -> str:
+        """The name a conversation is filed under, canonicalised.
+
+        Canonical because the registry's name is the identity Bogdan types --
+        `connect hotline-80` -- and filing under whatever casing or alias the
+        caller happened to use would split one agent's channel in two.
+
+        Unnamed callers go to the `UNATTRIBUTED` bucket rather than nowhere.
+        `hotline-call --agent` defaults to None, so a plain ring naming no agent
+        is the common case, not an edge case, and the question he is about to
+        answer has to be filed somewhere.
+        """
+        if not agent:
+            return UNATTRIBUTED
+        record = self._registry_record(str(agent))
+        name = str(record.name) if record is not None else str(agent)
+        try:
+            if record is not None:
+                self.store.ensure_agent(
+                    name,
+                    session_id=record.session_id,
+                    task=record.task,
+                    declared_at=record.declared_at,
+                    completed_at=record.completed_at,
+                )
+            else:
+                self.store.ensure_agent(name)
+        except Exception:  # noqa: BLE001 - annotation is not worth losing a call over
+            log.exception("could not record agent %s", name)
+        return name
+
     async def _bind(self, key: str, agent: str) -> None:
         try:
             bind = getattr(self.pool, "bind", None)
             if bind is None:
                 return
-            from hotline.agents import Registry
-
-            record = Registry().by_name(agent)
+            record = self._registry_record(agent)
             if record is not None:
                 bind(key, record.name, record.session_id)
         except Exception:
@@ -301,10 +560,10 @@ class Service:
         pending = self.sessions.pop(call_id, None)
         if pending is not None:
             pending.cancel()
-        events = self.calls.get(call_id)
+        events = self._channel(call_id)
         if events is not None and not events.closed:
-            events.append("state", "ended", at=time.time())
-            events.close()
+            self._append(call_id, "state", "ended")
+            self._close_conversation(call_id)
         return {"call_id": call_id, "ended": events is not None}
 
     # ---- delegation: what the app is actually for -------------------------
@@ -365,11 +624,9 @@ class Service:
         minutes and an HTTP request that long is a request that dies on a
         network handover.
         """
-        conversation = uuid.uuid4().hex[:12]
-        events = EventLog()
-        self.calls[conversation] = events
-        self.call_opened[conversation] = time.time()
-        events.append("you", text, at=time.time())
+        conversation, _events = self._open_conversation(agent, "say")
+        name = self.call_agent[conversation]
+        self._append(conversation, "you", text)
 
         key = f"ios-{conversation}"
         if agent:
@@ -379,8 +636,18 @@ class Service:
             def narrate(event: Any) -> None:
                 kind = getattr(event, "kind", "")
                 if kind in ("tool", "summary"):
-                    events.append(kind, getattr(event, "detail", ""),
-                                  getattr(event, "tool", None), time.time())
+                    self._append(conversation, kind, getattr(event, "detail", ""),
+                                 getattr(event, "tool", None))
+                if kind == "tool":
+                    # The only honestly-observed `last_tool_at` there is until
+                    # the transcript hook lands: this daemon watched this tool
+                    # call happen. It is only ever set from observation, never
+                    # from "the session says it is busy", which is what makes
+                    # `stalled` mean something.
+                    try:
+                        self.store.set_last_tool_at(name, time.time())
+                    except Exception:  # noqa: BLE001
+                        log.exception("could not record a tool call for %s", name)
 
             try:
                 _route, reply = await self.pool.ask(
@@ -390,12 +657,12 @@ class Service:
                 answer = reply.text
                 if getattr(reply, "notice", ""):
                     answer = f"Heads up, {reply.notice}. {answer}"
-                events.append("claude", answer, at=time.time())
+                self._append(conversation, "claude", answer)
             except Exception as exc:
                 log.exception("delegation turn failed")
-                events.append("error", f"{type(exc).__name__}: {exc}", at=time.time())
+                self._append(conversation, "error", f"{type(exc).__name__}: {exc}")
             finally:
-                events.close()
+                self._close_conversation(conversation)
 
         self.sessions[conversation] = asyncio.ensure_future(run())
         return {"conversation": conversation}
@@ -422,6 +689,9 @@ class Service:
                 "answered": answered,
                 "closed": events.closed,
                 "waiting": not answered and not events.closed,
+                # Additive: which channel this belongs to, so the redesigned app
+                # can group by agent without a second round trip.
+                "agent": self.call_agent.get(conversation, UNATTRIBUTED),
             })
         out.sort(key=lambda row: row["opened"], reverse=True)
         return {"conversations": out}
@@ -435,10 +705,17 @@ class Service:
         """
         from hotline.httpd import HttpError
 
-        events = self.calls.get(conversation)
+        events = self._channel(conversation)
         if events is None:
             raise HttpError(404, f"no conversation {conversation}")
-        events.append("you", text, at=time.time())
+        self._append(conversation, "you", text)
+        try:
+            # He answered, so nothing is blocked on him here any more --
+            # whatever else happens to the conversation afterwards.
+            self.store.mark_answered(conversation)
+        except Exception:  # noqa: BLE001 - the answer is delivered either way
+            log.exception("could not mark %s answered", conversation)
+        self._roster_waker.wake()
         return {"conversation": conversation, "delivered": True}
 
     # ---- the live feed ---------------------------------------------------
@@ -446,7 +723,7 @@ class Service:
     async def feed(self, call_id: str, since: int, wait: float) -> dict[str, Any]:
         from hotline.httpd import HttpError
 
-        events = self.calls.get(call_id)
+        events = self._channel(call_id)
         if events is None:
             raise HttpError(404, f"no call {call_id}")
         found = await events.wait(since, min(wait, MAX_WAIT))

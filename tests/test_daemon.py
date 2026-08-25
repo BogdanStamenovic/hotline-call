@@ -21,6 +21,7 @@ hotline_httpd = pytest.importorskip(
 from hotline_ios.daemon import Service, build_server
 from hotline_ios.ring.loopback import LoopbackTransport
 from hotline_ios.ring.watch import ConfirmedRing
+from hotline_ios.store import UNATTRIBUTED
 
 
 class Utterance:
@@ -188,8 +189,10 @@ async def test_his_reply_in_the_app_comes_back_on_hotline_calls_stdout():
                 break
             await asyncio.sleep(0.01)
         conversation = next(iter(service.calls))
-        await asyncio.sleep(0.1)
-        service.calls[conversation].append("you", "yes, go ahead", at=0.0)
+        # Through the same path the app uses, not by poking the log: the reply
+        # now has to be persisted and to clear the blocked pin as well as reach
+        # the waiting caller, and reaching in from the side would skip both.
+        await service.reply(conversation, "yes, go ahead")
 
         body = await asyncio.wait_for(task, timeout=30)
         assert body["state"] == "answered"
@@ -492,22 +495,105 @@ def test_unknown_transport_is_refused_not_ignored() -> None:
 
 
 def test_open_calls_ignores_closed_ones_and_reap_drops_them() -> None:
-    """active_calls counted every conversation ever opened, so it only ever grew."""
+    """active_calls counted every conversation ever opened, so it only ever grew.
+
+    Driven through the store now rather than by hand-building EventLogs, because
+    the store is where a conversation lives; the old timestamp is still injected
+    rather than waited for.
+    """
     import time as _time
 
     from hotline_ios.daemon import Service
-    from hotline_ios.events import EventLog
     from hotline_ios.ring.loopback import LoopbackTransport
 
     service = Service(LoopbackTransport(), pool=None)
+    old = _time.time() - 7200
     for call_id in ("a", "b", "c"):
-        service.calls[call_id] = EventLog()
-        service.call_opened[call_id] = _time.time() - 7200
+        service.store.open_conversation(call_id, "hotline-80", "ring", opened_at=old)
+        service.store.append_event("hotline-80", "claude", "?", conversation_id=call_id, at=old)
+    service._hydrate()
+    assert set(service.calls) == {"a", "b", "c"}
     assert service.open_calls() == 3
-    service.calls["a"].close()
-    service.calls["b"].close()
+
+    service._close_conversation("a")
+    service._close_conversation("b")
     assert service.open_calls() == 1
     # Only the closed and old ones go; the open one stays because he may still
     # answer it.
     assert service.reap(older_than=3600) == 2
     assert set(service.calls) == {"c"}
+    # Evicted from the index, NOT deleted. Real deletion is purge and only
+    # purge -- and a reaped conversation reads straight back in.
+    assert service.store.conversation("a") is not None
+    assert service._channel("a") is not None
+
+
+async def test_an_unanswered_question_survives_a_restart_of_the_daemon():
+    """The failure the store exists to remove.
+
+    An unanswered ring used to live in a dict and die with the process, so a
+    restart threw away the exact thing he was about to answer. Two Services over
+    the same database in one test, which is what a restart is.
+    """
+    first = Service(LoopbackTransport(), FakePool())
+    server = await run_server(first, 18820)
+    try:
+        body = await asyncio.to_thread(
+            post, 18820, "/api/v1/call",
+            {"reason": "may I spend money", "source": "the ios build",
+             "agent": "hotline-80", "wait": False})
+        conversation = body["conversation"]
+    finally:
+        await server.close()
+    first.store.close()
+
+    second = Service(LoopbackTransport(), FakePool())
+    server = await run_server(second, 18821)
+    try:
+        listing = await asyncio.to_thread(post, 18821, "/api/v1/conversations", {})
+        rows = listing["conversations"]
+        assert [row["conversation"] for row in rows] == [conversation]
+        assert rows[0]["waiting"] is True
+        assert "the ios build: may I spend money" in rows[0]["asked"]
+
+        page = await asyncio.to_thread(
+            post, 18821, "/api/v1/events", {"call_id": conversation, "since": 0, "wait": 0})
+        assert [e["kind"] for e in page["events"]] == ["claude"]
+        assert page["closed"] is False
+        assert page["gap"] is False
+
+        # And it is still answerable by a process that never opened it.
+        answered = await asyncio.to_thread(
+            post, 18821, "/api/v1/reply", {"conversation": conversation, "text": "yes"})
+        assert answered["delivered"] is True
+    finally:
+        await server.close()
+
+
+async def test_a_conversation_is_filed_under_the_agent_that_opened_it():
+    service = Service(LoopbackTransport(), FakePool())
+    server = await run_server(service, 18822)
+    try:
+        ring = await asyncio.to_thread(
+            post, 18822, "/api/v1/call",
+            {"reason": "ping", "agent": "hotline-80", "wait": False})
+        said = await asyncio.to_thread(
+            post, 18822, "/api/v1/say", {"text": "status?", "agent": "hotline-80"})
+        anonymous = await asyncio.to_thread(
+            post, 18822, "/api/v1/call", {"reason": "who am I", "wait": False})
+
+        assert service.store.conversation(ring["conversation"])["agent_name"] == "hotline-80"
+        assert service.store.conversation(said["conversation"])["agent_name"] == "hotline-80"
+        assert service.store.conversation(ring["conversation"])["kind"] == "ring"
+        assert service.store.conversation(said["conversation"])["kind"] == "say"
+        # A ring naming no agent is the common case, not an error. It is filed
+        # in a named bucket rather than dropped or given a phantom identity.
+        assert service.store.conversation(anonymous["conversation"])["agent_name"] == UNATTRIBUTED
+
+        # One channel, both conversations, one sequence.
+        events = service.store.since("hotline-80", 0)
+        assert {e.conversation_id for e in events} == {ring["conversation"],
+                                                      said["conversation"]}
+        assert [e.seq for e in events] == sorted(e.seq for e in events)
+    finally:
+        await server.close()

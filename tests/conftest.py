@@ -26,3 +26,20 @@ if str(_SRC) not in sys.path:
 _HOTLINE = Path(__file__).resolve().parents[3] / "hotline" / "src"
 if _HOTLINE.is_dir() and str(_HOTLINE) not in sys.path:
     sys.path.insert(0, str(_HOTLINE))
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def isolated_store(tmp_path, monkeypatch):
+    """Never let a test touch the real database.
+
+    The daemon's default store path is beside hotline's own `agents.json`, under
+    `XDG_STATE_HOME`, and that file belongs to the instance serving his phone.
+    A suite that wrote conversations into it would corrupt live state and would
+    also stop being deterministic the moment it read anything back. Autouse
+    rather than opt-in: forgetting it in one new test is exactly the failure
+    this is here to make impossible.
+    """
+    monkeypatch.setenv("HOTLINE_IOS_DB", str(tmp_path / "hotline-ios.db"))
