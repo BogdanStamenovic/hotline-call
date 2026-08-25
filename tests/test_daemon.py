@@ -259,3 +259,64 @@ async def test_the_phone_can_hang_up_and_doing_it_twice_is_not_an_error():
         assert any(e["kind"] == "state" and e["text"] == "ended" for e in feed["events"])
     finally:
         await server.close()
+
+
+async def test_delegating_returns_a_conversation_and_the_answer_arrives_on_the_feed():
+    """What the app actually does: send an instruction, follow the reply.
+
+    The answer deliberately does NOT come back on this response -- a task can
+    take minutes and an HTTP request open that long is one that dies on a
+    network handover.
+    """
+    pool = FakePool()
+    service = Service(LoopbackTransport(FMT), pool)
+    server = await run_server(service, 18801)
+    try:
+        sent = await asyncio.to_thread(
+            post, 18801, "/api/v1/say", {"text": "what is the status", "agent": "hotline-80"})
+        conversation = sent["conversation"]
+        assert conversation
+
+        seen: list[dict] = []
+        for _ in range(50):
+            page = await asyncio.to_thread(
+                post, 18801, "/api/v1/events",
+                {"call_id": conversation, "since": 0, "wait": 1}, 15)
+            seen = page["events"]
+            if any(e["kind"] == "claude" for e in seen):
+                break
+        kinds = [e["kind"] for e in seen]
+        assert "you" in kinds and "claude" in kinds, seen
+        assert [e for e in seen if e["kind"] == "claude"][0]["text"] == "nothing is on fire"
+
+        # The turn must be labelled as typed rather than spoken: there is no STT
+        # in this path any more, and claiming a mis-hearing risk that does not
+        # exist makes the label useless where it does.
+        _key, _text, origin = pool.asked[0]
+        assert getattr(origin, "kind", "") == "phone"
+    finally:
+        await server.close()
+
+
+async def test_saying_nothing_is_a_400():
+    service = Service(LoopbackTransport(FMT), FakePool())
+    server = await run_server(service, 18802)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            await asyncio.to_thread(post, 18802, "/api/v1/say", {"text": "   "})
+        assert exc.value.code == 400
+    finally:
+        await server.close()
+
+
+async def test_the_agent_list_survives_a_missing_registry():
+    # It reads hotline's registry and live sessions; neither is guaranteed to be
+    # there, and an empty list is a far better answer than a 500 on the one
+    # screen he opens first.
+    service = Service(LoopbackTransport(FMT), FakePool())
+    server = await run_server(service, 18803)
+    try:
+        body = await asyncio.to_thread(post, 18803, "/api/v1/agents", {})
+        assert isinstance(body["agents"], list)
+    finally:
+        await server.close()

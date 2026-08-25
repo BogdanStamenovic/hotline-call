@@ -48,6 +48,7 @@ DEFAULT_PORT = 8789
 """One past hotlined's 8788, so the two are obviously siblings."""
 
 MAX_WAIT = 30.0
+TURN_TIMEOUT = 900.0
 """Ceiling on a long-poll. Under most proxy and NAT idle timeouts."""
 
 
@@ -247,6 +248,98 @@ class Service:
             events.close()
         return {"call_id": call_id, "ended": session is not None}
 
+    # ---- delegation: what the app is actually for -------------------------
+
+    def agents(self) -> dict[str, Any]:
+        """Who is alive, what each is working on, and which are busy.
+
+        Reads hotline's registry and cross-references live sessions, because a
+        registry record outlives the process it describes -- a name in the file
+        is not evidence anything is running, and showing him a dead agent to
+        talk to is worse than showing him none.
+        """
+        try:
+            from hotline.agents import Registry
+            from hotline.ccsocks import discover
+        except Exception:
+            log.exception("registry unavailable")
+            return {"agents": []}
+
+        live: dict[str, Any] = {}
+        try:
+            for session in discover():
+                live[str(getattr(session, "session_id", ""))] = session
+        except Exception:
+            log.exception("could not enumerate live sessions")
+
+        out: list[dict[str, Any]] = []
+        for agent in Registry().working():
+            session = live.get(agent.session_id)
+            out.append({
+                "name": agent.name,
+                "task": agent.task,
+                "cwd": str(getattr(session, "cwd", "") or ""),
+                "live": session is not None,
+                "busy": bool(getattr(session, "status", "") == "busy"),
+            })
+        # Live sessions that never declared themselves are still worth talking
+        # to -- his own shells, mostly -- so they are listed under their derived
+        # name rather than hidden because they skipped a registration step.
+        declared = {a.session_id for a in Registry().working()}
+        for session_id, session in live.items():
+            if session_id in declared:
+                continue
+            out.append({
+                "name": str(getattr(session, "name", "") or session_id[:8]),
+                "task": "",
+                "cwd": str(getattr(session, "cwd", "") or ""),
+                "live": True,
+                "busy": bool(getattr(session, "status", "") == "busy"),
+            })
+        return {"agents": out}
+
+    async def say(self, text: str, agent: str | None) -> dict[str, Any]:
+        """Send him a turn's worth of instruction and follow the reply.
+
+        Returns immediately with a conversation key. The answer arrives on the
+        event feed rather than on this response, because a task can take
+        minutes and an HTTP request that long is a request that dies on a
+        network handover.
+        """
+        conversation = uuid.uuid4().hex[:12]
+        events = EventLog()
+        self.calls[conversation] = events
+        events.append("you", text, at=time.time())
+
+        key = f"ios-{conversation}"
+        if agent:
+            await self._bind(key, agent)
+
+        async def run() -> None:
+            def narrate(event: Any) -> None:
+                kind = getattr(event, "kind", "")
+                if kind in ("tool", "summary"):
+                    events.append(kind, getattr(event, "detail", ""),
+                                  getattr(event, "tool", None), time.time())
+
+            try:
+                _route, reply = await self.pool.ask(
+                    key, text, narrator=narrate, timeout=TURN_TIMEOUT,
+                    origin=_typed(agent),
+                )
+                answer = reply.text
+                if getattr(reply, "notice", ""):
+                    answer = f"Heads up, {reply.notice}. {answer}"
+                events.append("claude", answer, at=time.time())
+            except Exception as exc:
+                log.exception("delegation turn failed")
+                events.append("error", f"{type(exc).__name__}: {exc}", at=time.time())
+            finally:
+                events.close()
+
+        self.sessions[conversation] = asyncio.ensure_future(run())
+        return {"conversation": conversation}
+
     # ---- the live feed ---------------------------------------------------
 
     async def feed(self, call_id: str, since: int, wait: float) -> dict[str, Any]:
@@ -274,6 +367,21 @@ def _speakable():
         return speakable
     except Exception:
         return lambda text: text
+
+
+def _typed(agent: str | None):
+    """Label a delegated instruction as typed from his phone.
+
+    Deliberately NOT kind="voice": there is no speech recognition in this path
+    any more, so claiming a mis-hearing risk that does not exist would make the
+    label useless where it does.
+    """
+    try:
+        from hotline.provenance import Origin
+
+        return Origin(kind="phone", label="typed in the hotline app on his phone")
+    except Exception:
+        return None
 
 
 def _origin(target: CallTarget):
@@ -334,6 +442,21 @@ def build_server(service: Service, host: str, port: int) -> Any:
     # so `/events/<call_id>/<since>` is not available either. The choice was
     # between forking a server Bogdan has already read and putting two integers
     # in a JSON body. The body wins easily.
+    @server.route("POST", "/api/v1/agents")
+    async def agents(request: Any) -> tuple[int, dict[str, Any]]:
+        service.authorise(request)
+        return 200, service.agents()
+
+    @server.route("POST", "/api/v1/say")
+    async def say(request: Any) -> tuple[int, dict[str, Any]]:
+        service.authorise(request)
+        body = request.json()
+        text = str(body.get("text", "")).strip()
+        if not text:
+            raise HttpError(400, "text is required")
+        agent = body.get("agent")
+        return 200, await service.say(text, str(agent) if agent else None)
+
     @server.route("POST", "/api/v1/hangup")
     async def hangup(request: Any) -> tuple[int, dict[str, Any]]:
         service.authorise(request)
