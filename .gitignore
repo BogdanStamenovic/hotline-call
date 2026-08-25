@@ -7,3 +7,9 @@ build/
 *.app/
 server/.venv/
 .pytest_cache/
+
+# SwiftPM build output and xtool packaging output. .gitignore already had
+# "build/", which never matches ".build/" -- 1840 object files and dSYMs went
+# in before that was noticed.
+.build/
+app/HotlineCall/xtool/
