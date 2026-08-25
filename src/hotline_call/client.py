@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -49,7 +48,7 @@ def _post(path: str, payload: dict[str, Any], *, url: str, timeout: float) -> di
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:400]
         raise DaemonError(f"{exc.code} {exc.reason}: {detail}") from exc
-    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise DaemonError(f"cannot reach hotline-iosd at {url}: {exc}") from exc
 
 

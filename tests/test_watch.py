@@ -7,7 +7,6 @@ it to, and every option fails silently in its own way. These tests pin the rule
 that silence degrades loudly.
 """
 
-import asyncio
 
 import pytest
 

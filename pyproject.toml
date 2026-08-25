@@ -45,3 +45,18 @@ line-length = 100
 python_version = "3.12"
 warn_unused_ignores = true
 warn_redundant_casts = true
+# hotline is imported over PYTHONPATH rather than installed here, and type
+# checking someone else's package is not this package's job. Everything crossing
+# that boundary is narrowed immediately -- a reply's .text, an Agent's fields --
+# so there is nothing to check across it. Same shape as hotline's own overrides
+# for faster-whisper and piper.
+[[tool.mypy.overrides]]
+module = ["hotline.*"]
+ignore_missing_imports = true
+
+# telethon ships no type information. Everything it returns is immediately
+# narrowed to a call id or an exception here, so there is nothing to check
+# across the boundary -- same reasoning as hotline's overrides for faster-whisper.
+[[tool.mypy.overrides]]
+module = ["telethon.*"]
+ignore_missing_imports = true

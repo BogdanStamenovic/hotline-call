@@ -19,7 +19,6 @@ hotline_httpd = pytest.importorskip(
 )
 
 from hotline_ios.daemon import Service, build_server
-from hotline_ios.ring.base import CallTarget
 from hotline_ios.ring.loopback import LoopbackTransport
 from hotline_ios.ring.watch import ConfirmedRing
 
@@ -271,7 +270,7 @@ async def test_delegating_returns_a_conversation_and_the_answer_arrives_on_the_f
                 break
         kinds = [e["kind"] for e in seen]
         assert "you" in kinds and "claude" in kinds, seen
-        assert [e for e in seen if e["kind"] == "claude"][0]["text"] == "nothing is on fire"
+        assert next(e for e in seen if e["kind"] == "claude")["text"] == "nothing is on fire"
 
         # The turn must be labelled as typed rather than spoken: there is no STT
         # in this path any more, and claiming a mis-hearing risk that does not

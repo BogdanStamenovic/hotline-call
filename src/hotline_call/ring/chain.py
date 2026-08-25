@@ -28,7 +28,7 @@ what he was declining.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from .base import CallDeclined, CallError, CallTarget, CallUnanswered, CallUnreachable
 
@@ -40,14 +40,17 @@ class RingChain:
 
     def __init__(
         self,
-        links: list[object],
+        # Sequence rather than list: list is invariant, so a list[ConfirmedRing]
+        # -- which is exactly what the daemon builds -- would not typecheck
+        # against list[object].
+        links: Sequence[object],
         *,
         on_fallthrough: Callable[[str, str], None] | None = None,
         fall_through_on_unanswered: bool = False,
     ) -> None:
         if not links:
             raise ValueError("a ring chain with no transports can never ring")
-        self.links = links
+        self.links = list(links)
         self.on_fallthrough = on_fallthrough
         # Off by default. A phone that rang for 45 s and was ignored has
         # delivered the message; ringing a second device immediately afterwards

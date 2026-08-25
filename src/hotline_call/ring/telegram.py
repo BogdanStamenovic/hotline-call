@@ -214,16 +214,16 @@ class TelegramTransport:
                 # him not being there, and they deserve different responses.
                 outcome.set_result("Busy" in reason or "Hangup" in reason and False)
 
-        handler = self._client.add_event_handler(  # type: ignore[attr-defined]
-            on_update, events.Raw()
-        )
+        client = self._client
+        assert client is not None
+        client.add_event_handler(on_update, events.Raw())  # type: ignore[attr-defined]
         try:
             return await asyncio.wait_for(outcome, timeout)
-        except (TimeoutError, asyncio.TimeoutError):
+        except TimeoutError:
             return None
         finally:
             with contextlib.suppress(Exception):
-                self._client.remove_event_handler(on_update)  # type: ignore[attr-defined]
+                client.remove_event_handler(on_update)  # type: ignore[attr-defined]
 
 
 def _discard_reason() -> object:

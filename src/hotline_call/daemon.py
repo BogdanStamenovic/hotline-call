@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import logging
 import os
 import sys
@@ -249,7 +248,7 @@ class Service:
             log.exception("registry unavailable")
             return {"agents": []}
 
-        live: dict[str, Any] = {}
+        live: dict[str, Any] = {}  # session_id -> whatever discover() yields
         try:
             for session in discover():
                 live[str(getattr(session, "session_id", ""))] = session
@@ -390,7 +389,7 @@ def _speakable():
         from hotline.voice import speakable
 
         return speakable
-    except Exception:
+    except Exception:  # noqa: BLE001 - unpolished speech beats no answer
         return lambda text: text
 
 
@@ -405,7 +404,7 @@ def _typed(agent: str | None):
         from hotline.provenance import Origin
 
         return Origin(kind="phone", label="typed in the hotline app on his phone")
-    except Exception:
+    except Exception:  # noqa: BLE001 - an unlabelled turn beats a dropped one
         return None
 
 
@@ -425,7 +424,7 @@ def _origin(target: CallTarget):
             author_id=None,
             channel_id=None,
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 - an unlabelled turn beats a dropped one
         return None
 
 
@@ -594,7 +593,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     async def run() -> None:
         try:
             await transport.start()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - see comment
             # Do NOT die. The daemon still serves the app, the agent list and the
             # transcript feed without a working doorbell -- and a ringer that
             # cannot start is exactly the thing that should be visible on

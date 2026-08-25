@@ -126,7 +126,7 @@ class SipProbe(asyncio.DatagramProtocol):
         try:
             message = data.decode("utf-8", errors="replace")
             method = message.split(" ", 1)[0].upper()
-        except Exception:
+        except Exception:  # noqa: BLE001 - a malformed datagram must not kill the probe
             return
 
         if method == "REGISTER":

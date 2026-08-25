@@ -12,7 +12,7 @@ import asyncio
 
 import pytest
 
-from hotline_ios.ring.base import CallDeclined, CallTarget, CallUnanswered, CallUnreachable
+from hotline_ios.ring.base import CallTarget, CallUnanswered, CallUnreachable
 from hotline_ios.ring.telegram import TelegramTransport
 
 WHO = CallTarget(device="phone", reason="the build is stuck", caller_id="the ios build")
@@ -87,7 +87,7 @@ async def test_the_request_being_accepted_is_the_evidence_it_rang():
     assert t.ringing.is_set()
     with pytest.raises(CallUnanswered):
         await task
-    assert [type(r).__name__ for r in client.requests][0] == "RequestCallRequest"
+    assert next(type(r).__name__ for r in client.requests) == "RequestCallRequest"
 
 
 async def test_it_always_discards_so_the_phone_stops_buzzing():

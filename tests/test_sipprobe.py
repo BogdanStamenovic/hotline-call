@@ -8,11 +8,8 @@ explicitly.
 """
 
 import asyncio
-from pathlib import Path
 
-import pytest
-
-from hotline_ios.sipprobe import SipProbe, header, parse_push_params, serve
+from hotline_ios.sipprobe import header, parse_push_params, serve
 
 # A real-shaped Linphone iOS Contact, RFC 8599 spelling.
 MODERN = (
@@ -98,11 +95,11 @@ async def test_a_real_register_over_a_real_socket(tmp_path):
     assert reply.startswith("SIP/2.0 200 OK")
     # A registrar must tag the To header or some clients never treat the
     # registration as confirmed and retry forever.
-    assert ";tag=" in [ln for ln in reply.split("\r\n") if ln.startswith("To:")][0]
+    assert ";tag=" in next(ln for ln in reply.split("\r\n") if ln.startswith("To:"))
     assert "Call-ID: probe-test-1" in reply
 
     assert probe.packets == 1
-    record = list(probe.registrations.values())[0]
+    record = next(iter(probe.registrations.values()))
     assert record.pushable
     assert record.push["pn-prid"] == "9f8e7d6c5b4a3f2e1d0c"
 
@@ -113,7 +110,7 @@ async def test_a_real_register_over_a_real_socket(tmp_path):
 
 
 async def test_invite_is_declined_rather_than_half_accepted(tmp_path):
-    probe = await serve("127.0.0.1", 15061, tmp_path / "c.txt")
+    await serve("127.0.0.1", 15061, tmp_path / "c.txt")
     loop = asyncio.get_running_loop()
     got: asyncio.Queue[bytes] = asyncio.Queue()
 

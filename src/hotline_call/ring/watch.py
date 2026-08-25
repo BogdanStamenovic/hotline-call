@@ -59,7 +59,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 
-from .base import CallError, CallTarget, CallUnreachable
+from .base import CallTarget, CallUnreachable
 
 log = logging.getLogger("hotline-ios.ring.watch")
 
@@ -136,11 +136,15 @@ class ConfirmedRing:
 
         if not ringing.is_set():
             attempt.cancel()
-            with_suppress = getattr(asyncio, "CancelledError")
+            # The transport's own failure is not the interesting one -- we are
+            # about to report something more specific -- but swallowing it in
+            # silence is how a transport bug stays invisible.
             try:
                 await attempt
-            except (with_suppress, CallError, Exception):
+            except asyncio.CancelledError:
                 pass
+            except Exception:
+                log.debug("transport also raised while being cancelled", exc_info=True)
             self._degrade(
                 f"no ring confirmation from {getattr(self.inner, 'name', '?')} "
                 f"within {self.confirm_within:.0f}s"
