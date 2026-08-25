@@ -35,6 +35,11 @@ surface.
 **Not verified: that this makes his phone ring.** That needs the credentials
 above and his handset, and it has not been run. Nothing here should be read as
 saying it works yet.
+
+**One setting on his phone can defeat this silently**: Settings -> Privacy ->
+Calls must not be "Nobody". Telegram will accept the call request and never ring
+him, and nothing in the response distinguishes that from success. See the note
+at the point where `ringing` is set.
 """
 
 from __future__ import annotations
@@ -155,9 +160,17 @@ class TelegramTransport:
                 raise CallUnreachable(f"telegram refused the call: {text}") from exc
             raise CallUnreachable(f"telegram call request failed: {text}") from exc
 
-        # The request being accepted IS the evidence the phone is alerting --
-        # Telegram has taken responsibility for delivering it. That is what
+        # The request being accepted is the evidence the phone is alerting --
+        # Telegram has taken responsibility for delivering it -- and it is what
         # ConfirmedRing waits on.
+        #
+        # KNOWN HOLE, and it is the one case where this evidence is not
+        # evidence: if his Settings -> Privacy -> Calls is "Nobody", Telegram
+        # accepts the request and simply never rings him. There is nothing
+        # visible in the response to distinguish that from a real ring, so this
+        # would report success for a call that did not happen -- exactly the
+        # failure ConfirmedRing exists to prevent. It cannot be closed from
+        # inside the transport; it has to be checked on his phone once.
         self.ringing.set()
         call = getattr(result, "phone_call", None)
         log.info("telegram is ringing %s (call %s)", self.peer, getattr(call, "id", "?"))
