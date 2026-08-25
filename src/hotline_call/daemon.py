@@ -75,6 +75,9 @@ class Service:
         # unusual rate can tune the VAD. None means hotline's Segmenter.
         self.segmenter_factory = segmenter_factory
         self.calls: dict[str, EventLog] = {}
+        # Live sessions, so the phone can end a call from its own UI rather
+        # than only by the far end hanging up.
+        self.sessions: dict[str, Any] = {}
         self.started = time.time()
         self.degradations: list[str] = []
 
@@ -159,6 +162,7 @@ class Service:
         if target.agent:
             await self._bind(f"ios-{call_id}", target.agent)
 
+        self.sessions[call_id] = session
         runner = asyncio.ensure_future(session.run())
         # Announce why the phone rang. Without this he answers to silence and
         # has to ask, which on a spoken channel costs a whole turn.
@@ -181,6 +185,7 @@ class Service:
             runner.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await runner
+        self.sessions.pop(call_id, None)
         reply = _last_from_him(session)
         events.close()
         state = "answered" if reply else "ended"
@@ -225,6 +230,22 @@ class Service:
         if session is not None:
             out["transcript"] = [{"who": who, "text": text} for who, text in session.transcript]
         return out
+
+    async def hang_up(self, call_id: str) -> dict[str, Any]:
+        """End a call from the phone's side.
+
+        Idempotent, and a missing call is not an error: the app can send this
+        after the far end has already ended, and turning that race into a 404
+        would make the phone show a failure for something that worked.
+        """
+        session = self.sessions.pop(call_id, None)
+        events = self.calls.get(call_id)
+        if session is not None:
+            await session.hangup()
+        if events is not None and not events.closed:
+            events.append("state", "ended", at=time.time())
+            events.close()
+        return {"call_id": call_id, "ended": session is not None}
 
     # ---- the live feed ---------------------------------------------------
 
@@ -313,6 +334,15 @@ def build_server(service: Service, host: str, port: int) -> Any:
     # so `/events/<call_id>/<since>` is not available either. The choice was
     # between forking a server Bogdan has already read and putting two integers
     # in a JSON body. The body wins easily.
+    @server.route("POST", "/api/v1/hangup")
+    async def hangup(request: Any) -> tuple[int, dict[str, Any]]:
+        service.authorise(request)
+        body = request.json()
+        call_id = str(body.get("call_id", ""))
+        if not call_id:
+            raise HttpError(400, "call_id is required")
+        return 200, await service.hang_up(call_id)
+
     @server.route("POST", "/api/v1/events")
     async def feed(request: Any) -> tuple[int, dict[str, Any]]:
         service.authorise(request)

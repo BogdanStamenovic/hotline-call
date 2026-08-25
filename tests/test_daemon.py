@@ -233,3 +233,29 @@ async def test_a_call_nobody_hangs_up_is_ended_rather_than_leaked():
         assert body["waited_seconds"] < 10
     finally:
         await server.close()
+
+
+async def test_the_phone_can_hang_up_and_doing_it_twice_is_not_an_error():
+    # The app can send this after the far end already ended -- turning that race
+    # into a 404 would show him a failure for something that worked.
+    transport = LoopbackTransport(FMT)
+    service = Service(transport, FakePool(), transcriber=FakeTranscriber(),
+                      speaker=FakeSpeaker(), segmenter_factory=OneShotSegmenter)
+    server = await run_server(service, 18798)
+    try:
+        body = await asyncio.to_thread(
+            post, 18798, "/api/v1/call", {"reason": "status", "wait": False})
+        call_id = body["call_id"]
+        assert call_id in service.sessions
+
+        first = await asyncio.to_thread(post, 18798, "/api/v1/hangup", {"call_id": call_id})
+        assert first["ended"] is True
+        second = await asyncio.to_thread(post, 18798, "/api/v1/hangup", {"call_id": call_id})
+        assert second["ended"] is False       # idempotent, still a 200
+
+        feed = await asyncio.to_thread(
+            post, 18798, "/api/v1/events", {"call_id": call_id, "since": 0, "wait": 0})
+        assert feed["closed"] is True
+        assert any(e["kind"] == "state" and e["text"] == "ended" for e in feed["events"])
+    finally:
+        await server.close()
