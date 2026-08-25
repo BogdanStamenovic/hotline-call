@@ -41,3 +41,13 @@ CSeq: 1 REGISTER
 Contact: <sip:bogdan@100.72.2.62>
 Content-Length: 0
 
+
+===== 19:13:09 from 100.72.2.62:38674 =====
+OPTIONS sip:probe SIP/2.0
+Via: SIP/2.0/UDP 127.0.0.1:9
+From: <sip:v@x>;tag=9
+To: <sip:v@x>
+Call-ID: verify-data89
+CSeq: 1 OPTIONS
+Content-Length: 0
+
