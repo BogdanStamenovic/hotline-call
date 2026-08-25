@@ -32,7 +32,7 @@ import uuid
 from collections.abc import Sequence
 from typing import Any
 
-from . import ingest
+from . import ingest, vitals
 from .endpoint import DEFAULT_HOST, DEFAULT_PORT, LOOPBACK, bind_hosts, local_url
 from .events import Entry, EventLog, Waker
 from .ingest import Ingested
@@ -99,6 +99,43 @@ Not the primary path -- the hook is. This catches the cases the hook cannot: a
 session started before the hook was installed, a nudge dropped while the daemon
 was restarting, a hook that hit its own 30 s backoff. Cheap because it reads
 only what the stored offset says is new."""
+
+STOP_DEBOUNCE = 2.0
+"""A repeat `stop` on the same agent inside this many seconds is refused.
+
+§4: sub-200 ms double-Escape behaviour is unverified, and designing around a
+guess is how you get a cancel that sometimes cancels twice. It also makes a
+client retry-after-timeout safe -- the second request is told the first one
+landed rather than firing a second keystroke into a session that has already
+been cancelled."""
+
+SPAWN_TIMEOUT = 45.0
+"""How long `resume` and `new` wait for a fresh session to register itself.
+
+Half `tmuxen.spawn`'s own default: this is a request from a phone, and a minute
+and a half of a spinner is worse than an honest failure that can be retried."""
+
+COMPACT_SETTLE = 0.6
+"""Between the Escape and typing `/compact`.
+
+Pacing a terminal, not waiting for work: the CLI has to finish cancelling before
+it will accept a new line. The actual completion of compaction is watched for
+and is never a timer."""
+
+COMPACT_POLL = 0.5
+COMPACT_TIMEOUT = 180.0
+"""How long to watch for the compaction boundary before giving up and saying so.
+
+The spike measured a real compaction at 71 s. This is a bound on the wait, not a
+substitute for the signal -- expiring means `compacted: false` with the reason,
+never a success declared by the clock."""
+
+CONTINUE_AFTER_COMPACT = (
+    "Your context was just compacted from the hotline app. Pick up exactly where "
+    "you left off -- read the compaction summary above for what you were doing, "
+    "and carry on without starting over."
+)
+"""The default continuation `compact` injects when no `then` was supplied."""
 
 ROSTER_FIELDS = ("task", "live", "busy", "state", "stalled", "blocked",
                  "retired", "historyGeneration")
@@ -169,6 +206,11 @@ class Service:
         self.hook_events = 0
         self.unattributed_hook_events = 0
         self.hook_parse_failures = 0
+        # Durations that arrived for a tool call this daemon has no row for --
+        # a dropped PreToolUse nudge, or a read that is behind. Counted rather
+        # than ignored: the app renders no duration bar for those rows, and a
+        # rising number here is the only way to tell that from "nothing ran".
+        self.tool_durations_unmatched = 0
         # agent -> why its offset stopped advancing. Non-empty means the map is
         # knowingly behind for that agent rather than knowingly complete.
         self.ingest_stalled: dict[str, str] = {}
@@ -189,6 +231,11 @@ class Service:
         # configured, because the two disagreed once and nothing noticed.
         self.listen_hosts: list[str] = []
         self.listen_port = DEFAULT_PORT
+        # agent -> when it was last interrupted, on the monotonic clock. Wall
+        # time would let an NTP step turn a debounce into a permanent refusal.
+        self._last_stop_at: dict[str, float] = {}
+        # Assistant output samples, in memory on purpose -- see `vitals.py`.
+        self.rates = vitals.Rates()
         self._hydrate()
 
     # ---- where this daemon can be reached --------------------------------
@@ -331,6 +378,7 @@ class Service:
         text: str,
         tool: str | None = None,
         at: float | None = None,
+        client_token: str | None = None,
     ) -> Entry:
         """Persist one event, then index it. The store assigns the sequence.
 
@@ -345,7 +393,8 @@ class Service:
         events = self._channel(conversation)
         try:
             stored = self.store.append_event(
-                agent, kind, text, conversation_id=conversation, tool=tool, at=at
+                agent, kind, text, conversation_id=conversation, tool=tool, at=at,
+                client_token=client_token,
             )
             entry = Entry(seq=stored.seq, kind=kind, text=text, tool=tool, at=at)
         except Exception as exc:  # a full disk must not drop his question
@@ -662,7 +711,19 @@ class Service:
         if events is not None and not events.closed:
             self._append(call_id, "state", "ended")
             self._close_conversation(call_id)
-        return {"call_id": call_id, "ended": events is not None}
+        return {
+            "call_id": call_id,
+            "ended": events is not None,
+            # Always false, and it is not a placeholder. This endpoint ends the
+            # daemon's own wait -- it cancels the asyncio task awaiting a reply
+            # and closes the conversation. The agent on the other end keeps
+            # running, untouched, and never learns this happened. Reporting
+            # anything else here would be the same lie as a /health that says ok
+            # while the pager rings nothing. Stopping the process is `kill`, and
+            # cancelling its turn is `stop`; both are separate endpoints because
+            # they are separate acts.
+            "process_stopped": False,
+        }
 
     # ---- delegation: what the app is actually for -------------------------
 
@@ -700,14 +761,25 @@ class Service:
             log.exception("could not read the registry")
             records = []
 
+        now = time.time()
         try:
             annotations = {row["name"]: row for row in self.store.agents()}
             blocked = self.store.blocked_since()
+            # One grouped query for the whole roster rather than one per row:
+            # this is also the body of a long-poll, which recomputes on every
+            # pass while a phone is listening.
+            tool_counts = self.store.tools_since(now - vitals.WINDOW)
         except Exception:
             log.exception("could not read agent annotations")
-            annotations, blocked = {}, {}
+            annotations, blocked, tool_counts = {}, {}, {}
 
-        now = time.time()
+        # One `list-sessions` for the whole roster rather than one `has-session`
+        # per agent: this runs on every request AND on every pass of a parked
+        # long-poll, so per-agent shelling out would be a subprocess storm. It is
+        # still computed now, per request, never cached -- which is what §4 asks
+        # for. The question is how many processes it costs, not how fresh it is.
+        panes = self._panes()
+
         out: list[dict[str, Any]] = []
         declared: set[str] = set()
         for record in records:
@@ -715,7 +787,8 @@ class Service:
             out.append(self._roster_row(
                 str(record.name), str(record.task or ""), live.get(record.session_id),
                 completed_at=record.completed_at, annotations=annotations,
-                blocked=blocked, now=now,
+                blocked=blocked, now=now, panes=panes, record=record,
+                tool_counts=tool_counts,
             ))
         # Live sessions that never declared themselves are still worth talking
         # to -- his own shells, mostly -- so they are listed under their derived
@@ -726,7 +799,8 @@ class Service:
             name = str(getattr(session, "name", "") or session_id[:8])
             out.append(self._roster_row(
                 name, "", session, completed_at=None, annotations=annotations,
-                blocked=blocked, now=now,
+                blocked=blocked, now=now, panes=panes, record=None,
+                tool_counts=tool_counts,
             ))
         return out
 
@@ -740,6 +814,9 @@ class Service:
         annotations: dict[str, Any],
         blocked: dict[str, float],
         now: float,
+        panes: set[str] | None = None,
+        record: Any = None,
+        tool_counts: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         annotation = annotations.get(name) or {}
         busy = bool(getattr(session, "status", "") == "busy")
@@ -788,6 +865,32 @@ class Service:
             "blockedSince": blocked_since,
             "retired": annotation.get("retired_at") is not None,
             "historyGeneration": int(annotation.get("history_generation") or 0),
+            # §11's first ask: the strip's ELAPSED cell. Already a column; the
+            # registry's own value wins because it survives this database being
+            # purged, and the annotation is the fallback for a live session that
+            # never declared itself.
+            "declaredAt": (
+                float(getattr(record, "declared_at", None) or 0.0) or None
+                if record is not None else None
+            ) or (float(annotation["declared_at"]) if annotation.get("declared_at") else None),
+            "controls": self._controls(
+                name, session, live=live, panes=panes, record=record
+            ),
+            # §11's second ask, and the reason it is a separate boolean from
+            # `vitals.contextUsed`: "no first turn yet" and "no statusline
+            # wrapper for this session" both arrive as a missing number, render
+            # identically, and mean opposite things. This one is observed --
+            # the wrapper has reported for this agent at least once -- rather
+            # than read out of a settings file the session may predate.
+            "contextAvailable": annotation.get("statusline_at") is not None,
+            "vitals": vitals.project(
+                agent=name,
+                annotation=dict(annotation),
+                tools_in_window=int((tool_counts or {}).get(name, 0)),
+                blocked_since=blocked_since,
+                rates=self.rates,
+                now=now,
+            ),
         }
 
     def _note_roster_changes(self, rows: list[dict[str, Any]]) -> None:
@@ -798,9 +901,7 @@ class Service:
         not worth machinery to prevent -- which is why `retire` and `purge` can
         emit their own without coordinating with this.
         """
-        snapshot = {
-            row["name"]: {field: row[field] for field in ROSTER_FIELDS} for row in rows
-        }
+        snapshot = {row["name"]: _signature(row) for row in rows}
         previous = self._roster_snapshot
         self._roster_snapshot = snapshot
         if previous is None:
@@ -814,8 +915,8 @@ class Service:
                 self._tick(name, "appeared")
             elif was != current:
                 self._tick(name, ", ".join(
-                    f"{field}: {was[field]} -> {current[field]}"
-                    for field in ROSTER_FIELDS if was[field] != current[field]
+                    f"{field}: {was.get(field)} -> {current[field]}"
+                    for field in current if was.get(field) != current[field]
                 ))
         for name in previous:
             if name not in snapshot:
@@ -853,6 +954,559 @@ class Service:
 
     def _is_live(self, agent: str) -> bool:
         return any(row["name"] == agent and row["live"] for row in self._roster_rows())
+
+    # ---- control: what he can do to an agent from his phone ---------------
+    #
+    # Everything here is subject to two rules that are easy to state and easy to
+    # get wrong.
+    #
+    # **`enabled` is computed per agent, at request time, and never cached.** A
+    # capability is a claim about right now, and a cached one is a claim about
+    # whenever the cache was filled. The pty cancel needs a pty, and a pane can
+    # die while the process it was running lives on.
+    #
+    # **The endpoint enforces independently of what the roster said.** A phone
+    # that has been asleep is holding a roster from ten minutes ago; every
+    # refusal below is re-derived when the request arrives, so a stale client
+    # showing a control as enabled gets a 409 rather than an action.
+
+    def _panes(self) -> set[str]:
+        try:
+            from hotline import tmuxen
+
+            return tmuxen.sessions()
+        except Exception:
+            log.exception("could not list tmux sessions")
+            return set()
+
+    def _pty_of(self, session: Any, panes: set[str] | None = None) -> tuple[str, str]:
+        """`(tmux target, why there is none)`. Exactly one of the two is empty.
+
+        The reason strings are the ones the phone renders verbatim (§7 rule 4),
+        so they say what is actually wrong rather than "unavailable". "Running
+        headless" and "its pane is gone" call for different responses from him
+        and used to be the same sentence.
+        """
+        if session is None:
+            return "", "not running"
+        target = str(getattr(session, "tmux", "") or "")
+        if not target:
+            return "", "running headless — its turn can't be interrupted, only killed"
+        name = target.split(":", 1)[0]
+        alive = name in (self._panes() if panes is None else panes)
+        if not alive:
+            return "", f"its tmux session {name} is gone, so there is no pane to type into"
+        return target, ""
+
+    def _resumable(self, record: Any) -> str:
+        """"" when the agent could be resumed, or why it could not."""
+        if record is None:
+            return "it never declared itself, so there is no record to resume from"
+        try:
+            from hotline.revive import brief_for
+
+            return "" if brief_for(record) is not None else (
+                "it left no handoff and its transcript is gone"
+            )
+        except Exception:
+            log.exception("could not work out whether %s is resumable", record)
+            return "could not read its handoff or transcript"
+
+    def _controls(
+        self,
+        name: str,
+        session: Any,
+        *,
+        live: bool,
+        panes: set[str] | None = None,
+        record: Any = None,
+    ) -> list[dict[str, Any]]:
+        """The capability list for one agent, computed now.
+
+        Order is the order the phone renders them in, and it is deliberate:
+        the two that keep the session first, the two that change what it is
+        doing next, the destructive one last.
+        """
+        _target, no_pty = self._pty_of(session, panes)
+        cannot_resume = self._resumable(record)
+        return [
+            _capability("stop", "Stop", not no_pty, no_pty),
+            _capability("compact", "Compact", not no_pty, no_pty),
+            _capability("retask", "Retask", live, "" if live else "not running"),
+            _capability(
+                "resume", "Resume", not live and not cannot_resume,
+                "it is still running — retask it instead" if live else cannot_resume,
+            ),
+            _capability("kill", "Kill", live, "" if live else "not running"),
+        ]
+
+    def global_controls(self) -> list[dict[str, Any]]:
+        """`new`, which belongs to the box rather than to any agent.
+
+        Verified rather than assumed: spawning needs a tmux to spawn into and a
+        `claude` to run, and reporting it enabled on a box missing either is the
+        same lie /health exists to stop telling about the doorbell.
+        """
+        import shutil
+
+        why = ""
+        if shutil.which("tmux") is None:
+            why = "tmux is not installed on this box, so there is no pane to start one in"
+        else:
+            try:
+                from hotline.config import CLAUDE_BIN
+
+                if not (pathlib.Path(CLAUDE_BIN).exists() or shutil.which(CLAUDE_BIN)):
+                    why = f"{CLAUDE_BIN} is not on this box"
+            except Exception:  # noqa: BLE001 - hotline is a PYTHONPATH dependency
+                why = "hotline is not importable here, so nothing can be spawned"
+        return [_capability("new", "New agent", not why, why)]
+
+    def _session_of(self, name: str) -> Any:
+        """The live session behind a roster name, or None. Resolved fresh.
+
+        Not taken from a roster row the caller happened to have: every
+        destructive path re-resolves immediately before acting, because the
+        window between computing a roster and acting on it is exactly where a
+        pid gets recycled.
+        """
+        live = self._live_sessions()
+        record = self._registry_record(name)
+        if record is not None:
+            found = live.get(str(getattr(record, "session_id", "")))
+            if found is not None:
+                return found
+        for session_id, session in live.items():
+            if str(getattr(session, "name", "") or session_id[:8]) == name:
+                return session
+        return None
+
+    def _note(self, agent: str, kind: str, text: str, tool: str | None = None) -> None:
+        """File a fact about the session into its own channel.
+
+        A stop, a kill and a compaction are things that happened to the agent,
+        not toasts about a button press, so they belong in the record he scrolls
+        rather than in a banner that disappears.
+        """
+        try:
+            self.store.append_event(agent, kind, text, tool=tool)
+        except Exception:
+            log.exception("could not record %s for %s", kind, agent)
+            return
+        self._waker(agent).wake()
+
+    def _refuse(self, status: int, message: str) -> Any:
+        from hotline.httpd import HttpError
+
+        return HttpError(status, message)
+
+    async def _interrupt(self, name: str, session: Any) -> str:
+        """The one cancel path, with its debounce. Returns "" or why it refused.
+
+        `tmuxen.interrupt` is the only thing that knows a cancel is a keystroke.
+        Everything above this line asks for it by name, so the day `ccsocks`
+        grows a real cancel message this is where it is swapped and nowhere
+        else.
+        """
+        from hotline.errors import HotlineError
+
+        target, why = self._pty_of(session)
+        if not target:
+            return why
+        now = time.monotonic()
+        last = self._last_stop_at.get(name)
+        if last is not None and now - last < STOP_DEBOUNCE:
+            return "already interrupting"
+        self._last_stop_at[name] = now
+        try:
+            from hotline import tmuxen
+
+            await tmuxen.interrupt(target)
+        except HotlineError as exc:
+            # Nothing landed, so the debounce must not stand: it exists to stop
+            # a second Escape reaching a session that already got one, and this
+            # session got none.
+            self._last_stop_at.pop(name, None)
+            return str(exc)
+        return ""
+
+    async def stop(self, agent: str) -> dict[str, Any]:
+        """Cancel the current turn. The session survives and can take new work."""
+        name = self._known_agent(agent)
+        session = self._session_of(name)
+        why = await self._interrupt(name, session)
+        if why:
+            raise self._refuse(409, why)
+        self._note(name, "state", "interrupted from the phone; the session is still running")
+        self._roster_waker.wake()
+        return {"agent": name, "interrupted": True}
+
+    async def kill(self, agent: str) -> dict[str, Any]:
+        """End the session. It only comes back through `resume`.
+
+        `ccsocks.terminate()` directly rather than `router.kill_session()`: the
+        router resolves a fuzzy spec, and this has already resolved the exact
+        session. Handing a name back to a fuzzy resolver so it can find it again
+        is a chance to find a different one, on the one endpoint where that
+        would be unrecoverable. `terminate()` carries the self-guard either way.
+        """
+        from hotline.errors import HotlineError
+
+        name = self._known_agent(agent)
+        session = self._session_of(name)
+        if session is None:
+            raise self._refuse(409, "not running")
+        try:
+            from hotline.ccsocks import terminate
+
+            outcome = await terminate(session)
+        except HotlineError as exc:
+            raise self._refuse(409, str(exc)) from exc
+        self._note(name, "state", f"killed from the phone: {outcome}")
+        self._roster_waker.wake()
+        return {"agent": name, "outcome": outcome}
+
+    async def retask(
+        self,
+        agent: str,
+        text: str,
+        *,
+        stop_first: bool = False,
+        client_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Give a running agent new work, optionally cancelling what it is on.
+
+        Composed here rather than as two calls from the phone: if the interrupt
+        lands and the network drops the second request, the agent is cancelled
+        with nothing queued to replace it. One request makes it atomic from the
+        phone's side.
+
+        `stop_first` is refused when that agent's `stop` is not available, never
+        silently downgraded -- "it stopped and started the new work" and "it will
+        get to this after the current turn" are different outcomes and he acts
+        on them differently.
+        """
+        from hotline.errors import HotlineError
+
+        name = self._known_agent(agent)
+        session = self._session_of(name)
+        if session is None:
+            raise self._refuse(409, "not running")
+
+        interrupted = False
+        if stop_first:
+            why = await self._interrupt(name, session)
+            if why:
+                raise self._refuse(409, f"stop_first was asked for, but {why}")
+            interrupted = True
+
+        try:
+            from hotline.ccsocks import inject
+
+            await inject(session, text)
+        except HotlineError as exc:
+            raise self._refuse(409, str(exc)) from exc
+
+        # Observed after the fact rather than predicted: whether this lands now
+        # or waits its turn depends on what the session is doing at this instant,
+        # and the descriptor is the session's own word for that.
+        queued = self._is_busy(session)
+        entry = self._note_retask(name, text, client_token)
+        self._roster_waker.wake()
+        return {
+            "agent": name,
+            "delivered": True,
+            "queued": queued,
+            "interrupted": interrupted,
+            "clientToken": client_token,
+            "seq": entry,
+        }
+
+    def _is_busy(self, session: Any) -> bool:
+        try:
+            from hotline.ccsocks import status_of
+
+            return status_of(int(getattr(session, "pid", 0))) == "busy"
+        except Exception:
+            log.exception("could not re-read the status of %s", getattr(session, "name", "?"))
+            return bool(getattr(session, "status", "") == "busy")
+
+    def _note_retask(self, name: str, text: str, client_token: str | None) -> int | None:
+        try:
+            stored = self.store.append_event(name, "you", text, client_token=client_token)
+        except Exception:
+            log.exception("could not record a retask for %s", name)
+            return None
+        self._waker(name).wake()
+        return stored.seq
+
+    # ---- compact -----------------------------------------------------------
+
+    async def compact(self, agent: str, then: str | None = None) -> dict[str, Any]:
+        """Interrupt, run `/compact`, wait for it to really finish, then continue.
+
+        Composed here for the same reason `retask {stop_first}` is: three calls
+        from a phone means a dropped connection can leave the agent interrupted
+        and idle, or compacted and never restarted.
+
+        Two things about the mechanism are not obvious and were both established
+        by direct observation rather than reasoning:
+
+        * **`/compact` has to go through the pty.** `ccsocks.inject("/compact")`
+          delivers it as literal text -- the transcript shows it landing as an
+          ordinary peer user turn, and the model answered that it had no tool
+          that could compact anything. That is the exact "types a string into a
+          prompt" failure this endpoint exists to avoid, and it is what the
+          obvious implementation would have shipped.
+        * **The continuation is the opposite.** `inject()` is right for it,
+          because a continuation genuinely is a user message. So the two steps
+          use two different channels on purpose.
+
+        Every field of the response reports what actually happened. `resumed:
+        false` is a valid outcome, not a failure to smooth over.
+        """
+        from hotline.errors import HotlineError
+
+        name = self._known_agent(agent)
+        session = self._session_of(name)
+        began = time.monotonic()
+        result: dict[str, Any] = {
+            "agent": name, "interrupted": False, "compacted": False, "resumed": False,
+            "preTokens": None, "postTokens": None, "durationMs": None, "detail": "",
+        }
+
+        target, why = self._pty_of(session)
+        if not target:
+            raise self._refuse(409, why)
+
+        stopped = await self._interrupt(name, session)
+        if stopped:
+            raise self._refuse(409, stopped)
+        result["interrupted"] = True
+
+        # The CLI has to finish cancelling before it will take a new line. This
+        # paces a terminal, which is the one thing a short wait is honest for --
+        # it is not standing in for the completion signal, which is watched for
+        # and never timed.
+        await asyncio.sleep(COMPACT_SETTLE)
+        try:
+            from hotline import tmuxen
+
+            await tmuxen.send_command(target, "/compact")
+        except HotlineError as exc:
+            result["detail"] = f"interrupted, but /compact could not be typed: {exc}"
+            return self._finish_compact(result, began)
+
+        session_id = str(getattr(session, "session_id", ""))
+        found, detail = await self._await_compaction(name, session_id, session)
+        result["detail"] = detail
+        if found is None:
+            return self._finish_compact(result, began)
+
+        result["compacted"] = True
+        result["preTokens"] = _as_int(found.get("pre_tokens"))
+        result["postTokens"] = _as_int(found.get("post_tokens"))
+        result["durationMs"] = _as_int(found.get("duration_ms"))
+
+        try:
+            from hotline.ccsocks import inject
+
+            await inject(session, then or CONTINUE_AFTER_COMPACT)
+            result["resumed"] = True
+        except HotlineError as exc:
+            # Reported, not smoothed over: he is looking at a compacted session
+            # that is sitting there doing nothing, and the app renders that as
+            # its own state with a Continue button rather than as success.
+            result["detail"] = (
+                f"compacted, but the continuation could not be delivered: {exc}"
+            )
+        self._roster_waker.wake()
+        return self._finish_compact(result, began)
+
+    def _finish_compact(self, result: dict[str, Any], began: float) -> dict[str, Any]:
+        result["elapsedMs"] = int((time.monotonic() - began) * 1000)
+        summary = (
+            f"compacted {result['preTokens']} → {result['postTokens']} tokens"
+            if result["compacted"] and result["preTokens"] is not None
+            else ("compacted" if result["compacted"] else "compaction did not complete")
+        )
+        if not result["resumed"]:
+            summary += "; not resumed"
+        if result["detail"]:
+            summary += f" ({result['detail']})"
+        self._note(result["agent"], "state", summary)
+        return result
+
+    async def _await_compaction(
+        self, agent: str, session_id: str, session: Any
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Wait for the `compact_boundary` record. Observed, never timed.
+
+        The transcript marker is the only thing counted as success, because it
+        is the only signal that says compaction *happened* -- it carries the
+        CLI's own `preTokens`, `postTokens` and `durationMs`, which is what lets
+        the button report "48k → 4.1k in 71s" instead of a green tick.
+
+        The descriptor's `busy` → `idle` flip is watched too, but only as a
+        reason to stop waiting. On its own it is ambiguous: a session that never
+        ran the command is also idle, and treating that as a success is exactly
+        the check-that-measures-nothing this project has been burned by. So
+        going idle without a marker ends the wait and is reported as a failure
+        with the reason, not as a compaction.
+        """
+        deadline = time.monotonic() + COMPACT_TIMEOUT
+        saw_busy = False
+        while time.monotonic() < deadline:
+            await asyncio.sleep(COMPACT_POLL)
+            ingested = await self.ingest_session(agent, session_id)
+            if ingested is not None and ingested.last_compaction:
+                return dict(ingested.last_compaction), ""
+            status = self._status_of(session)
+            if status == "busy":
+                saw_busy = True
+            elif saw_busy and status == "idle":
+                # One more read: the descriptor can flip before the record has
+                # been flushed, and calling it a failure on that race would be
+                # wrong about a compaction that did happen.
+                await asyncio.sleep(COMPACT_POLL)
+                ingested = await self.ingest_session(agent, session_id)
+                if ingested is not None and ingested.last_compaction:
+                    return dict(ingested.last_compaction), ""
+                return None, (
+                    "the session went idle without writing a compaction boundary, "
+                    "so /compact did not run"
+                )
+        return None, (
+            f"no compaction boundary appeared within {COMPACT_TIMEOUT:.0f}s; "
+            "nothing was resumed rather than firing into a session that may still be busy"
+        )
+
+    def _status_of(self, session: Any) -> str | None:
+        try:
+            from hotline.ccsocks import status_of
+
+            return status_of(int(getattr(session, "pid", 0)))
+        except Exception:
+            log.exception("could not read the status of %s", getattr(session, "name", "?"))
+            return None
+
+    async def resume(self, agent: str, cwd: str | None = None) -> dict[str, Any]:
+        """Bring a dead agent back on a new session, seeded with what survives.
+
+        The revive itself is `hotline.revive.resume`, shared with the CLI's
+        `--resume`, because two implementations of "spawn, rehome, keep the
+        channel" would be two chances to disagree about what resuming means.
+
+        The brief is injected and not waited on. The CLI waits five minutes for
+        the first answer and prints it; this cannot, and `seeded` says whether
+        the message was accepted rather than whether it was understood.
+        """
+        from hotline.errors import HotlineError
+
+        name = str(agent or "").strip()
+        if not name:
+            raise self._refuse(400, "agent is required")
+        try:
+            from hotline.agents import Registry
+            from hotline.channels import from_env as channels_from_env
+            from hotline.revive import NoSuchAgent, NothingToResumeFrom
+            from hotline.revive import resume as revive_resume
+        except Exception as exc:
+            raise self._refuse(503, f"hotline is not importable here: {exc}") from exc
+
+        try:
+            resumed = await revive_resume(
+                name, Registry(), cwd=cwd or None, channels=channels_from_env()
+            )
+        except NoSuchAgent as exc:
+            raise self._refuse(404, str(exc)) from exc
+        except NothingToResumeFrom as exc:
+            raise self._refuse(409, str(exc)) from exc
+        except HotlineError as exc:
+            raise self._refuse(409, f"could not start a session: {exc}") from exc
+
+        seeded = True
+        try:
+            from hotline.ccsocks import inject
+
+            await inject(resumed.session, resumed.brief.seed)
+        except HotlineError:
+            log.exception("resumed %s but could not hand it its brief", name)
+            seeded = False
+
+        self.store.ensure_agent(
+            resumed.agent.name,
+            session_id=resumed.session.session_id,
+            task=resumed.agent.task,
+        )
+        self._note(
+            resumed.agent.name, "state",
+            "resumed from the phone" + (
+                " on its handoff" if resumed.from_handoff else " on its transcript"
+            ),
+        )
+        self._roster_waker.wake()
+        return {
+            "agent": resumed.agent.name,
+            "session": resumed.session.session_id,
+            "from_handoff": resumed.from_handoff,
+            "seeded": seeded,
+            "tmux": resumed.tmux,
+            "keptChannel": resumed.kept_channel,
+            "channelError": resumed.channel_error,
+        }
+
+    async def new_agent(
+        self, task: str, cwd: str | None = None, name: str | None = None
+    ) -> dict[str, Any]:
+        """Start a fresh session and hand it its task."""
+        from hotline.errors import HotlineError
+
+        task = str(task or "").strip()
+        if not task:
+            raise self._refuse(400, "task is required")
+        blocked = self.global_controls()[0]
+        if not blocked["enabled"]:
+            raise self._refuse(409, str(blocked["reason"]))
+        try:
+            from hotline import tmuxen
+            from hotline.agents import Registry
+        except Exception as exc:
+            raise self._refuse(503, f"hotline is not importable here: {exc}") from exc
+
+        wanted = str(name or "").strip() or None
+        try:
+            session = await tmuxen.spawn(
+                wanted or f"ios-{uuid.uuid4().hex[:6]}",
+                cwd=cwd or None, name=wanted, timeout=SPAWN_TIMEOUT,
+            )
+        except HotlineError as exc:
+            raise self._refuse(409, f"could not start a session: {exc}") from exc
+
+        agent_name = wanted or str(getattr(session, "name", "") or session.session_id[:8])
+        try:
+            Registry().declare(session.session_id, agent_name, task)
+        except Exception:  # a running session beats a tidy registry
+            log.exception("started %s but could not declare it", agent_name)
+
+        delivered = True
+        try:
+            from hotline.ccsocks import inject
+
+            await inject(session, task)
+        except HotlineError:
+            log.exception("started %s but could not hand it its task", agent_name)
+            delivered = False
+
+        self.store.ensure_agent(agent_name, session_id=session.session_id, task=task)
+        self._note(agent_name, "state", "started from the phone")
+        self._roster_waker.wake()
+        return {
+            "agent": agent_name,
+            "session": session.session_id,
+            "delivered": delivered,
+            "tmux": getattr(session, "tmux", None),
+        }
 
     # ---- the map: hooks nudge, this tails the transcript ------------------
 
@@ -946,6 +1600,9 @@ class Service:
         self.ingest_stalled.pop(agent, None)
 
         result = ingest.absorb(self.store, agent, found.events, turn_ended=turn_ended)
+        # The only place an output rate can come from: the prose itself is not
+        # stored, so it is counted as it goes past. See `vitals.py`.
+        self.rates.observe(agent, result.text_samples)
         self.store.set_read_position(agent, found.offset, found.sidechains)
         if result.last_tool_at is not None:
             # An honestly-observed tool call, which is what makes `stalled` mean
@@ -1009,9 +1666,26 @@ class Service:
                 log.exception("could not record a context sample for %s", agent)
 
         if event == "StatusLine":
+            # Recorded even when the payload carried no usage figure. This is
+            # what `contextAvailable` is: the wrapper reported, so a missing
+            # number means "no first turn yet" rather than "no wrapper here",
+            # and the app renders those two differently on purpose.
+            try:
+                self.store.set_statusline_seen(agent)
+            except Exception:
+                log.exception("could not record a statusline report for %s", agent)
             # Reports context, not transcript progress, and fires several times
             # per turn. Tailing on it would triple the reads for nothing.
             return {"ok": True, "agent": agent, "event": event, "events": 0}
+
+        if event == "PostToolUse":
+            # The only place a per-tool duration exists. The transcript's own
+            # `durationMs` is a whole turn's, and there is nothing per-call in
+            # the file at all -- checked, not assumed. No tail here either: the
+            # `tool_use` record was already read on the PreToolUse nudge, and
+            # re-reading would double the work for a column update.
+            return {"ok": True, "agent": agent, "event": event,
+                    **self._record_duration(agent, body)}
 
         result = await self.ingest_session(
             agent, session_id, turn_ended=event in TURN_ENDING_EVENTS
@@ -1024,6 +1698,27 @@ class Service:
             "events": result.events, "tools": result.tools,
             "phases_opened": result.phases_opened, "phases_closed": result.phases_closed,
         }
+
+    def _record_duration(self, agent: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Attach `PostToolUse.duration_ms` to the row the transcript already wrote.
+
+        A miss is reported rather than swallowed: it means the row for that
+        `tool_use_id` was never written, and the app then draws no duration bar
+        at all instead of a guessed one -- which is the correct behaviour and is
+        worth being able to see the rate of.
+        """
+        tool_use_id = str(body.get("tool_use_id") or "")
+        duration = body.get("duration_ms")
+        if not tool_use_id or not isinstance(duration, int | float):
+            return {"timed": False, "reason": "no tool_use_id or duration_ms in the nudge"}
+        try:
+            matched = self.store.set_duration(tool_use_id, float(duration))
+        except Exception:
+            log.exception("could not record a tool duration for %s", agent)
+            return {"timed": False, "reason": "the store refused it"}
+        if not matched:
+            self.tool_durations_unmatched += 1
+        return {"timed": matched}
 
     async def poll_once(self) -> dict[str, Any]:
         """One sweep of every live session that maps to a known agent.
@@ -1073,6 +1768,12 @@ class Service:
             raise HttpError(400, "agent is required")
         if self._registry_record(name) is not None:
             return self.resolve_agent(name)
+        # A live session that never declared itself is a row on his roster under
+        # its derived name, so it has to be addressable by that name too --
+        # otherwise every control on one of his own shells 404s while the app is
+        # showing it as available.
+        if self._session_of(name) is not None:
+            return name
         try:
             if self.store.agent(name) is not None:
                 return name
@@ -1203,6 +1904,10 @@ class Service:
         except ValueError as exc:
             raise HttpError(400, str(exc)) from exc
         if not dry_run:
+            # The in-memory output samples are history too. Leaving them would
+            # mean a purged agent still animated a rate derived from prose that
+            # is no longer anywhere.
+            self.rates.forget(name)
             for conversation in list(self.calls):
                 if self.store.conversation(conversation) is None:
                     self.calls.pop(conversation, None)
@@ -1213,7 +1918,9 @@ class Service:
             self._tick(name, f"historyGeneration: {result['history_generation']}")
         return result
 
-    async def say(self, text: str, agent: str | None) -> dict[str, Any]:
+    async def say(
+        self, text: str, agent: str | None, client_token: str | None = None
+    ) -> dict[str, Any]:
         """Send him a turn's worth of instruction and follow the reply.
 
         Returns immediately with a conversation key. The answer arrives on the
@@ -1223,7 +1930,12 @@ class Service:
         """
         conversation, _events = self._open_conversation(agent, "say")
         name = self.call_agent[conversation]
-        self._append(conversation, "you", text)
+        # §11: the phone's own id for this message, echoed back and carried on
+        # the row. It turns reconciling a local echo against the feed from
+        # "sound because this phone is the only writer" into an equality test,
+        # and makes a retry after a timeout detectable as a duplicate rather
+        # than delivered twice.
+        self._append(conversation, "you", text, client_token=client_token)
 
         key = f"ios-{conversation}"
         if agent:
@@ -1262,7 +1974,7 @@ class Service:
                 self._close_conversation(conversation)
 
         self.sessions[conversation] = asyncio.ensure_future(run())
-        return {"conversation": conversation}
+        return {"conversation": conversation, "clientToken": client_token}
 
     def conversations(self) -> dict[str, Any]:
         """Everything open, newest first.
@@ -1293,7 +2005,9 @@ class Service:
         out.sort(key=lambda row: row["opened"], reverse=True)
         return {"conversations": out}
 
-    async def reply(self, conversation: str, text: str) -> dict[str, Any]:
+    async def reply(
+        self, conversation: str, text: str, client_token: str | None = None
+    ) -> dict[str, Any]:
         """His answer to a question a ring opened.
 
         Distinct from `say`, which starts a new conversation with an agent. This
@@ -1305,7 +2019,7 @@ class Service:
         events = self._channel(conversation)
         if events is None:
             raise HttpError(404, f"no conversation {conversation}")
-        self._append(conversation, "you", text)
+        self._append(conversation, "you", text, client_token=client_token)
         try:
             # He answered, so nothing is blocked on him here any more --
             # whatever else happens to the conversation afterwards.
@@ -1313,7 +2027,7 @@ class Service:
         except Exception:  # the answer is delivered either way
             log.exception("could not mark %s answered", conversation)
         self._roster_waker.wake()
-        return {"conversation": conversation, "delivered": True}
+        return {"conversation": conversation, "delivered": True, "clientToken": client_token}
 
     # ---- the live feed ---------------------------------------------------
 
@@ -1333,6 +2047,42 @@ class Service:
             "gap": events.gap(since),
             "dropped": events.dropped,
         }
+
+
+def _as_int(value: Any) -> int | None:
+    """A real number or nothing. Never a zero standing in for "not reported"."""
+    return int(value) if isinstance(value, int | float) else None
+
+
+def _capability(id_: str, label: str, enabled: bool, reason: str) -> dict[str, Any]:
+    """One `Capability`, in the shape §4 declares.
+
+    `reason` is dropped when the thing is enabled -- a reason for a control that
+    works is noise -- and is never empty when it is not. A disabled control with
+    no reason is indistinguishable on the phone from a broken one, which is the
+    exact failure §7 rule 4 exists to prevent.
+    """
+    return {
+        "id": id_,
+        "label": label,
+        "enabled": bool(enabled),
+        "reason": None if enabled else (reason or "unavailable"),
+    }
+
+
+def _signature(row: dict[str, Any]) -> dict[str, Any]:
+    """What counts as a roster change worth waking a phone for.
+
+    `controls` is in here as the set of enabled ids rather than the whole list,
+    because a pane can die while the process that owned it lives: `stop` and
+    `compact` go from available to refused and nothing else on the row moves. A
+    phone holding the old row would show him two buttons that now 409.
+    """
+    out: dict[str, Any] = {field: row[field] for field in ROSTER_FIELDS}
+    out["controls"] = ",".join(
+        capability["id"] for capability in row.get("controls", ()) if capability["enabled"]
+    )
+    return out
 
 
 def _first_offset(session_id: str) -> int:
@@ -1474,6 +2224,10 @@ def build_server(service: Service, host: str | Sequence[str], port: int) -> Any:
             # whether a request to it just now actually worked.
             "hook_url": service.hook_url,
             "hook_reachable": hook_ok,
+            # §4: the app renders whatever is here and hardcodes none of it.
+            # `new` belongs to the box rather than to any agent, so it rides
+            # here rather than on a roster row.
+            "globalControls": service.global_controls(),
             # The map's own honesty fields. `unattributed_hook_events` counts
             # nudges dropped because nothing matched the session -- never filed
             # under a guess -- and `ingest_stalled` names the agents whose
@@ -1483,6 +2237,7 @@ def build_server(service: Service, host: str | Sequence[str], port: int) -> Any:
             "hook_events": service.hook_events,
             "unattributed_hook_events": service.unattributed_hook_events,
             "hook_parse_failures": service.hook_parse_failures,
+            "tool_durations_unmatched": service.tool_durations_unmatched,
             "ingest_stalled": sorted(service.ingest_stalled),
             # Surfaced on the health endpoint on purpose: a ringer that has been
             # silently degrading is exactly what a health check is for.
@@ -1539,6 +2294,68 @@ def build_server(service: Service, host: str | Sequence[str], port: int) -> Any:
             int(body.get("since", 0)), float(body.get("wait", 25))
         )
 
+    # ---- control ---------------------------------------------------------
+    #
+    # Every one of these re-derives its own refusal rather than trusting the
+    # roster the client is holding. That is not belt-and-braces: his phone
+    # renders a roster that can be minutes old, and the capability list is a
+    # description of the moment it was computed.
+
+    @server.route("POST", "/api/v1/agents/stop")
+    async def stop(request: Any) -> tuple[int, dict[str, Any]]:
+        service.authorise(request)
+        body = request.json()
+        return 200, await service.stop(str(body.get("agent", "")))
+
+    @server.route("POST", "/api/v1/agents/kill")
+    async def kill(request: Any) -> tuple[int, dict[str, Any]]:
+        service.authorise(request)
+        body = request.json()
+        return 200, await service.kill(str(body.get("agent", "")))
+
+    @server.route("POST", "/api/v1/agents/retask")
+    async def retask(request: Any) -> tuple[int, dict[str, Any]]:
+        service.authorise(request)
+        body = request.json()
+        text = str(body.get("text", "")).strip()
+        if not text:
+            raise HttpError(400, "text is required")
+        token = body.get("client_token")
+        return 200, await service.retask(
+            str(body.get("agent", "")), text,
+            stop_first=bool(body.get("stop_first", False)),
+            client_token=str(token) if token else None,
+        )
+
+    @server.route("POST", "/api/v1/agents/resume")
+    async def resume(request: Any) -> tuple[int, dict[str, Any]]:
+        service.authorise(request)
+        body = request.json()
+        cwd = body.get("cwd")
+        return 200, await service.resume(
+            str(body.get("agent", "")), str(cwd) if cwd else None
+        )
+
+    @server.route("POST", "/api/v1/agents/new")
+    async def new_agent(request: Any) -> tuple[int, dict[str, Any]]:
+        service.authorise(request)
+        body = request.json()
+        cwd, name = body.get("cwd"), body.get("name")
+        return 200, await service.new_agent(
+            str(body.get("task", "")),
+            str(cwd) if cwd else None,
+            str(name) if name else None,
+        )
+
+    @server.route("POST", "/api/v1/agents/compact")
+    async def compact(request: Any) -> tuple[int, dict[str, Any]]:
+        service.authorise(request)
+        body = request.json()
+        then = body.get("then")
+        return 200, await service.compact(
+            str(body.get("agent", "")), str(then) if then else None
+        )
+
     @server.route("POST", "/api/v1/agents/retire")
     async def retire(request: Any) -> tuple[int, dict[str, Any]]:
         service.authorise(request)
@@ -1573,7 +2390,10 @@ def build_server(service: Service, host: str | Sequence[str], port: int) -> Any:
         if not text:
             raise HttpError(400, "text is required")
         agent = body.get("agent")
-        return 200, await service.say(text, str(agent) if agent else None)
+        token = body.get("client_token")
+        return 200, await service.say(
+            text, str(agent) if agent else None, str(token) if token else None
+        )
 
     @server.route("POST", "/api/v1/conversations")
     async def conversations(request: Any) -> tuple[int, dict[str, Any]]:
@@ -1588,7 +2408,10 @@ def build_server(service: Service, host: str | Sequence[str], port: int) -> Any:
         text = str(body.get("text", "")).strip()
         if not conversation or not text:
             raise HttpError(400, "conversation and text are required")
-        return 200, await service.reply(conversation, text)
+        token = body.get("client_token")
+        return 200, await service.reply(
+            conversation, text, str(token) if token else None
+        )
 
     @server.route("POST", "/api/v1/hangup")
     async def hangup(request: Any) -> tuple[int, dict[str, Any]]:

@@ -43,3 +43,29 @@ def isolated_store(tmp_path, monkeypatch):
     this is here to make impossible.
     """
     monkeypatch.setenv("HOTLINE_IOS_DB", str(tmp_path / "hotline-ios.db"))
+
+
+@pytest.fixture(autouse=True)
+def no_real_tmux(monkeypatch):
+    """Nothing in this suite may shell out to the real tmux.
+
+    Two separate reasons, and the second is the serious one. The box this runs
+    on has live agent sessions on it, including whichever one is running the
+    suite, so a test that reached a real `tmux send-keys` could type into
+    somebody's work. And a roster test that read the real session list would
+    assert against whatever happened to be running, which is flaky in a way that
+    looks like a bug in this code.
+
+    Defaults are "no tmux server at all". A test that needs panes overrides
+    `sessions`/`exists`; `_tmux` itself raises, so nothing can reach a real
+    subprocess by a path nobody thought to stub.
+    """
+    tmuxen = pytest.importorskip("hotline.tmuxen")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(f"the suite tried to shell out to tmux: {args}")
+
+    monkeypatch.setattr(tmuxen, "_tmux", forbidden)
+    monkeypatch.setattr(tmuxen, "_detached_tmux", forbidden)
+    monkeypatch.setattr(tmuxen, "sessions", lambda: set())
+    monkeypatch.setattr(tmuxen, "exists", lambda name: False)
