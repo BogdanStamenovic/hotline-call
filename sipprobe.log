@@ -1,6 +1,0 @@
-2026-08-25 18:35:10,750 INFO SIP probe listening on 100.72.2.62:5060 (UDP), capturing to /home/bodas/data/hotline-ios/sip-capture.txt
-2026-08-25 18:35:22,026 INFO REGISTER from 100.72.2.62:59963
-2026-08-25 18:35:22,026 INFO   From:    <sip:smoketest@100.72.2.62>;tag=t1
-2026-08-25 18:35:22,026 INFO   Contact: <sip:smoketest@100.72.2.62>;pn-provider=apns;pn-prid=SMOKE123;pn-param=TEAM.org.linphone.phone.voip
-2026-08-25 18:35:22,026 INFO   PUSH PARAMS FOUND: {'pn-provider': 'apns', 'pn-prid': 'SMOKE123', 'pn-param': 'TEAM.org.linphone.phone.voip'}
-2026-08-25 18:35:22,027 INFO   >>> THIS IS THE ANSWER: the app DOES emit a push token for a third-party domain. Outcome C-TAILNET is viable.

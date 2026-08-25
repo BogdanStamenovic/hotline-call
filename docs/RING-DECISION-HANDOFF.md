@@ -8,6 +8,49 @@ the build; `hotline-80`/`hotline-2c` owns the server and coordination.
 second artifact). Also posted in full to Bogdan's Discord channel so it is
 actionable without opening the link.
 
+## DECIDED 2026-08-25 16:59 — msg `1541854587424735242`, verified kind=human
+
+> "make your own app for delegation talking excetera which i will sideload every
+> week. Telegram for the ring. And we can fully scrap the talking voice rout.
+> Thats bassically a gimic"
+
+**Neither B nor C as briefed. He split the ring from the interface.**
+- **Telegram is the doorbell** (`telethon`, `phone.requestCall`).
+- **His own app is the interface** — text-first, sideloaded weekly, cost accepted.
+- **The voice route is scrapped**, called a gimmick.
+
+**Every option we costed assumed the thing that RINGS is the thing you TALK
+THROUGH.** B made one app do both and paid with the keepalive; C took a
+stranger's app for the ring and inherited its UI. Splitting them dissolves
+nearly this whole document:
+
+- no CallKit in his app -> the unproven local-ring question is MOOT
+- no `UIBackgroundModes: audio` -> all four silent-death paths GONE
+- **no push entitlement needed at all** -> free provisioning was only ever a
+  problem because of push
+- reboot gap stops mattering for an app you tap to open
+- no SIP / Linphone / Belledonne -> the ungated-endpoint dependency GONE
+- no audio transport -> jitter, DERP relay, Opus-vs-G.711 all IRRELEVANT here
+
+Surviving cost: the 7-day re-sign, taken knowingly and unprompted.
+
+**Surviving work — now the critical path:** the toolchain (Swift 6.3.3 + xtool),
+the `workflow` scope and the authorised throwaway public repo. One
+`gh repo create` from the SDK build. ConfirmedRing survives and simplifies:
+positive evidence or report unreachable, applied to `phone.requestCall`.
+The transport-agnostic core is vindicated — the ring swapped out with no rewrite.
+
+**CANCELLED asks — do not let him do these:** installing Linphone (answers a
+question nobody asks now) and the 30-second WiFi test (was for audio quality,
+which no longer exists as a concern).
+
+**OPEN, load-bearing:** (1) Is Telegram actually on his phone? The plan presumes
+it and nobody asked until after he decided. (2) Does "scrap the voice route"
+mean DELETE hotline's existing Discord voice pipeline (`voice.py`, `audio.py`,
+Whisper, Piper, 398 tests), or only stop investing? **Conservative reading
+adopted: delete nothing.** Awaiting his word. Do not remove a working tested
+subsystem on an inferred reading.
+
 ## State
 
 - **Money question: closed.** No $99 Apple Developer. His words, verified

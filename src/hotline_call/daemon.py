@@ -267,28 +267,6 @@ class Service:
         }
 
 
-def _find_local(transport: Any) -> Any:
-    """Find a LocalTransport wherever it sits -- bare, wrapped, or in a chain.
-
-    Written as a search rather than a stored reference because the transport is
-    assembled from ConfirmedRing and RingChain at startup, and requiring the
-    daemon to know that shape would couple it to a composition that is meant to
-    be rearrangeable.
-    """
-    from .ring.local import LocalTransport
-
-    seen: list[Any] = [transport]
-    while seen:
-        current = seen.pop()
-        if isinstance(current, LocalTransport):
-            return current
-        inner = getattr(current, "inner", None)
-        if inner is not None:
-            seen.append(inner)
-        seen.extend(getattr(current, "links", []) or [])
-    return None
-
-
 def _speakable():
     try:
         from hotline.voice import speakable
@@ -356,44 +334,6 @@ def build_server(service: Service, host: str, port: int) -> Any:
     # so `/events/<call_id>/<since>` is not available either. The choice was
     # between forking a server Bogdan has already read and putting two integers
     # in a JSON body. The body wins easily.
-    # ---- what the phone itself calls -------------------------------------
-    #
-    # These only do anything when a LocalTransport is somewhere in the chain.
-    # Routed unconditionally rather than conditionally registered so that an app
-    # pointed at a server running a different transport gets a clear 409 instead
-    # of a 404 that looks like a wrong URL.
-
-    def _local() -> Any:
-        found = _find_local(service.transport)
-        if found is None:
-            raise HttpError(409, "this server has no own-app transport in its ring chain")
-        return found
-
-    @server.route("POST", "/api/v1/device/poll")
-    async def device_poll(request: Any) -> tuple[int, dict[str, Any]]:
-        service.authorise(request)
-        body = request.json()
-        ring = await _local().poll(timeout=min(float(body.get("wait", 25)), MAX_WAIT))
-        return 200, {"ring": ring}
-
-    @server.route("POST", "/api/v1/device/ack")
-    async def device_ack(request: Any) -> tuple[int, dict[str, Any]]:
-        """The app saying it put a call on screen. This is the proof it rang."""
-        service.authorise(request)
-        call_id = str(request.json().get("call_id", ""))
-        if not call_id:
-            raise HttpError(400, "call_id is required")
-        return 200, {"acknowledged": _local().acknowledge(call_id)}
-
-    @server.route("POST", "/api/v1/device/answer")
-    async def device_answer(request: Any) -> tuple[int, dict[str, Any]]:
-        service.authorise(request)
-        body = request.json()
-        call_id = str(body.get("call_id", ""))
-        if not call_id:
-            raise HttpError(400, "call_id is required")
-        return 200, {"settled": _local().settle(call_id, bool(body.get("answered", False)))}
-
     @server.route("POST", "/api/v1/hangup")
     async def hangup(request: Any) -> tuple[int, dict[str, Any]]:
         service.authorise(request)
