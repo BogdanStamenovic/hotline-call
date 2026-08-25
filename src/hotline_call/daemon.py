@@ -541,6 +541,10 @@ def build_transport(names: Sequence[str], *, confirm_within: float = 8.0) -> Any
             from .ring.telegram import TelegramTransport
 
             links.append(TelegramTransport())
+        elif name == "sip":
+            from .ring.sip import SipTransport
+
+            links.append(SipTransport())
         elif name == "loopback":
             from .ring.loopback import LoopbackTransport
 
@@ -548,7 +552,7 @@ def build_transport(names: Sequence[str], *, confirm_within: float = 8.0) -> Any
         else:
             raise SystemExit(
                 f"hotline-iosd: unknown ring transport {name!r}; "
-                "known: telegram, loopback"
+                "known: telegram, sip, loopback"
             )
     if not links:
         raise SystemExit("hotline-iosd: no ring transport configured; set HOTLINE_IOS_RING")

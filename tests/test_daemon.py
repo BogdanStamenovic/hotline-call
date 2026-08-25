@@ -395,3 +395,18 @@ async def test_replying_to_a_conversation_that_does_not_exist_is_a_404():
         assert exc.value.code == 404
     finally:
         await server.close()
+
+
+def test_both_doorbells_assemble_in_order():
+    """His instruction, as a configuration: "Okay we will do both".
+
+    This value -- telegram,sip -- is the one build_transport's own docstring
+    uses as the example, and for a while it was also the one it refused.
+    """
+    from hotline_ios.daemon import build_transport
+
+    chain = build_transport(["telegram", "sip"])
+    assert [link.inner.name for link in chain.links] == ["telegram", "sip"]
+    # Telegram cannot prove a ring landed; SIP gets a literal 180 Ringing. Both
+    # are still wrapped, because the chain can only fall through on evidence.
+    assert chain.rings_when_closed is True
