@@ -30,6 +30,7 @@ dev = [
 [project.scripts]
 hotline-call = "hotline_ios.call_cli:main"
 hotline-iosd = "hotline_ios.daemon:main"
+hotline-ios-hooks = "hotline_ios.hooks:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hotline_ios"]

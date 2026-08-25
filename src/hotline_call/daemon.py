@@ -32,7 +32,9 @@ import uuid
 from collections.abc import Sequence
 from typing import Any
 
+from . import ingest
 from .events import Entry, EventLog, Waker
+from .ingest import Ingested
 from .ring.base import (
     CallDeclined,
     CallError,
@@ -74,6 +76,25 @@ STALL_AFTER = 600.0
 A guess, and labelled as one: it is a `stalled` flag, not a liveness claim --
 liveness is already checked properly. Tune it once the transcript hook is
 feeding `last_tool_at` from something other than the daemon's own turns."""
+
+HOOK_EVENTS = ("UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SessionStart",
+               "StatusLine")
+"""What `/api/v1/hook` will act on. Anything else is accepted and counted, not
+refused: a hook installed by a future version must never fail a real turn
+because this daemon has not been taught the name yet."""
+
+TURN_ENDING_EVENTS = ("Stop", "SubagentStop")
+"""The nudges that close a phase. The transcript's own end-of-turn markers
+(`system/turn_duration`, `system/stop_hook_summary`) are written *after* Stop
+fires, so waiting for them would leave every phase open until the next prompt."""
+
+SAFETY_POLL = 30.0
+"""How often the safety poll sweeps live sessions.
+
+Not the primary path -- the hook is. This catches the cases the hook cannot: a
+session started before the hook was installed, a nudge dropped while the daemon
+was restarting, a hook that hit its own 30 s backoff. Cheap because it reads
+only what the stored offset says is new."""
 
 ROSTER_FIELDS = ("task", "live", "busy", "state", "stalled", "blocked",
                  "retired", "historyGeneration")
@@ -137,6 +158,20 @@ class Service:
         # degradations right beside it.
         self.ring_ready = False
         self.degradations: list[str] = []
+        # Hook accounting, all reported on /health. Counters rather than a
+        # boolean because "the map is empty" and "the map is empty and 4000
+        # nudges were dropped" are very different situations and used to look
+        # identical.
+        self.hook_events = 0
+        self.unattributed_hook_events = 0
+        self.hook_parse_failures = 0
+        # agent -> why its offset stopped advancing. Non-empty means the map is
+        # knowingly behind for that agent rather than knowingly complete.
+        self.ingest_stalled: dict[str, str] = {}
+        # One lock per agent. Two nudges for the same session can arrive while
+        # the first read is still in flight, and both would read from the same
+        # stored offset and write every event twice.
+        self._ingest_locks: dict[str, asyncio.Lock] = {}
         self.store = store if store is not None else self._open_store()
         # One wake per agent for the agent-scoped feed, and one for the roster.
         # Same broadcast primitive `EventLog` uses; see `events.Waker`.
@@ -756,6 +791,209 @@ class Service:
     def _is_live(self, agent: str) -> bool:
         return any(row["name"] == agent and row["live"] for row in self._roster_rows())
 
+    # ---- the map: hooks nudge, this tails the transcript ------------------
+
+    def _live_sessions(self) -> dict[str, Any]:
+        """session_id -> live session. Same `discover()` the roster uses."""
+        try:
+            from hotline.ccsocks import discover
+
+            return {str(getattr(s, "session_id", "")): s for s in discover() if
+                    getattr(s, "session_id", "")}
+        except Exception:
+            log.exception("could not enumerate live sessions")
+            return {}
+
+    def agent_for_session(self, session_id: str) -> str | None:
+        """Which channel a session's transcript belongs to, or None.
+
+        §9.7 settled the correlation by direct observation: `hook.session_id` ==
+        the descriptor's `sessionId` == `Registry.Agent.session_id`. So this is
+        two exact lookups, not a heuristic, and it returns None rather than
+        guessing when neither matches.
+
+        The second lookup is the same fallback the roster already applies: a
+        live session that never declared itself is still listed, under a name
+        derived from its descriptor. Filing its events under that same derived
+        name is not a phantom bucket -- it is the row he is already looking at.
+        """
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return None
+        try:
+            from hotline.agents import Registry
+
+            for record in Registry().agents.values():
+                if str(record.session_id) == session_id:
+                    return str(record.name)
+        except Exception:
+            log.exception("could not read the registry while attributing a hook")
+        session = self._live_sessions().get(session_id)
+        if session is not None:
+            return str(getattr(session, "name", "") or session_id[:8])
+        return None
+
+    def _degrade(self, note: str) -> None:
+        """Append to the list `/health` actually shows, deduped against the last.
+
+        Deduped because these come from a hook that fires on every tool call,
+        and an unbounded list of the same sentence would push everything else
+        off the end of the five that get reported."""
+        if not self.degradations or self.degradations[-1] != note:
+            self.degradations.append(note)
+
+    def _ingest(self, agent: str, session_id: str, *, turn_ended: bool) -> Ingested | None:
+        """Read this session's transcript forward and file what is new.
+
+        Synchronous: it is a bounded file read plus a handful of indexed inserts
+        against a local SQLite, which is the same reasoning `Store` is
+        synchronous for. The caller holds a per-agent lock.
+
+        Returns None when the read could not be trusted, and in that case the
+        stored offset is **not** advanced -- §2 is explicit that a read which
+        produces nothing recognisable must be retried loudly rather than skipped
+        past. A silently-empty map is the loopback-doorbell failure shape.
+        """
+        from hotline import transcript
+
+        offset, sidechains = self.store.read_position(agent)
+        if offset == 0 and not sidechains:
+            offset = _first_offset(session_id)
+        found = transcript.events_since(session_id, offset, sidechains=sidechains)
+
+        if not found.trustworthy:
+            self.hook_parse_failures += 1
+            note = (
+                f"transcript for {agent} unreadable: {found.unparseable} of "
+                f"{found.lines} lines in this slice did not parse and nothing was "
+                f"recognised; its offset is held at {offset} and will be re-read"
+            )
+            log.error("%s", note)
+            self.ingest_stalled[agent] = note
+            self._degrade(note)
+            return None
+        if found.overlong:
+            # Advancing loses one record; not advancing stops this agent's map
+            # for good. Say which was chosen rather than doing it quietly.
+            self._degrade(
+                f"transcript for {agent} contained a record larger than one read "
+                f"({transcript.MAX_SLICE_BYTES} bytes); it was skipped rather than "
+                "stalling the channel"
+            )
+        self.ingest_stalled.pop(agent, None)
+
+        result = ingest.absorb(self.store, agent, found.events, turn_ended=turn_ended)
+        self.store.set_read_position(agent, found.offset, found.sidechains)
+        if result.last_tool_at is not None:
+            # An honestly-observed tool call, which is what makes `stalled` mean
+            # something. Never set from "the session says it is busy".
+            try:
+                self.store.set_last_tool_at(agent, result.last_tool_at)
+            except Exception:
+                log.exception("could not record a tool call for %s", agent)
+        if result.events:
+            self._waker(agent).wake()
+        return result
+
+    async def ingest_session(
+        self, agent: str, session_id: str, *, turn_ended: bool = False
+    ) -> Ingested | None:
+        """`_ingest` under this agent's lock, off the event loop's critical path.
+
+        Two nudges for one session overlap constantly -- a `PreToolUse` and the
+        `Stop` behind it -- and without the lock both would read from the same
+        stored offset and write every event twice.
+        """
+        lock = self._ingest_locks.setdefault(agent, asyncio.Lock())
+        async with lock:
+            return await asyncio.to_thread(
+                self._ingest, agent, session_id, turn_ended=turn_ended
+            )
+
+    async def hook(self, body: dict[str, Any]) -> dict[str, Any]:
+        """The nudge. `{session_id, cwd, transcript_path, event}` and nothing else.
+
+        Deliberately tiny: no model output, no tool arguments, no secrets on the
+        wire. Everything it reports is read out of the file afterwards, which is
+        also why a daemon that was down for an hour catches up rather than
+        losing that hour.
+
+        Always 200 for a well-formed body, including for a session it cannot
+        attribute. The caller is a hook attached to a real turn and a 4xx there
+        buys nothing -- the drop is recorded on `/health` instead, where it can
+        actually be seen.
+        """
+        self.hook_events += 1
+        session_id = str(body.get("session_id", "") or "")
+        event = str(body.get("event", "") or "")
+        agent = self.agent_for_session(session_id)
+        if agent is None:
+            self.unattributed_hook_events += 1
+            log.warning(
+                "hook %r for session %s matches no agent (cwd %s); dropped",
+                event, session_id[:12] or "?", body.get("cwd", "?"),
+            )
+            return {"ok": False, "reason": "no agent for that session", "event": event}
+
+        used = body.get("context_used_percentage")
+        if isinstance(used, int | float):
+            # §9.7: the statusLine payload is the only honest source, and it is
+            # `null` before a session's first turn. Nothing is stored for null,
+            # because "unknown" and "none used" are different states.
+            try:
+                self.store.set_context_used(agent, max(0.0, min(1.0, float(used) / 100.0)))
+            except Exception:
+                log.exception("could not record a context sample for %s", agent)
+
+        if event == "StatusLine":
+            # Reports context, not transcript progress, and fires several times
+            # per turn. Tailing on it would triple the reads for nothing.
+            return {"ok": True, "agent": agent, "event": event, "events": 0}
+
+        result = await self.ingest_session(
+            agent, session_id, turn_ended=event in TURN_ENDING_EVENTS
+        )
+        if result is None:
+            return {"ok": False, "reason": "transcript unreadable", "agent": agent,
+                    "event": event}
+        return {
+            "ok": True, "agent": agent, "event": event,
+            "events": result.events, "tools": result.tools,
+            "phases_opened": result.phases_opened, "phases_closed": result.phases_closed,
+        }
+
+    async def poll_once(self) -> dict[str, Any]:
+        """One sweep of every live session that maps to a known agent.
+
+        The safety net §2 asks for. It exists because the hook can miss: a
+        session that predates the install, a nudge dropped over a daemon
+        restart, a hook sitting in its own 30 s backoff. It never closes a phase
+        -- only a Stop nudge knows a turn ended -- so a poll can add tool calls
+        to an open phase but cannot invent an ending for it.
+        """
+        seen = 0
+        events = 0
+        for session_id in list(self._live_sessions()):
+            agent = self.agent_for_session(session_id)
+            if agent is None:
+                continue
+            seen += 1
+            result = await self.ingest_session(agent, session_id)
+            if result is not None:
+                events += result.events
+        return {"sessions": seen, "events": events}
+
+    async def safety_poll(self, interval: float = SAFETY_POLL) -> None:
+        """Run `poll_once` forever. Started by `main()`, never by a test."""
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self.poll_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # a failed sweep must not end the sweeping
+                log.exception("safety poll failed")
+
     # ---- the agent-scoped channel ----------------------------------------
 
     def _known_agent(self, agent: str) -> str:
@@ -1034,6 +1272,30 @@ class Service:
         }
 
 
+def _first_offset(session_id: str) -> int:
+    """Where to start reading a session nobody has watched before.
+
+    Not zero, for a session whose transcript is already large. Replaying a
+    day-old transcript would write tens of thousands of rows into a channel he
+    has never opened, all stamped with timestamps from hours ago, and would do
+    it for every session on the box the moment the hook is installed. The map
+    starts when the daemon starts watching; what came before is still on disk in
+    the transcript, which §2 keeps as the authoritative record anyway.
+
+    A line boundary is not needed here: `events_since` trims to one, and a first
+    read that starts mid-record loses that one record rather than corrupting the
+    offset.
+    """
+    try:
+        from hotline import transcript
+
+        size = transcript.size_of(session_id)
+    except Exception:
+        log.exception("could not size the transcript for %s", session_id[:12])
+        return 0
+    return max(0, size - ingest.FIRST_SLICE_BYTES)
+
+
 def _speakable():
     try:
         from hotline.voice import speakable
@@ -1120,6 +1382,16 @@ def build_server(service: Service, host: str, port: int) -> Any:
             "transports_available": sorted(service.links),
             "active_calls": service.open_calls(),
             "conversations_held": len(service.calls),
+            # The map's own honesty fields. `unattributed_hook_events` counts
+            # nudges dropped because nothing matched the session -- never filed
+            # under a guess -- and `ingest_stalled` names the agents whose
+            # offset is deliberately held because their transcript stopped
+            # parsing. Both are zero/empty on a healthy box, and both used to be
+            # indistinguishable from "nothing is happening".
+            "hook_events": service.hook_events,
+            "unattributed_hook_events": service.unattributed_hook_events,
+            "hook_parse_failures": service.hook_parse_failures,
+            "ingest_stalled": sorted(service.ingest_stalled),
             # Surfaced on the health endpoint on purpose: a ringer that has been
             # silently degrading is exactly what a health check is for.
             "degradations": service.degradations[-5:],
@@ -1195,6 +1467,11 @@ def build_server(service: Service, host: str, port: int) -> Any:
             before_seq=int(before) if before is not None else None,
             dry_run=bool(body.get("dry_run", False)),
         )
+
+    @server.route("POST", "/api/v1/hook")
+    async def hook(request: Any) -> tuple[int, dict[str, Any]]:
+        service.authorise(request)
+        return 200, await service.hook(request.json() or {})
 
     @server.route("POST", "/api/v1/say")
     async def say(request: Any) -> tuple[int, dict[str, Any]]:
@@ -1386,6 +1663,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             service.degradations.append(str(exc))
         server = build_server(service, args.host, args.port)
         await server.start()
+        # Started here rather than in Service.__init__ so a test can construct a
+        # Service without a running loop, and so nothing sweeps the box during
+        # the suite.
+        poll = asyncio.ensure_future(service.safety_poll())
+        poll.add_done_callback(lambda task: task.cancelled() or task.exception())
         log.info(
             "hotline-iosd on %s:%d, ring=%s, rings_when_closed=%s",
             args.host, args.port, getattr(transport, "name", "?"),
