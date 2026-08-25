@@ -1046,7 +1046,12 @@ class Service:
         doing next, the destructive one last.
         """
         _target, no_pty = self._pty_of(session, panes)
-        cannot_resume = self._resumable(record)
+        # Only asked for an agent that is not running. `brief_for` globs the
+        # projects directory and reads the handoff file, and this is recomputed
+        # on every request and on every pass of a parked long-poll -- paying
+        # that for every live agent to answer a question whose answer is "it is
+        # still running" would make the roster cost scale with his disk.
+        cannot_resume = "" if live else self._resumable(record)
         return [
             _capability("stop", "Stop", not no_pty, no_pty),
             _capability("compact", "Compact", not no_pty, no_pty),
