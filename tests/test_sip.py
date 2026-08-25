@@ -6,6 +6,7 @@ response parsing. What it cannot prove is that linphone.org behaves this way --
 that needs his account.
 """
 
+import asyncio
 import socket
 import threading
 
@@ -122,7 +123,6 @@ class FakeRegistrar(threading.Thread):
         self.stop_flag.set()
         self.sock.close()
 
-    methods_seen: list = []
 
 
 @pytest.fixture
