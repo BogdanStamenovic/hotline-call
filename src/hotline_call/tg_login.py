@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -161,6 +162,64 @@ async def _whoami(session: str) -> int:
         return 0
     finally:
         await client.disconnect()
+
+
+async def _ringtest(session: str, peer: str, seconds: float) -> int:
+    """Actually ring him once, through the real transport, and hang up.
+
+    This is the only preflight that proves anything. `whoami` proves we are
+    signed in; nothing short of a ring proves his phone alerts. It drives
+    `TelegramTransport` rather than reimplementing the call, so a pass here is
+    evidence about the code that will run in production and not about a
+    lookalike written for the test.
+
+    The failure it exists to catch: with Settings -> Privacy -> Calls set to
+    "Nobody" (or "My Contacts" between two accounts that have not saved each
+    other), Telegram rejects the request. `UserPrivacyRestrictedError` is
+    telethon's mapping for that refusal, and catching it by name turns a
+    baffling silent non-ring into one sentence naming the setting to change.
+    """
+    from .ring.base import CallTarget, CallUnanswered, CallUnreachable
+    from .ring.telegram import TelegramTransport
+
+    api_id, api_hash = _credentials()
+    transport = TelegramTransport(
+        api_id=api_id, api_hash=api_hash, peer=peer, session=session
+    )
+    try:
+        await transport.start()
+    except Exception as exc:
+        sys.exit(f"transport refused to start: {exc}")
+
+    print(f"ringing {peer} -- his phone should light up within a second or two")
+    try:
+        await transport.ring(CallTarget(device="preflight", reason="ring test"), timeout=seconds)
+    except CallUnanswered:
+        # Nobody was meant to answer. Reaching the timeout means it rang.
+        print(f"RANG (unanswered after {seconds:g}s, which is the expected result)")
+        return 0
+    except CallUnreachable as exc:
+        print(f"DID NOT RING: {exc}")
+        _privacy_hint(exc)
+        return 1
+    except Exception as exc:
+        print(f"DID NOT RING: {type(exc).__name__}: {exc}")
+        _privacy_hint(exc)
+        return 1
+    else:
+        print("call was answered or ended early -- it rang")
+        return 0
+    finally:
+        with contextlib.suppress(Exception):
+            await transport.stop()
+
+
+def _privacy_hint(exc: BaseException) -> None:
+    if "privacy" in f"{type(exc).__name__}{exc}".lower():
+        print()
+        print("This is the Calls privacy setting, not a bug in the ring.")
+        print("On the phone being called:  Settings -> Privacy and Security -> Calls")
+        print("Set it to 'Everybody', or to 'My Contacts' with both accounts saved.")
 
 
 def main(argv: list[str] | None = None) -> int:
