@@ -79,10 +79,12 @@ async def _send(session: str, phone: str) -> int:
             print(f"already signed in as {me.first_name} (@{me.username}) -- nothing to do")
             return 0
         sent = await client.send_code_request(phone)
-        state_path.write_text(
-            json.dumps({"phone": phone, "phone_code_hash": sent.phone_code_hash})
-        )
-        state_path.chmod(0o600)
+        # Opened 0600 rather than written-then-chmod'd: the latter leaves
+        # phone_code_hash at the default umask for however long the write takes.
+        blob = json.dumps({"phone": phone, "phone_code_hash": sent.phone_code_hash})
+        fd = os.open(state_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(blob)
         print(f"code sent to {phone} -- it arrives INSIDE Telegram on that phone, not by SMS")
         print("then run:  tg-login code <the 5 digits>")
         return 0
@@ -186,9 +188,12 @@ async def _ringtest(session: str, peer: str, seconds: float) -> int:
     transport = TelegramTransport(
         api_id=api_id, api_hash=api_hash, peer=peer, session=session
     )
+    # Blind catches here are the point, not an oversight: this runs while he is
+    # sitting there waiting, and a traceback is the one output that helps nobody.
+    # Every failure gets turned into a sentence and a non-zero exit.
     try:
         await transport.start()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         sys.exit(f"transport refused to start: {exc}")
 
     print(f"ringing {peer} -- his phone should light up within a second or two")
@@ -202,7 +207,7 @@ async def _ringtest(session: str, peer: str, seconds: float) -> int:
         print(f"DID NOT RING: {exc}")
         _privacy_hint(exc)
         return 1
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         print(f"DID NOT RING: {type(exc).__name__}: {exc}")
         _privacy_hint(exc)
         return 1
@@ -241,6 +246,10 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("whoami", help="report who this session is signed in as")
 
+    r = sub.add_parser("ringtest", help="actually ring him once and hang up -- the only real proof")
+    r.add_argument("--peer", required=True, help="who to ring: @username, +phone, or numeric id")
+    r.add_argument("--seconds", type=float, default=8.0, help="how long to let it ring (default 8)")
+
     a = p.parse_args(argv)
     if a.cmd == "send":
         return asyncio.run(_send(a.session, a.phone))
@@ -248,6 +257,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_code(a.session, a.code))
     if a.cmd == "pass":
         return asyncio.run(_password(a.session, a.password))
+    if a.cmd == "ringtest":
+        return asyncio.run(_ringtest(a.session, a.peer, a.seconds))
     return asyncio.run(_whoami(a.session))
 
 

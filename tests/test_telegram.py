@@ -127,3 +127,35 @@ async def test_it_composes_with_the_chain_and_falls_through_when_telegram_is_dow
     await chain.ring(WHO, timeout=0.5)
     # Exactly what "we will do both" has to mean at runtime.
     assert chain.used.startswith("sip")
+
+
+async def test_a_privacy_refusal_names_the_setting_to_change():
+    """The refusal we hope Telegram gives us instead of silently not ringing.
+
+    Caught explicitly rather than by string match, because the fix is one
+    setting on his phone and naming it saves a debugging session. The string
+    check is kept as a fallback in the transport, since nobody has confirmed
+    which error `phone.requestCall` actually returns for this.
+    """
+    from telethon import errors
+
+    class Restricted(FakeClient):
+        async def __call__(self, request):
+            if type(request).__name__ == "RequestCallRequest":
+                raise errors.UserPrivacyRestrictedError(request=None)
+            return await super().__call__(request)
+
+    t = transport(Restricted())
+    with pytest.raises(CallUnreachable) as exc:
+        await t.ring(WHO, timeout=0.2)
+    assert "privacy" in str(exc.value).lower()
+    assert "Calls" in str(exc.value)
+    # And it must NOT have claimed the phone was ringing.
+    assert not t.ringing.is_set()
+
+
+def test_the_privacy_errors_are_looked_up_not_assumed():
+    from hotline_ios.ring.telegram import _privacy_errors
+
+    names = {e.__name__ for e in _privacy_errors()}
+    assert "UserPrivacyRestrictedError" in names

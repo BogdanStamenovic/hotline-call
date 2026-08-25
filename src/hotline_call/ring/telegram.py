@@ -36,10 +36,15 @@ surface.
 above and his handset, and it has not been run. Nothing here should be read as
 saying it works yet.
 
-**One setting on his phone can defeat this silently**: Settings -> Privacy ->
-Calls must not be "Nobody". Telegram will accept the call request and never ring
-him, and nothing in the response distinguishes that from success. See the note
-at the point where `ringing` is set.
+**One setting on his phone may defeat this**: Settings -> Privacy and Security
+-> Calls must not exclude the calling account.
+
+Whether that failure is loud or silent is **not settled**. `telethon.errors`
+does define `UserPrivacyRestrictedError`, which is strong evidence Telegram
+refuses out loud -- but nobody has confirmed that this is the error returned for
+`phone.requestCall` specifically. So this catches it explicitly *and* keeps a
+string check *and* keeps the warning at the point where `ringing` is set. If the
+refusal turns out to be silent after all, that warning is still the truth.
 """
 
 from __future__ import annotations
@@ -154,23 +159,37 @@ class TelegramTransport:
 
         try:
             result = await self._client(request)  # type: ignore[operator]
+        except _privacy_errors() as exc:
+            # The good case for us: Telegram refuses out loud rather than
+            # accepting a request it will never deliver. Named separately from
+            # the generic failure because the fix is a setting on his phone and
+            # nothing else, and saying which one saves a debugging session.
+            raise CallUnreachable(
+                "telegram refused the call on a privacy setting -- check "
+                "Settings > Privacy and Security > Calls on his phone; it must "
+                f"not be 'Nobody' ({exc})"
+            ) from exc
         except Exception as exc:
             text = str(exc)
-            if "PARTICIPANT_VERSION_OUTDATED" in text or "USER_PRIVACY" in text:
-                raise CallUnreachable(f"telegram refused the call: {text}") from exc
+            if "USER_PRIVACY" in text or "PRIVACY" in text.upper():
+                raise CallUnreachable(
+                    "telegram refused the call on a privacy setting -- check "
+                    f"Settings > Privacy and Security > Calls on his phone ({text})"
+                ) from exc
             raise CallUnreachable(f"telegram call request failed: {text}") from exc
 
         # The request being accepted is the evidence the phone is alerting --
         # Telegram has taken responsibility for delivering it -- and it is what
         # ConfirmedRing waits on.
         #
-        # KNOWN HOLE, and it is the one case where this evidence is not
-        # evidence: if his Settings -> Privacy -> Calls is "Nobody", Telegram
-        # accepts the request and simply never rings him. There is nothing
-        # visible in the response to distinguish that from a real ring, so this
-        # would report success for a call that did not happen -- exactly the
-        # failure ConfirmedRing exists to prevent. It cannot be closed from
-        # inside the transport; it has to be checked on his phone once.
+        # POSSIBLE HOLE, narrowed but not closed: if his Calls privacy setting
+        # excludes us, Telegram might accept the request and never ring him, in
+        # which case this reports a ring that did not happen -- exactly the
+        # failure ConfirmedRing exists to prevent. The refusal is caught
+        # explicitly above on the evidence that telethon defines an error for
+        # it, but nobody has confirmed that error is what phone.requestCall
+        # returns. Until a real ring has been observed, treat this line as the
+        # weakest claim in the module.
         self.ringing.set()
         call = getattr(result, "phone_call", None)
         log.info("telegram is ringing %s (call %s)", self.peer, getattr(call, "id", "?"))
@@ -237,6 +256,27 @@ class TelegramTransport:
         finally:
             with contextlib.suppress(Exception):
                 client.remove_event_handler(on_update)  # type: ignore[attr-defined]
+
+
+def _privacy_errors() -> tuple[type[BaseException], ...]:
+    """The exceptions telethon raises for a privacy refusal.
+
+    Looked up rather than imported at module scope so a telethon version without
+    one of them does not stop the transport importing at all. Returns an empty
+    tuple if none are found, which makes the `except` clause simply never match
+    and leaves the string check below as the fallback.
+    """
+    found: list[type[BaseException]] = []
+    try:
+        from telethon import errors
+
+        for name in ("UserPrivacyRestrictedError", "UserIsBlockedError"):
+            error = getattr(errors, name, None)
+            if isinstance(error, type) and issubclass(error, BaseException):
+                found.append(error)
+    except Exception:  # noqa: BLE001 - absence just means the string check runs
+        return ()
+    return tuple(found)
 
 
 def _discard_reason() -> object:
