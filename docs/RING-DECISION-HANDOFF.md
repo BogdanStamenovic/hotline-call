@@ -215,3 +215,69 @@ present with params `user_id, g_a_hash, protocol, video, random_id`, plus
 `AcceptCallRequest`/`DiscardCallRequest`. Installed rather than read, precisely
 because a guessed raw-GitHub URL 404'd first and "the file is not where I
 guessed" is exactly the null that invites a false finding.
+
+---
+
+## SDK: FOR THE RESPAWNED hotline-ios — READ THIS FIRST (data-89, 2026-08-25 ~19:10)
+
+Recorded while you were killed, from runs I read myself. Three findings, and
+the third is a trap that would produce a silently useless artifact.
+
+### 1. The macOS-runner strategy IS valid. `install` was the wrong subcommand.
+
+I told him earlier the runner strategy might rest on a false premise. **I was
+wrong, and your attempt-1 instinct was right all along** — it was only masked
+by the GUI hang. Run 32887720735, `xtool sdk build --help` on macOS:
+
+    Usage: xtool sdk build <path> <output-dir> [--arch <arch>]
+      --arch <arch>   The architecture of the Linux host the SDK is being
+                      built for. (default: auto)
+
+`sdk build` exists on macOS and its entire purpose is **building an SDK for a
+Linux host**. That is precisely this plan. `sdk install` no-oping on macOS
+("the iOS SDK ships with Xcode on macOS") is correct and irrelevant — it is
+the local-install command, not the cross-build command.
+
+That run failed **only** on `Error: Missing expected argument '<output-dir>'`.
+A missing positional, nothing more.
+
+### 2. THE TRAP: `--arch` auto is WRONG here, silently.
+
+`auto` matches the **current host**. Measured:
+
+    runner image : macos-15-arm64   (arm64)
+    archserver   : x86_64           (uname -m, verified)
+
+So `--arch` left at auto on that runner builds an **arm64** SDK that will not
+work on archserver. **Pass `--arch x86_64` explicitly.** This would not fail
+loudly — it produces a bundle that installs and then does not work, which is
+the worst shape available and the same "green but wrong" class as the no-op
+install and the 18 vanishing tests.
+
+### 3. Plan B measurements confirmed independently (run 32887587919)
+
+    /Applications/Xcode_26.3.app                       4.3 G
+      Platforms/iPhoneOS.platform/Developer/SDKs         56 M
+      Platforms/MacOSX.platform/Developer/SDKs          228 M
+      Platforms/iPhoneSimulator.platform/Developer/SDKs  66 M
+      Toolchains/.../usr/lib/swift                      525 M
+      Toolchains/.../usr/lib/clang                       21 M
+      Frameworks + PrivateFrameworks (all three)        ~28 M
+                                                       -------
+      what xtool keeps                                 ~925 M
+
+Every earlier estimate (3-8 GB bundle, 15-80 GB transient) was far too high.
+The runner's Xcode is already unpacked, so the extraction spike that was
+supposed to make this impossible **does not exist there**. No `.xip` needed,
+and **no Apple ID download needed** — which is the decision I had warned him
+might come back. It probably does not.
+
+### Next move, in order
+1. Re-run `sdk build "$XCODE" <output-dir> --arch x86_64` — one positional and
+   one flag away from an artifact.
+2. Assert on the **artifact**, not the exit code. Step 5 failing on
+   `test -n "$BUNDLE"` is the only reason the no-op was ever caught; keep that
+   deliberately rather than by accident.
+3. Plan B (tar the ~925 MB subtree) stays as the fallback and is cheap.
+
+I have queued nothing and touched nothing in your repo but this file.
