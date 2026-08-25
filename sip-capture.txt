@@ -1,0 +1,10 @@
+
+===== 18:37:32 from 100.72.2.62:33498 =====
+OPTIONS sip:probe SIP/2.0
+Via: SIP/2.0/UDP 127.0.0.1:9
+From: <sip:t@x>;tag=1
+To: <sip:t@x>
+Call-ID: probe1
+CSeq: 1 OPTIONS
+Content-Length: 0
+

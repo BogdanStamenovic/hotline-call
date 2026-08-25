@@ -1,30 +1,47 @@
 """Make an unconfirmed ring an error instead of a silence.
 
-This is the requirement every option shares, and it comes from a platform fact
-neither the spec nor any of the three outcomes anticipated:
+This is the requirement every option shares, and it is the one piece of design
+that is right under every outcome.
 
-**An iOS `NEPacketTunnelProvider` is suspended when the phone locks.** Apple
-Developer Forums thread 756941, answered by an Apple engineer with "100%, no" to
-whether such an extension can keep running while locked; the documented
-lifecycle is `sleepWithCompletionHandler`/`wake()`. Tailscale issues 8183, 14320
-and 334 are the same behaviour observed from outside. It is not a Tailscale bug,
-it is how iOS treats every packet tunnel.
+**On the justification, and a correction to an earlier version of this file.**
+This module first cited an Apple Developer Forums thread (756941) in which an
+Apple engineer supposedly answered "100%, no" to whether a packet tunnel
+provider keeps running while the phone is locked. **That citation could not be
+verified.** Two agents independently tried to fetch it: the page serves a
+JavaScript shell with none of the quoted terms in the HTML, and the forums API
+404s for that thread. It reached this file second-hand and was written down as
+settled fact, which it was not. Recorded here rather than quietly deleted,
+because a mechanism resting on a quote that evaporates when someone checks is
+exactly the thing that gets a sound design thrown out with a bad source.
 
-Two consequences, and the second is why this module exists:
+What *is* verifiable, and what actually happened when someone measured instead
+of arguing:
 
-1. **The ring must never assume the tailnet is up.** When his phone is locked --
-   which is exactly when a ring matters -- the tunnel is dormant. So the
-   doorbell always leaves the tailnet, at any budget. That was true before this
-   project started and it would have been true at $99 too; paying Apple only
-   changes whose push infrastructure rings the bell.
+- `tailscale/tailscale#17575`, `nickoneill` (a Tailscale contributor, attribution
+  checkable): the behaviour is "largely driven by the timing around iOS starting
+  the VPN based on on-demand rules" and "will still result in some of this
+  waiting behavior between states" -- a 5-10 s reconnect after sleep/wake.
+- **Measured on Bogdan's own phone, locked and idle: 20/20 `tailscale ping`
+  answered, 0% loss; peer-map sampled every 30 s for 20 minutes, present every
+  time.** The tunnel is not dead when the phone is locked. The strong claim was
+  wrong, and the measurement beats both the forum post and the argument.
 
-2. **Every option can fail silently, and they fail silently in different
-   places.** A keepalive socket dies on a phone reboot, a certificate expiry or
-   an audio-session interruption. A vendor push relay can start enforcing a
-   check, or drop a free tier. In all of those the call simply never arrives,
-   and the agent that placed it waits, and Bogdan is never told. **That is worse
-   than the Discord mention it replaced**, because he will have learned to trust
-   it.
+So the honest statement is the weaker one: **the tailnet cannot be *assumed* up
+at ring time** -- there is a real cold-start penalty on a phone nobody has
+touched for hours, which nobody has measured -- not "it is categorically
+suspended".
+
+**None of that changes what this module does**, which is why the mechanism
+survived the correction intact. Failing closed is correct in both worlds:
+
+- Outcome C fails if Belledonne tightens a check or drops a free tier.
+- Outcome B fails on a phone reboot, a certificate expiry, a force-quit, or an
+  audio session interrupted by an ordinary incoming phone call.
+- None of those produce an error. The call simply never arrives, the agent that
+  placed it waits, and Bogdan is never told.
+
+**That is worse than the Discord mention it replaced**, because he will have
+learned to trust it.
 
 So: placing a call is not evidence that it rang. A transport must produce
 positive evidence -- a SIP `180 Ringing`, a push-service accept, an ack from the
@@ -50,10 +67,10 @@ DEFAULT_CONFIRM_WITHIN = 8.0
 """How long a transport gets to prove the device is alerting.
 
 Generous on purpose. The path to his phone is relayed through a DERP server --
-measured at 92-623 ms with 172 ms of jitter, never once establishing a direct
-connection -- and on top of that a suspended tunnel has to be woken by inbound
-traffic before anything at all moves. Eight seconds is slow for a doorbell and
-still far quicker than the silence it replaces.
+measured at 92-623 ms with 172 ms of jitter, and `tailscale ping` reports a
+direct connection is never established -- and a tunnel started by an on-demand
+rule adds a documented 5-10 s before traffic moves. Eight seconds is slow for a
+doorbell and still far quicker than the silence it replaces.
 """
 
 

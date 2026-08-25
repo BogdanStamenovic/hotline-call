@@ -231,11 +231,25 @@ class CallSession:
     # ---- speaking --------------------------------------------------------
 
     async def say(self, text: str) -> None:
+        """Speak, or fail without taking the call down.
+
+        Synthesis has many runtime ways to fail -- a missing Piper voice, VRAM
+        pressure, a transport whose format it cannot render -- and none of them
+        are a reason to drop a call that is otherwise connected. He is on the
+        line; he can say "hello?". Losing the call because we could not speak
+        the greeting is strictly worse, and an earlier version did exactly that:
+        a Service with no speaker turned a working call into an HTTP 500.
+        """
         if not text.strip():
             return
         loop = asyncio.get_running_loop()
         fmt = self.stream.format
-        pcm = await loop.run_in_executor(None, self._synthesize, text, fmt)
+        try:
+            pcm = await loop.run_in_executor(None, self._synthesize, text, fmt)
+        except Exception as exc:
+            log.exception("synthesis failed; call continues in silence")
+            self.emit("error", f"could not speak: {type(exc).__name__}: {exc}")
+            return
         self.stream.send(pcm)
 
     def _synthesize(self, text: str, fmt: Any) -> bytes:
