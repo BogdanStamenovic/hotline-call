@@ -9,13 +9,21 @@ on Telegram actually being on his phone, and he has not confirmed that.** If it
 is not, outcome C — the stock Linphone app rung through Belledonne's push relay
 — is the branch to come back to, and this is the work that branch needs.
 
+**Update, 2026-08-25 17:10** — he asked for **both** doorbells, Telegram *and*
+Linphone: "Okay we will do both." So `sipprobe.py`, its tests, its unit and its
+instructions have been **un-parked** and the probe is listening again. Parking
+rather than deleting is what made that one `git mv` instead of an archaeology
+session, and it was `hotline-80`'s correction, not my idea.
+
+The split is also what *rescued* Linphone. Its only real cost was "someone
+else's app, and you inherit its interface" — which was only ever true while the
+ringer was also the talker. As a pure doorbell he barely looks at it.
+
 | parked | was | why it is not needed now |
 |---|---|---|
-| `hotline_ios/sipprobe.py` | a SIP registrar that captures what a client puts in its REGISTER `Contact` header | it exists to settle whether outcome C works, and C is not the plan |
 | `hotline_ios/media/rtp.py` | RTP + G.711 + a jitter buffer sized against the measured DERP path | there is no audio leg any more |
+| `hotline_ios/media/queue.py` | the queue that made barge-in possible | same |
 | `hotline_ios/ring/local.py` | ring his own app over a live tailnet socket, with an ack as proof | the app does not ring; Telegram does |
-| `systemd/hotline-sipprobe.service` | ran the probe on `100.72.2.62:5060` | stood down, unit removed from `~/.config/systemd/user` |
-| `docs/SIP-PROBE.md` | the five-minute experiment for him to run | the experiment is not needed unless C comes back |
 | `hotline_ios/call.py` | one voice call: VAD, transcription, `pool.ask`, synthesis, barge-in, tool narration | the voice route is scrapped -- he called it a gimmick |
 | `hotline_ios/media/pcm.py` | format conversion and G.711 as a lookup table | nothing carries audio any more |
 | `hotline_ios/media/queue.py` | the queue that made barge-in possible | same |

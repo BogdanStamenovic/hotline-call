@@ -8,3 +8,36 @@ Call-ID: probe1
 CSeq: 1 OPTIONS
 Content-Length: 0
 
+
+===== 19:12:14 from 100.72.2.62:55229 =====
+REGISTER sip:100.72.2.62 SIP/2.0
+Via: SIP/2.0/UDP 100.72.2.62:5099;branch=z9hG4bKr1
+From: <sip:bogdan@100.72.2.62>;tag=t
+To: <sip:bogdan@100.72.2.62>
+Call-ID: r1
+CSeq: 1 REGISTER
+Contact: <sip:bogdan@100.72.2.62>;pn-provider=apns;pn-prid=RESTORED1;pn-param=TEAM.org.linphone.phone.voip
+Content-Length: 0
+
+
+===== 19:12:14 from 100.72.2.62:43057 =====
+REGISTER sip:100.72.2.62 SIP/2.0
+Via: SIP/2.0/UDP 100.72.2.62:5099;branch=z9hG4bKr2
+From: <sip:bogdan@100.72.2.62>;tag=t
+To: <sip:bogdan@100.72.2.62>
+Call-ID: r2
+CSeq: 1 REGISTER
+Contact: <sip:bogdan@100.72.2.62>;app-id=org.linphone.phone.prod;pn-type=apple;pn-tok=LEGACY1
+Content-Length: 0
+
+
+===== 19:12:14 from 100.72.2.62:55150 =====
+REGISTER sip:100.72.2.62 SIP/2.0
+Via: SIP/2.0/UDP 100.72.2.62:5099;branch=z9hG4bKr3
+From: <sip:bogdan@100.72.2.62>;tag=t
+To: <sip:bogdan@100.72.2.62>
+Call-ID: r3
+CSeq: 1 REGISTER
+Contact: <sip:bogdan@100.72.2.62>
+Content-Length: 0
+
