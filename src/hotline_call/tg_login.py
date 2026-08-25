@@ -83,7 +83,7 @@ async def _send(session: str, phone: str) -> int:
         )
         state_path.chmod(0o600)
         print(f"code sent to {phone} -- it arrives INSIDE Telegram on that phone, not by SMS")
-        print(f"then run:  tg-login code <the 5 digits>")
+        print("then run:  tg-login code <the 5 digits>")
         return 0
     finally:
         await client.disconnect()
