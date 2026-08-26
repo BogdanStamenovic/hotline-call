@@ -19,3 +19,4 @@ ci/HotlineCall.xcodeproj/
 ci/Info.plist
 DerivedData/
 out/
+drop/
