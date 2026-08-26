@@ -13,3 +13,9 @@ server/.venv/
 # in before that was noticed.
 .build/
 app/HotlineCall/xtool/
+
+# Generated on the CI runner by xcodegen, never checked in.
+ci/HotlineCall.xcodeproj/
+ci/Info.plist
+DerivedData/
+out/
