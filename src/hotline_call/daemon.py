@@ -33,7 +33,14 @@ from collections.abc import Sequence
 from typing import Any
 
 from . import ingest, vitals
-from .endpoint import DEFAULT_HOST, DEFAULT_PORT, LOOPBACK, bind_hosts, local_url
+from .endpoint import (
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    LOOPBACK,
+    bind_hosts,
+    local_url,
+    unreachable,
+)
 from .events import Entry, EventLog, Waker
 from .ingest import Ingested
 from .ring.base import (
@@ -2692,6 +2699,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             service.degradations.append(str(exc))
         server = build_server(service, args.host, args.port)
         await server.start()
+        # The phone is the entire point, so losing its address is fatal, not a
+        # degradation. `asyncio.start_server` over a list binds what it can and
+        # raises only when *nothing* binds -- and loopback always binds, so it
+        # can never raise here. At boot that is a real race: the bind address is
+        # the tailnet IP, which does not exist until tailscaled is up. Silently
+        # serving loopback alone would mean a daemon that looks healthy in every
+        # log line and every local curl while the phone cannot reach it at all.
+        #
+        # Dying instead hands the problem to the restart policy in
+        # ~/.config/systemd/user/hotline-ios.service (Restart=always,
+        # RestartSec=5, no start limit), which retries until tailscale is up.
+        missing = unreachable(server.hosts, server.bound)
+        if missing:
+            raise SystemExit(
+                f"bound {server.bound or 'nothing'} but not {', '.join(missing)} "
+                f"on port {args.port}; the phone dials that address. "
+                "Is tailscaled up? Exiting so the service manager retries."
+            )
         # Started here rather than in Service.__init__ so a test can construct a
         # Service without a running loop, and so nothing sweeps the box during
         # the suite.
