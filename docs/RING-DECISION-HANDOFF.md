@@ -314,3 +314,172 @@ the reason written beside it.
   known-good SIP client to diff against while the UDP retransmit defect
   (missing RFC 3261 timer A) is open. It should be removed once nobody needs
   it; that is data-89's to clean up.
+
+---
+
+## SIDELOADING: WHY IT FAILS ON archserver, AND WHERE IT WORKS
+## (data-89, 2026-08-26 ~04:00 — read before retrying an install here)
+
+### The install has NEVER succeeded on archserver, over any transport
+
+Run with his phone physically connected:
+
+    [Unpacking app]     100%
+    [Preparing device]  100%
+    [Provisioning]       33%   <- dies here, every time
+    NIOPosix/BaseSocketChannel.swift:1018: Fatal error:
+      epoll_ctl(epfd:op:fd:event:): Operation not permitted (errno: 1)
+
+**Provisioning is the Apple Developer Services leg — network to APPLE, not to
+the phone.** So this is not a cable problem and `xtool install --network`
+cannot route around it: `--network` changes the phone leg only. The `.ipa` is
+also **unsigned** (no CodeDirectory in the Mach-O — checked), and signing
+happens *during* that provisioning step. **You cannot install your way past an
+unsigned binary.** Do not spend a night on transports.
+
+### The `epoll_ctl` EPERM is probably NOT confinement
+
+`epoll_ctl` returns `EPERM` specifically when the **target fd does not support
+polling** — a regular file, for instance. That is a documented condition, not a
+permissions verdict. So this most likely indicates a **SwiftNIO-on-Linux or
+xtool bug**, not a sandbox. That is a real diagnosis to chase (which fd is being
+registered, and why it is not pollable), rather than a wall to force.
+
+**DO NOT re-run this with the sandbox disabled.** Bogdan was offered exactly
+that and **refused the tool call and said stop**. That is a decision about the
+action, not about who is asking — it binds any agent here, and asking a peer to
+do it instead is laundering.
+
+### Where signing DOES work: his laptop
+
+    laptop `arch`  100.79.194.90   reachable over the tailnet, key-based SSH
+    xtool ds teams list -> Bogdan Stamenović [active]: 3GAQP72Y5Z
+                           Xcode Free Provisioning Program (iOS)
+    ~/hotline/ has sideload.sh, xtool.AppImage, and a prior ipa
+
+**The working route: build on archserver -> copy to the laptop -> run its
+`sideload.sh` over SSH.** It signs where signing demonstrably works and installs
+over whatever connection the laptop has to the phone. No `--network`, no
+sandbox argument, nothing unsigned.
+
+The profile expiring **1 Sept 22:53** is itself evidence: a signing succeeded
+somewhere, and it was not here.
+
+### Device facts, verified on archserver (several earlier assumptions were wrong)
+
+    iPhone16,1          "Bogdan"
+    iOS 18.7.8          <- NOT 26. Reasoning that assumed 26 should be rechecked.
+    Developer Mode      true, already on — no reboot needed
+    pairing record      /var/lib/lockdown/00008130-001669590ABA001C.plist
+    idevicepair validate -> SUCCESS
+    xtool devices        -> Bogdan [usb]: 00008130-001669590ABA001C
+
+The archserver pairing persists and is real. It is simply not sufficient,
+because pairing is not the thing that was broken.
+
+### CORRECTION: `xtool install --network` DOES NOT WORK HERE (proven 2026-08-26 ~04:16)
+
+data-89 told Bogdan the `--network` flag meant wireless re-signing was probably
+one command away. **That was wrong** and hotline-ios proved it on the laptop:
+
+- `xtool install --network` **hangs with no output** and times out. **The phone
+  does not advertise itself over the network at all**, so `--network` has
+  nothing to target. `xtool devices` only ever reports `Bogdan [usb]`.
+- **Tailscale does not bridge this.** It carries IP; the install path needs
+  usbmux-level device discovery, which is a different layer. Being on the same
+  tailnet is irrelevant to it.
+- **`idevice_id` and `xtool` do not share discovery.** `idevice_id -l` returns
+  nothing and `idevicepair validate` says "No device found" *while xtool sees
+  the phone fine*. So `idevice_id` will tell you there is no phone when there
+  is one — do not use it to decide whether a device is present.
+- **usbmuxd goes inactive on its own.** It must be started immediately before
+  an install or the install hangs silently.
+
+So the weekly re-sign is **cable-bound today**. SideStore's on-device refresh
+remains the only known no-cable route, and it costs the single iOS VPN slot
+that Tailscale occupies.
+
+### The install that DID work
+
+Laptop, 04:16: signed and installed, device reported Verifying 100% /
+Successfully installed.
+
+**Trap that nearly shipped the wrong build:** `~/hotline/sideload.sh` installs
+`$HERE/HotlineCall.ipa` **unconditionally**. Without overwriting that exact
+path it re-installs the previous build and reports success. Verify the ipa
+actually changed before running it — MD5 went `f3da1bfa` -> `41d2bc5a` on the
+run that worked. A stale install is indistinguishable from a fresh one in its
+output.
+
+---
+
+## data-89's RETRACTION LEDGER — the corrections, and why they are here
+
+Seven confident readings were wrong across three sessions on 2026-08-25. Every
+one was caught by someone other than its author; twice by the person who had
+supplied the datum. **A successor who does not read this will re-derive at
+least three of them.**
+
+1. **"Phone advertises zero endpoints."** `Endpoints`/`Addrs` are `None` for
+   EVERY peer in `tailscale status --json`, including ones with a live direct
+   connection. Null field, not a signal.
+2. **tailscale#11328 cited as a maintainer statement.** It is a reporter
+   paraphrasing an unlinked internal doc. Use `nickoneill` on **#17575**.
+3. **"iOS suspends VPN tunnels on lock, so B is impossible."** Source
+   (Apple Forums 756941) is **unfetchable by two independent attempts** and
+   **contradicted by his device**: 20/20 probes answered while locked, and a
+   cold inbound packet returned in **87 ms**. Do not cite it.
+4. **"All third-way alternatives are dead; C by elimination."** Published while
+   the research that refuted it was still running. **Telegram 1:1 calling is
+   real, free and released** (`RequestCallRequest` verified present in telethon
+   1.44.0). This one reversed a *"do not re-run this research"* instruction
+   that had already been filed — the worst kind of error, because an
+   instruction not to look again steers the next person away from the answer.
+5. **"The macOS-runner strategy rests on a false premise."** Wrong. `sdk build`
+   exists on macOS and builds *for a Linux host*; `install` was simply the
+   wrong subcommand.
+6. **"`xtool install --network` means wireless re-signing is one command away."**
+   Wrong — see the correction section above. Cable-bound today.
+7. **A conclusion left standing after its premise moved.** When he split the
+   ring from the interface, that invalidated the main objection to option C —
+   but C had already been shelved, so nobody re-ran the conclusion. Every fact
+   in it stayed true; only the answer went stale.
+
+**The shared shape of most of them:** a status field read as a signal without
+testing the thing the field supposedly indicates. The fix is always a
+**control** — probe it directly, or compare against a row whose answer you
+already know. #4 is the exception and the dangerous one: it was a summary of
+*my own incomplete work*, which no control row catches, because the claim was
+about the state of my own knowledge. **Guard: before writing "we checked X and
+found nothing", confirm every agent that was checking X has actually reported.**
+
+## OPEN ITEMS — nothing here is decided
+
+- **Telegram doorbell is built and has never been logged in.** No `.session`
+  file exists. `tg-login` (`send`/`code`/`pass`/`whoami`/`ringtest`) is written
+  and tested on every path that does not need real credentials. Needs from him:
+  `api_id`, `api_hash`, **and a second account with its own phone number** — a
+  bot token CANNOT place calls (`phone.requestCall` is user-only; verified by
+  the "Bots can use this method" marker being present on `messages.sendMessage`
+  and absent here, with a known user-only method as a control).
+- **PRIVACY CAVEAT, nobody else has written this down.** Logging archserver
+  into his second Telegram account gives this box a full session on that
+  account — **it can read that account's chats**, like any other logged-in
+  device. He was told once, in passing, and has not confirmed he is comfortable
+  with it. **Confirm before using a number that has personal history on it.**
+  He can revoke it any time under Settings > Devices.
+- **The weekly re-sign is cable-bound** until someone proves otherwise.
+  SideStore's on-device refresh is the only known no-cable route and it costs
+  the single iOS VPN slot Tailscale occupies.
+- **The SIP plumbing changed after it last rang his handset** (~20:00). Nobody
+  re-rang him to prove the refactor. One ring closes that gap.
+- **`baresip` is installed** and was only ever a diff tool. Remove it once
+  nobody is debugging SIP.
+
+## Deliverables that are NOT in this repo
+
+- The decision brief: https://claude.ai/code/artifact/c35a5d55-ef31-453a-a0d5-16827b4101de
+  Republish that same file path to update it; do not create a second artifact.
+- `~/.claude/skills/call-bogdan/SKILL.md` — rewritten to ring first, page as
+  fallback, with the "verify the ring is real" section.
+- `~/.claude/bin/hotline-call` — shim, venv-or-PYTHONPATH.
