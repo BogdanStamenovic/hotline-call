@@ -145,12 +145,18 @@ CONTINUE_AFTER_COMPACT = (
 """The default continuation `compact` injects when no `then` was supplied."""
 
 ROSTER_FIELDS = ("task", "live", "busy", "state", "stalled", "blocked",
-                 "retired", "historyGeneration")
+                 "retired", "historyGeneration", "authority")
 """What counts as a roster change worth waking a phone for.
 
 Deliberately excludes `blockedSince` and `cwd`: a timestamp that only moves
 because the thing it describes moved is not independently newsworthy, and
-ticking on it would make the invalidation stream fire on its own output."""
+ticking on it would make the invalidation stream fire on its own output.
+
+`authority` is in here despite almost never moving. When it does move it is
+because he granted or revoked a standing role, which is exactly the kind of
+change a phone holding the old row would otherwise show wrong until the next
+poll -- and it costs one comparison per row against a value that is `None` for
+nearly all of them."""
 
 
 class Service:
@@ -880,6 +886,18 @@ class Service:
             "blockedSince": blocked_since,
             "retired": annotation.get("retired_at") is not None,
             "historyGeneration": int(annotation.get("history_generation") or 0),
+            # hotline's own `Registry.Agent.authority`: "sys-admin" or None, a
+            # standing role granted by Bogdan. Passed through as the string
+            # rather than as a boolean, because hotline's field is `str | None`
+            # and a second role must not decode as "not sys-admin".
+            #
+            # None for a live session that never declared itself: there is no
+            # registry record to read a role off, and an undeclared shell has
+            # not been granted anything. Absent is the honest answer, and the
+            # app renders no badge for it.
+            "authority": (
+                getattr(record, "authority", None) if record is not None else None
+            ),
             # §11's first ask: the strip's ELAPSED cell.
             #
             # The registry's own value first, because that is when the agent
