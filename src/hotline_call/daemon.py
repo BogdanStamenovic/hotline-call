@@ -435,6 +435,26 @@ class Service:
         self._waker(agent).wake()
         return entry
 
+    # ---- what an agent chose to say --------------------------------------
+
+    def sent(self, agent: str, text: str) -> dict[str, Any]:
+        """A message an agent deliberately sent him, mirrored from Discord.
+
+        **`sent` is not `claude`, and the difference is the whole point.**
+        A `claude` row is transcript-derived: it is what the agent was saying
+        while it worked, and it arrives whether or not anyone was meant to read
+        it. A `sent` row is a message it chose to deliver -- the same bytes that
+        went to Discord. Collapsing the two would put "this is what I was
+        thinking" and "I am telling you this" under one label, which is the
+        exact confusion the provenance work exists to prevent, so they are kept
+        apart in the schema and not merely in the view.
+
+        No `phase_id`: a deliberate message is not a step in a turn.
+        """
+        stored = self.store.append_event(agent, "sent", text)
+        self._waker(agent).wake()
+        return {"ok": True, "agent": agent, "seq": stored.seq, "at": stored.at}
+
     # ---- auth ------------------------------------------------------------
 
     def authorise(self, request: Any) -> None:
@@ -2514,6 +2534,16 @@ def build_server(service: Service, host: str | Sequence[str], port: int) -> Any:
         return 200, await service.say(
             text, str(agent) if agent else None, str(token) if token else None
         )
+
+    @server.route("POST", "/api/v1/agents/sent")
+    async def agent_sent(request: Any) -> tuple[int, dict[str, Any]]:
+        service.authorise(request)
+        body = request.json()
+        agent = str(body.get("agent", "")).strip()
+        text = str(body.get("text", "")).strip()
+        if not agent or not text:
+            raise HttpError(400, "agent and text are required")
+        return 200, service.sent(agent, text)
 
     @server.route("POST", "/api/v1/conversations")
     async def conversations(request: Any) -> tuple[int, dict[str, Any]]:
