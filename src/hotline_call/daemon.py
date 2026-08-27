@@ -1668,8 +1668,11 @@ class Service:
         self.ingest_stalled.pop(agent, None)
 
         result = ingest.absorb(self.store, agent, found.events, turn_ended=turn_ended)
-        # The only place an output rate can come from: the prose itself is not
-        # stored, so it is counted as it goes past. See `vitals.py`.
+        # The only place an output rate can come from. The prose *is* stored
+        # now -- as `claude` events, since 27 Aug -- but the rate is still
+        # counted as it goes past rather than recomputed from the store, so a
+        # re-read that the guard in `Store.has_event` drops contributes no row
+        # and no sample. See `vitals.py`.
         self.rates.observe(agent, result.text_samples)
         self.store.set_read_position(agent, found.offset, found.sidechains, session_id)
         self._flush_durations(agent)
