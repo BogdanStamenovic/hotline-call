@@ -37,7 +37,7 @@ import sys
 from collections.abc import Sequence
 from typing import NoReturn
 
-from .client import DaemonError, place_call
+from .client import CallTimeout, DaemonError, place_call
 
 DEFAULT_TIMEOUT = 900.0
 DEFAULT_RING_TIMEOUT = 45.0
@@ -153,6 +153,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             wait=not args.no_wait,
             transport=args.transport,
         )
+    except CallTimeout as exc:
+        # The request outlived its deadline. If the daemon answered a fresh
+        # connect, it was up and holding the call: it rang and no answer came
+        # back on the line -- he may have answered on Discord, or let it ring
+        # out. That is "unanswered", NOT "undeliverable"; reporting the call
+        # path dead while the phone rang is the exact bug this branch fixes.
+        if exc.daemon_up:
+            log(
+                f"no answer on the call after {exc.elapsed:.0f}s "
+                "(the daemon was reachable; he may have answered elsewhere)"
+            )
+            if args.no_fallback:
+                return EXIT_UNANSWERED
+            return _fall_back(args, reason, "the call rang out", log)
+        # Genuinely unreachable: the original dead-daemon behaviour.
+        if args.no_fallback:
+            print(f"hotline-call: error: {exc}", file=sys.stderr)
+            return EXIT_UNDELIVERABLE
+        return _fall_back(args, reason, str(exc), log)
     except DaemonError as exc:
         if args.no_fallback:
             print(f"hotline-call: error: {exc}", file=sys.stderr)
