@@ -488,9 +488,11 @@ class Service:
     def reap(self, *, older_than: float = 3600.0) -> int:
         """Evict closed conversations from the in-memory index after an hour.
 
-        Only closed ones: an unanswered call stays, because he may open the app
-        later and answer it, and dropping it would throw away the question he
-        is about to answer.
+        Only closed ones. Unanswered calls used to be kept open on purpose; as
+        of 2026-09-01 the call paths close them (he asked for it, and closing
+        turned out not to lose a late answer -- `reply()` reads a closed row
+        back in), so they now reach this the same way any closed call does. An
+        eviction still deletes nothing: the row survives in the store.
 
         **This deletes nothing.** It used to be the only thing bounding memory
         and it still is, but the rows survive in the store and `_channel()`
@@ -623,10 +625,15 @@ class Service:
             self._close_conversation(conversation)
             return self._outcome(conversation, "declined", began, str(exc), transport=doorbell)
         except CallUnanswered as exc:
-            # It rang and he did not pick up. The conversation stays OPEN: he
-            # may well open the app five minutes later, and closing it here
-            # would throw away the question he is about to answer.
+            # It rang and he did not pick up. Record that it went unanswered and
+            # close it, at his instruction (2026-09-01, overriding SPEC 3's
+            # keep-open rule). Closing does NOT lose a late answer: `reply()`
+            # does not gate on `closed` and `_channel()` reads a closed row back
+            # in, so he can still open the app and answer. Close only drops it
+            # from `active_calls` and the waiting roster -- the leak he asked to
+            # stop.
             self._append(conversation, "state", "unanswered")
+            self._close_conversation(conversation)
             return self._outcome(conversation, "unanswered", began, str(exc), transport=doorbell)
         except (CallUnreachable, CallError) as exc:
             self.degradations.append(str(exc))
@@ -640,6 +647,11 @@ class Service:
 
         reply = await self._await_reply(events, reply_timeout)
         if not reply:
+            # Rang, connected, but no answer came back in time. Same rule as the
+            # ring-out above: say it went unanswered, then close it. He can still
+            # answer later; this only stops it counting as an active call.
+            self._append(conversation, "state", "unanswered")
+            self._close_conversation(conversation)
             return self._outcome(conversation, "unanswered", began,
                                  f"rang, but nothing came back within {reply_timeout:.0f}s",
                                  transport=doorbell)

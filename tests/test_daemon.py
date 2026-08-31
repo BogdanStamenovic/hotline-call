@@ -150,20 +150,47 @@ async def test_the_question_is_waiting_in_the_app_before_it_even_rings():
         await server.close()
 
 
-async def test_ringing_out_leaves_the_conversation_open_for_him():
-    # It rang and he did not pick up. He may open the app five minutes later,
-    # and closing the conversation here would throw away the question he is
-    # about to answer.
+async def test_ringing_out_closes_the_conversation_but_he_can_still_answer():
+    # It rang and he did not pick up. As of 2026-09-01 (his instruction,
+    # overriding SPEC 3) the conversation is marked unanswered and CLOSED so it
+    # stops counting as an active call -- but closing must not lose a late
+    # answer, so a reply after the close still lands.
     service = Service(LoopbackTransport(answer=False), FakePool())
     server = await run_server(service, 18805)
     try:
         body = await asyncio.to_thread(
             post, 18805, "/api/v1/call", {"reason": "ping", "ring_timeout": 0.05}, 20)
         assert body["state"] == "unanswered"
+        conversation = body["conversation"]
         page = await asyncio.to_thread(
             post, 18805, "/api/v1/events",
+            {"call_id": conversation, "since": 0, "wait": 0})
+        assert page["closed"] is True
+        # "just say they did go unanswered" -- the record says so.
+        assert "unanswered" in [e["text"] for e in page["events"] if e["kind"] == "state"]
+        # Closed, and still answerable: he opened the app late.
+        answered = await asyncio.to_thread(
+            post, 18805, "/api/v1/reply", {"conversation": conversation, "text": "yes"})
+        assert answered["delivered"] is True
+    finally:
+        await server.close()
+
+
+async def test_rang_but_no_reply_in_time_also_closes_unanswered():
+    # The other unanswered path: the ring connected but nothing came back within
+    # the reply window. Same rule -- say unanswered, close it.
+    service = Service(LoopbackTransport(answer=True), FakePool())
+    server = await run_server(service, 18806)
+    try:
+        body = await asyncio.to_thread(
+            post, 18806, "/api/v1/call",
+            {"reason": "ping", "ring_timeout": 0.05, "timeout": 0.05}, 20)
+        assert body["state"] == "unanswered"
+        page = await asyncio.to_thread(
+            post, 18806, "/api/v1/events",
             {"call_id": body["conversation"], "since": 0, "wait": 0})
-        assert page["closed"] is False
+        assert page["closed"] is True
+        assert "unanswered" in [e["text"] for e in page["events"] if e["kind"] == "state"]
     finally:
         await server.close()
 
