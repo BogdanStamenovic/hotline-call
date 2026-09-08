@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio, base64, ctypes, glob, io, json, logging, os, queue, subprocess, sys, threading, time, wave
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -45,6 +46,9 @@ MAX_CALL_SECONDS = 1800   # a backstop, not a policy
 # His instruction: do not hang up on him, wait for HIS hangup. A silent
 # stretch is him thinking; a stretch with no RTP at all is the phone gone.
 DEAD_LINE_SECONDS = 90
+# A single answer can run long; only stop extending it well past any
+# plausible sentence.
+MAX_UTTERANCE_SECONDS = 180
 AGENT_SLOW_AFTER = 3.0   # seconds before a second, apologetic filler goes out
 
 MANNERS = """You are on a LIVE PHONE CALL with Bogdan, speaking Serbian out loud. \
@@ -147,6 +151,16 @@ def main() -> int:
     log.info("agent ready in %.1fs (session %s)", time.time() - t, (agent.session or "?")[:12])
 
     transcript: list[tuple[str, str]] = []
+    # One worker: faster-whisper is not thread-safe for concurrent transcribes on
+    # the same model, and serialising them is fine because they are each far
+    # shorter than the speech still arriving behind them.
+    pool = ThreadPoolExecutor(max_workers=1)
+
+    def transcribe(audio) -> str:
+        if audio is None or audio.size < 4000:
+            return ""
+        segs, _ = whisper.transcribe(audio, language="sr", beam_size=1)
+        return "".join(seg.text for seg in segs).strip()
 
     def on_answer(reply_msg, media_sock, our_key, our_salt):
         try:
@@ -180,8 +194,32 @@ def main() -> int:
         turn = 0
         while time.time() - call_started < MAX_CALL_SECONDS:
             turn += 1
-            heard, why = call.receive_turn(max_seconds=30.0, silence_ms=800)
-            log.info("turn %d: %s, %.1fs of audio", turn, why, heard.size / 16000)
+            # Transcribe each phrase as he finishes it, on a worker, so the ASR
+            # cost lands under his own speech instead of in the pause after it.
+            pending: list = []
+            captured: list[np.ndarray] = []
+
+            def on_chunk(phrase, _p=pending, _c=captured):
+                _c.append(phrase)
+                _p.append(pool.submit(transcribe, phrase))
+
+            listened = 0.0
+            while True:
+                heard, why = call.receive_turn(max_seconds=30.0, silence_ms=800,
+                                               on_chunk=on_chunk)
+                if heard.size:
+                    captured.append(heard)
+                    pending.append(pool.submit(transcribe, heard))
+                listened += 30.0
+                # "timeout" means the cap hit while he was STILL TALKING. Ending
+                # the turn there is talking over him, which is what cut him off
+                # mid-sentence on the 19:10 call. Keep listening.
+                if why == "timeout" and listened < MAX_UTTERANCE_SECONDS:
+                    log.info("turn %d: still going at %.0fs, keeping the line open",
+                             turn, listened)
+                    continue
+                break
+            log.info("turn %d: %s, %d phrase(s)", turn, why, len(pending))
 
             if why == "no-audio":
                 # No RTP at all. Either he hung up or the media died; only after
@@ -193,15 +231,19 @@ def main() -> int:
                 continue
             dead_since = None
 
-            if why == "silence" or heard.size < 8000:
+            if not pending and (why == "silence" or heard.size < 8000):
                 # Audio is flowing, he just is not speaking. Stay quiet and wait.
                 call.send_silence(1.0)
                 continue
 
             t0 = time.time()
-            segs, _ = whisper.transcribe(heard, language="sr", beam_size=1)
-            said = "".join(s.text for s in segs).strip()
-            log.info("  heard (%.2fs): %r", time.time() - t0, said)
+            said = " ".join(f.result() for f in pending).strip()
+            log.info("  heard (%.2fs to finish, %d phrases): %r",
+                     time.time() - t0, len(pending), said)
+            if call.his_level is None and captured:
+                # The first thing he says is definitionally him: he answered the
+                # phone. Everything quieter or unlike it afterwards is the room.
+                call.enrol_voice(np.concatenate(captured))
             if not said:
                 play("notheard"); continue
             transcript.append(("bogdan", said))

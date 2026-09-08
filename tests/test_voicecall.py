@@ -388,3 +388,90 @@ def test_audio_that_arrived_before_we_spoke_cannot_interrupt_us():
     call.send_audio(np.zeros(8000, dtype=np.float32), rate=8000, interruptible=True)
     assert call.interrupted is False, "stale audio cut off the reply to it"
     assert call.frames_sent >= 50 + 25
+
+
+# -- voice profiling: telling him from the room ----------------------------
+
+
+def test_background_speech_does_not_interrupt_once_he_is_enrolled():
+    """His diagnosis, 2026-09-08: people talking in the room kept cutting him off.
+
+    Background conversation IS speech, so it clears a noise-floor threshold
+    easily. What it does not clear is a threshold set relative to a voice
+    speaking into the handset.
+    """
+    call, theirs, _, their_keys, our_addr = call_pair()
+    feed(theirs, their_keys, our_addr, quiet(1.0))
+    call.send_silence(0.5, calibrate=True)
+    call.enrol_voice(speech(2.0, rate=16000, amp=0.35), rate=16000)
+    assert call.his_level is not None
+
+    # Someone across the room: same kind of sound, a fraction of the level.
+    feed_during(theirs, their_keys, our_addr, speech(1.5, amp=0.05))
+    call.send_audio(np.zeros(16000, dtype=np.float32), rate=8000, interruptible=True)
+    assert call.interrupted is False, "the room interrupted him"
+
+
+def test_he_still_interrupts_after_enrolment():
+    call, theirs, _, their_keys, our_addr = call_pair()
+    feed(theirs, their_keys, our_addr, quiet(1.0))
+    call.send_silence(0.5, calibrate=True)
+    call.enrol_voice(speech(2.0, rate=16000, amp=0.35), rate=16000)
+    feed_during(theirs, their_keys, our_addr, speech(2.0, amp=0.35))
+    call.send_audio(np.zeros(16000, dtype=np.float32), rate=8000, interruptible=True)
+    assert call.interrupted is True, "he talked over us and we did not stop"
+
+
+def test_enrolment_ignores_a_clip_too_short_to_learn_from():
+    call, _theirs, _, _, _ = call_pair()
+    call.enrol_voice(speech(0.2, rate=16000), rate=16000)
+    assert call.his_level is None
+
+
+def test_the_envelope_describes_timbre_not_loudness():
+    """Same sound at two volumes must look the same, or the check is just
+    another energy threshold wearing a hat."""
+    loud = speech(1.0, rate=16000, amp=0.4)
+    soft = speech(1.0, rate=16000, amp=0.02)
+    a = voicecall.VoiceCall._envelope(loud, 8)
+    b = voicecall.VoiceCall._envelope(soft, 8)
+    assert float(np.dot(a, b)) > 0.99
+
+
+# -- chunked transcription -------------------------------------------------
+
+
+def test_phrases_are_handed_over_at_pauses_while_he_is_still_talking():
+    call, theirs, _, their_keys, our_addr = call_pair()
+    got: list = []
+    clip = np.concatenate([quiet(0.3), speech(0.9), quiet(0.5), speech(0.9), quiet(1.2)])
+    feed(theirs, their_keys, our_addr, clip)
+    audio, reason = call.receive_turn(max_seconds=8.0, silence_ms=900,
+                                      chunk_at_ms=300, on_chunk=got.append)
+    assert reason == "endpointed"
+    assert got, "no phrase was emitted before the end of the turn"
+
+
+def test_a_chunked_turn_returns_only_the_untranscribed_tail():
+    """Returning everything would transcribe the first half of his sentence
+    twice and paste it in front of itself."""
+    call, theirs, _, their_keys, our_addr = call_pair()
+    got: list = []
+    clip = np.concatenate([quiet(0.3), speech(0.9), quiet(0.5), speech(0.9), quiet(1.2)])
+    feed(theirs, their_keys, our_addr, clip)
+    tail, _ = call.receive_turn(max_seconds=8.0, silence_ms=900,
+                                chunk_at_ms=300, on_chunk=got.append)
+    emitted = sum(c.size for c in got)
+    assert emitted > 0
+    assert tail.size < emitted + 16000, "the tail looks like the whole utterance again"
+
+
+def test_a_raising_chunk_handler_does_not_kill_the_turn():
+    call, theirs, _, their_keys, our_addr = call_pair()
+    def boom(_):
+        raise RuntimeError("transcriber fell over")
+    clip = np.concatenate([quiet(0.3), speech(0.9), quiet(0.5), speech(0.9), quiet(1.2)])
+    feed(theirs, their_keys, our_addr, clip)
+    _audio, reason = call.receive_turn(max_seconds=8.0, silence_ms=900,
+                                       chunk_at_ms=300, on_chunk=boom)
+    assert reason == "endpointed", "a broken transcriber must not end the call"

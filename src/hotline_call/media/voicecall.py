@@ -139,6 +139,11 @@ class VoiceCall:
         # Measured during priming silence, when neither of us is talking.
         # None means never measured; the absolute threshold is used instead.
         self.line_floor: float | None = None
+        # Learned from the first thing he actually says. Until then only the
+        # noise floor is available, which is why the first turn is the one most
+        # likely to be interrupted by the room.
+        self.his_level: float | None = None
+        self.his_voice: np.ndarray | None = None
         self.frames_received = 0
         self.auth_failures = 0
 
@@ -161,6 +166,20 @@ class VoiceCall:
     BARGE_IN_FRAMES = 25
     # How far above the measured line noise counts as him talking.
     BARGE_IN_OVER_FLOOR = 4.0
+    # ...and, once we have heard him, what fraction of HIS OWN speaking level a
+    # sound must reach. This is the fix for other people in the room: background
+    # conversation clears a noise-floor threshold easily, because it IS speech,
+    # just not his. It does not clear a threshold set relative to a voice
+    # speaking directly into the handset, because distance costs it an order of
+    # magnitude. His idea, 2026-09-08, after a call where the room kept
+    # interrupting him.
+    BARGE_IN_OF_HIS_LEVEL = 0.45
+    # Spectral bands used to tell his voice from someone across the room. Coarse
+    # on purpose: this is a cheap similarity check on 8 kHz telephony audio, not
+    # speaker identification, and it is a SECOND opinion that only ever makes
+    # the barge-in harder to trigger.
+    VOICE_BANDS = 8
+    VOICE_SIMILARITY = 0.82
     # Frames of inbound audio to retain while we speak. A barge-in needs its
     # onset kept, not the whole utterance: without a cap this grew for the
     # length of every reply and handed the next turn 19 s of mostly our own
@@ -266,7 +285,9 @@ class VoiceCall:
                 samples = np.frombuffer(pcm.ulaw_decode(payload), dtype="<i2")
                 level = float(np.sqrt(np.mean((samples / 32768.0) ** 2))) if samples.size else 0.0
                 bar = self._barge_threshold()
-                loud_run = loud_run + 1 if (bar is not None and level >= bar) else 0
+                is_him = (bar is not None and level >= bar
+                          and self._sounds_like_him(samples))
+                loud_run = loud_run + 1 if is_him else 0
                 if loud_run >= self.BARGE_IN_FRAMES:
                     return loud_run
         finally:
@@ -326,6 +347,59 @@ class VoiceCall:
             # which is the safe direction -- see _barge_threshold.
             log.info("only %d frames during priming; barge-in stays off", len(heard))
 
+    @staticmethod
+    def _envelope(samples: np.ndarray, bands: int) -> np.ndarray:
+        """A coarse normalised spectrum: what this sound is made of, not how loud.
+
+        Normalised so it describes timbre rather than level -- the whole point
+        is to compare a quiet sound against a loud reference and still tell
+        whether it is the same voice.
+        """
+        if samples.size < 32:
+            return np.zeros(bands, dtype=np.float32)
+        spectrum = np.abs(np.fft.rfft(samples * np.hanning(samples.size)))
+        chunks = np.array_split(spectrum[1:], bands)
+        env = np.array([float(c.mean()) for c in chunks], dtype=np.float32)
+        total = float(np.linalg.norm(env))
+        return env / total if total > 0 else env
+
+    def enrol_voice(self, audio: np.ndarray, rate: int = 16000) -> None:
+        """Learn his voice from a turn we already know was him.
+
+        Called with the first turn he speaks: he is the one who answered the
+        phone, so whatever endpointed as speech there is definitionally him.
+        Anything quieter or spectrally unlike this afterwards is the room.
+        """
+        if audio.size < rate // 2:
+            return
+        frame = max(64, rate * FRAME_MS // 1000)
+        frames = [audio[i:i + frame] for i in range(0, audio.size - frame + 1, frame)]
+        levels = np.array([float(np.sqrt(np.mean(f ** 2))) for f in frames])
+        if not levels.size:
+            return
+        # The loud half is his voice; the quiet half is the gaps between words.
+        speaking = levels[levels >= np.percentile(levels, 60)]
+        if not speaking.size:
+            return
+        self.his_level = float(np.median(speaking))
+        loud = [f for f, lv in zip(frames, levels) if lv >= np.percentile(levels, 60)]
+        envs = [self._envelope(f, self.VOICE_BANDS) for f in loud]
+        if envs:
+            mean = np.mean(envs, axis=0)
+            norm = float(np.linalg.norm(mean))
+            self.his_voice = (mean / norm) if norm > 0 else None
+        log.info("enrolled his voice: level %.4f -> interrupts must reach %.4f",
+                 self.his_level, self._barge_threshold() or -1)
+
+    def _sounds_like_him(self, samples: np.ndarray) -> bool:
+        """Cheap timbre check. True when unknown, so it can only ever add caution."""
+        if self.his_voice is None:
+            return True
+        env = self._envelope(samples.astype(np.float32) / 32768.0, self.VOICE_BANDS)
+        if not env.any():
+            return True
+        return float(np.dot(env, self.his_voice)) >= self.VOICE_SIMILARITY
+
     def _barge_threshold(self) -> float | None:
         """The level that counts as him interrupting, or None for "do not".
 
@@ -337,7 +411,10 @@ class VoiceCall:
         """
         if self.line_floor is None:
             return None
-        return max(self.line_floor * self.BARGE_IN_OVER_FLOOR, self.MAX_THRESHOLD)
+        bar = max(self.line_floor * self.BARGE_IN_OVER_FLOOR, self.MAX_THRESHOLD)
+        if self.his_level is not None:
+            bar = max(bar, self.his_level * self.BARGE_IN_OF_HIS_LEVEL)
+        return bar
 
     def _sample_levels(self, budget: float) -> list[float]:
         """Read for `budget` seconds and return the frame energies seen."""
@@ -442,6 +519,8 @@ class VoiceCall:
         silence_ms: int = 800,
         min_speech_ms: int = 300,
         calibrate_ms: int = 300,
+        chunk_at_ms: int = 350,
+        on_chunk=None,
     ) -> tuple[np.ndarray, str]:
         """Listen until he stops talking, then return what he said.
 
@@ -455,6 +534,17 @@ class VoiceCall:
         Returns (audio at 16 kHz, why it stopped) so the caller can tell "he
         finished" from "he never started" from "he is still going". Those need
         different replies and collapsing them into an empty array loses that.
+
+        `on_chunk` is handed each phrase as he finishes it, at any pause of
+        `chunk_at_ms` too short to end the turn. His idea: transcribing the whole
+        utterance only after he stops means the ASR cost lands entirely in the
+        silence he is waiting through, and on a 10 s turn that was 4.4 s of dead
+        air. Feeding phrases out as they complete moves nearly all of it under
+        his own speech, leaving only the final phrase to transcribe at the end.
+
+        Chunking happens at pauses rather than on a timer because a fixed
+        boundary lands mid-word, and Whisper given half a word transcribes half
+        a word.
         """
         # Whatever arrived while we were speaking IS the start of his turn.
         frames: list[bytes] = list(self._pending_rx)
@@ -462,8 +552,11 @@ class VoiceCall:
         levels: list[float] = []
         speech_frames = 0
         trailing_silence = 0
+        chunk_start = 0          # index into `frames` where the current phrase began
+        emitted_to = 0
         threshold: float | None = None
         frames_for_silence = max(1, silence_ms // FRAME_MS)
+        frames_for_chunk = max(1, chunk_at_ms // FRAME_MS)
         frames_for_speech = max(1, min_speech_ms // FRAME_MS)
         frames_to_calibrate = max(1, calibrate_ms // FRAME_MS)
 
@@ -532,6 +625,19 @@ class VoiceCall:
                     if speech_frames >= frames_for_speech and trailing_silence >= frames_for_silence:
                         reason = "endpointed"
                         break
+                    # A shorter pause is a phrase boundary, not the end of his
+                    # turn: hand what he has said so far to the transcriber and
+                    # keep listening.
+                    if (on_chunk is not None and trailing_silence == frames_for_chunk
+                            and len(frames) - emitted_to > frames_for_speech):
+                        phrase = pcm.to_model(
+                            pcm.ulaw_decode(b"".join(frames[emitted_to:])), rate=WIRE_RATE)
+                        emitted_to = len(frames)
+                        chunk_start = emitted_to
+                        try:
+                            on_chunk(phrase)
+                        except Exception:
+                            log.exception("chunk handler raised; continuing to listen")
         finally:
             self.sock.settimeout(original)
 
@@ -542,7 +648,11 @@ class VoiceCall:
             reason = "silence"
         if not frames:
             return np.zeros(0, dtype=np.float32), "no-audio"
-        audio = pcm.to_model(pcm.ulaw_decode(b"".join(frames)), rate=WIRE_RATE)
+        # Only the tail: everything before `emitted_to` already went to on_chunk
+        # and transcribing it twice would duplicate half his sentence.
+        tail = frames[emitted_to:] if on_chunk is not None else frames
+        audio = (pcm.to_model(pcm.ulaw_decode(b"".join(tail)), rate=WIRE_RATE)
+                 if tail else np.zeros(0, dtype=np.float32))
         return audio, reason
 
     def stats(self) -> dict[str, int]:
