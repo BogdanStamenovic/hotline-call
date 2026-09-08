@@ -132,6 +132,7 @@ class CallAgent:
 
 def main() -> int:
     from hotline_ios.media import voicecall
+    from hotline_ios.speculate import Speculator
     from hotline_ios.ring.sip import SipTransport
     from hotline_ios.ring.base import CallTarget
 
@@ -146,6 +147,10 @@ def main() -> int:
 
     fillers = load_fillers()
     whisper = load_whisper()
+    # Warmed BEFORE the phone rings: the first embed loads the model, and paying
+    # that inside a live turn would cost seconds at the worst possible moment.
+    speculator = Speculator()
+    log.info("speculator: %s", "embeddings" if speculator.warm() else "keywords only")
     agent = CallAgent(context)
     log.info("seeding the call agent before dialling")
     t = time.time(); agent.open()
@@ -227,9 +232,30 @@ def main() -> int:
             pending: list = []
             captured: list[np.ndarray] = []
 
-            def on_chunk(phrase, _p=pending, _c=captured):
+            # Updated as each phrase is transcribed -- i.e. WHILE he is still
+            # talking -- so by the time he stops we already know which holding
+            # phrase fits and can play it with no synthesis at all.
+            partial = {"text": "", "intent": "NEJASNO"}
+
+            def on_chunk(phrase, _p=pending, _c=captured, _st=partial):
                 _c.append(phrase)
-                _p.append(pool.submit(transcribe, phrase))
+                fut = pool.submit(transcribe, phrase)
+                _p.append(fut)
+
+                def guess(f, _st=_st):
+                    try:
+                        piece = f.result()
+                    except Exception:
+                        return
+                    if not piece:
+                        return
+                    _st["text"] = (_st["text"] + " " + piece).strip()
+                    intent, margin = speculator.intent(_st["text"])
+                    if intent != _st["intent"]:
+                        log.info("  speculation: %s (margin %.3f) <- %r",
+                                 intent, margin, _st["text"][:60])
+                    _st["intent"] = intent
+                fut.add_done_callback(guess)
 
             listened = 0.0
             while True:
@@ -270,8 +296,8 @@ def main() -> int:
 
             t0 = time.time()
             said = " ".join(f.result() for f in pending).strip()
-            log.info("  heard (%.2fs to finish, %d phrases): %r",
-                     time.time() - t0, len(pending), said)
+            log.info("  heard (%.2fs to finish, %d phrases, intent %s): %r",
+                     time.time() - t0, len(pending), partial["intent"], said)
             if call.his_level is None and captured:
                 # The first thing he says is definitionally him: he answered the
                 # phone. Everything quieter or unlike it afterwards is the room.
@@ -304,7 +330,11 @@ def main() -> int:
                 except Exception as exc: result.put(("err", f"{type(exc).__name__}: {exc}"))
             worker = threading.Thread(target=work, daemon=True); worker.start()
 
-            play(["ack_mhm", "ack_aha", "ack_dobro"][turn % 3])
+            # Instant, contextual, and safe: a holding phrase asserts nothing, so
+            # unlike a speculative ANSWER it cannot be contradicted by the rest
+            # of his sentence. Measured on his own transcripts, a speculative
+            # answer is flatly wrong 25% of the time however much has been heard.
+            play(speculator.holding_clip(partial["intent"], turn))
             began = time.time()
             while worker.is_alive() and time.time() - began < 25:
                 if time.time() - began > AGENT_SLOW_AFTER and result.empty():

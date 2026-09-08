@@ -43,5 +43,55 @@
     "text": "Nisam te čuo, ponovi molim te.",
     "rate": 24000,
     "seconds": 2.04
+  },
+  "hold_pitanje_1": {
+    "text": "Aha, važi — da vidim.",
+    "rate": 24000,
+    "seconds": 1.8
+  },
+  "hold_pitanje_2": {
+    "text": "Dobro pitanje, čekaj malo.",
+    "rate": 24000,
+    "seconds": 1.96
+  },
+  "hold_zalba_1": {
+    "text": "Mhm, razumem, gledam odmah.",
+    "rate": 24000,
+    "seconds": 2.0
+  },
+  "hold_zalba_2": {
+    "text": "Jasno, to nije dobro. Proveravam.",
+    "rate": 24000,
+    "seconds": 2.12
+  },
+  "hold_pozdrav_1": {
+    "text": "Ćao, tu sam.",
+    "rate": 24000,
+    "seconds": 1.52
+  },
+  "hold_pozdrav_2": {
+    "text": "Evo me, slušam te.",
+    "rate": 24000,
+    "seconds": 1.72
+  },
+  "hold_zadatak_1": {
+    "text": "Važi, samo sekund.",
+    "rate": 24000,
+    "seconds": 1.76
+  },
+  "hold_zadatak_2": {
+    "text": "Dobro, gledam to sad.",
+    "rate": 24000,
+    "seconds": 1.84
+  },
+  "hold_nejasno_1": {
+    "text": "Mhm?",
+    "rate": 24000,
+    "seconds": 1.16
+  },
+  "hold_nejasno_2": {
+    "text": "Da, kaži.",
+    "rate": 24000,
+    "seconds": 1.4
   }
 }
