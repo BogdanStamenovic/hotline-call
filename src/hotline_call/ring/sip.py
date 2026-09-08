@@ -161,6 +161,7 @@ class SipTransport:
         peer: str | None = None,
         transport: str | None = None,
         port: int | None = None,
+        on_answer: object | None = None,
     ) -> None:
         self.user = user or os.environ.get("SIP_USER", "")
         self.password = password or os.environ.get("SIP_PASSWORD", "")
@@ -180,9 +181,22 @@ class SipTransport:
         # the SrtpSession from the same material the offer advertised.
         self._srtp_key: bytes = b""
         self._srtp_salt: bytes = b""
+        # Called with (sdp_answer_text, media_socket, key, salt) when he picks
+        # up. Default None keeps the doorbell behaviour: ACK and hang up at
+        # once, because a ring transport that holds a call it cannot talk on
+        # is worse than one that does not.
+        self.on_answer = on_answer
         self.ringing = asyncio.Event()
         self._sock: socket.socket | None = None
         self._local: tuple[str, int] = ("0.0.0.0", 0)
+        # What the SDP advertises as the media address. Defaults to whatever
+        # local address the SIP socket ended up with -- a LAN address, which
+        # only works if his phone is on the same wifi. There is no ICE here, so
+        # when it is not, nothing tells us: the call connects and is silent.
+        # SIP_MEDIA_HOST overrides it with an address reachable from his phone
+        # wherever it is -- in practice archserver's tailnet address.
+        self.media_host = os.environ.get("SIP_MEDIA_HOST", "")
+        self._buffer = b""
 
     async def start(self) -> None:
         if not (self.user and self.password and self.peer):
@@ -214,6 +228,7 @@ class SipTransport:
         return sock
 
     def _close(self) -> None:
+        self._buffer = b""
         if self._sock is not None:
             try:
                 self._sock.close()
@@ -225,11 +240,55 @@ class SipTransport:
         sock.sendall(message.encode())
 
     def _recv(self, sock: socket.socket, timeout: float) -> str:
-        sock.settimeout(timeout)
-        try:
-            return sock.recv(65535).decode("utf-8", errors="replace")
-        except TimeoutError:
-            return ""
+        """One complete SIP message, framed by Content-Length.
+
+        A single recv() was fine for as long as this only read status lines: the
+        headers of a 180 or a 407 always arrive in one segment. It is wrong the
+        moment a body matters. SIP over TCP/TLS is a byte stream, so a 200 OK's
+        SDP routinely lands in a segment after its headers, and one recv()
+        returns a message whose body is simply missing -- which surfaced as
+        "no c=IN IP4 line: nowhere to send audio" on a call he had just
+        answered. The far end was blameless; the read was short.
+
+        The same stream can also deliver several messages in one segment (100
+        Trying and 180 Ringing back to back), so leftovers stay buffered rather
+        than being discarded with the read that happened to carry them.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            message = self._take_message()
+            if message is not None:
+                return message
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return ""
+            sock.settimeout(remaining)
+            try:
+                chunk = sock.recv(65535)
+            except TimeoutError:
+                return ""
+            if not chunk:
+                return ""
+            self._buffer += chunk
+
+    def _take_message(self) -> str | None:
+        """Pull one whole message off the buffer, or None if it is incomplete."""
+        split = self._buffer.find(b"\r\n\r\n")
+        if split < 0:
+            return None
+        head = self._buffer[:split].decode("utf-8", errors="replace")
+        length = 0
+        for line in head.split("\r\n"):
+            name, _, value = line.partition(":")
+            if name.strip().lower() in ("content-length", "l"):
+                with contextlib.suppress(ValueError):
+                    length = int(value.strip())
+        total = split + 4 + length
+        if len(self._buffer) < total:
+            return None
+        message = self._buffer[:total].decode("utf-8", errors="replace")
+        self._buffer = self._buffer[total:]
+        return message
 
     # ---- messages --------------------------------------------------------
 
@@ -281,6 +340,7 @@ class SipTransport:
         me = f"sip:{self.user}@{self.domain}"
         them = self.peer if self.peer.startswith("sip:") else f"sip:{self.peer}"
         host, port = self._local
+        media_host = self.media_host or host
         media_port = self._open_media()
         if not self._srtp_key:
             self._srtp_key, self._srtp_salt = srtp.new_key_salt()
@@ -295,9 +355,9 @@ class SipTransport:
         # working session from it, so an answered call has somewhere to go.
         sdp = (
             "v=0\r\n"
-            f"o=- {random.randint(1, 2**31)} 1 IN IP4 {host}\r\n"
+            f"o=- {random.randint(1, 2**31)} 1 IN IP4 {media_host}\r\n"
             "s=hotline\r\n"
-            f"c=IN IP4 {host}\r\n"
+            f"c=IN IP4 {media_host}\r\n"
             "t=0 0\r\n"
             f"m=audio {media_port} RTP/SAVP 0 8 101\r\n"
             f"{srtp.crypto_line(self._srtp_key, self._srtp_salt)}\r\n"
@@ -443,7 +503,8 @@ class SipTransport:
                 # started mattering when he actually picked one up -- before
                 # that the code never reached a 200 and CANCEL was always right.
                 to_tag = header_of(reply, "To")
-                self._finish_answered(sock, invite_id, from_tag, to_tag, cseq)
+                self._finish_answered(sock, invite_id, from_tag, to_tag, cseq,
+                                      reply=reply)
                 break
             if code in (486, 600, 603):
                 self._cancel(sock, invite_id, from_tag, cseq)
@@ -461,18 +522,26 @@ class SipTransport:
             raise CallUnanswered(f"sip rang for {timeout:.0f}s with no answer")
 
     def _finish_answered(
-        self, sock: socket.socket, call_id: str, from_tag: str, to_header: str, cseq: int
+        self, sock: socket.socket, call_id: str, from_tag: str, to_header: str,
+        cseq: int, reply: str = ""
     ) -> None:
-        """ACK the 200, then hang up.
+        """ACK the 200, run `on_answer` if there is one, then hang up.
 
-        We never wanted the call -- the ring IS the message, and he reads the
-        question in the app. But an unACKed 200 makes the far end retransmit it
-        for half a minute, and a call left up keeps his phone occupied.
+        With no handler the ring never wanted the call -- the ring IS the
+        message, and he reads the question in the app. But an unACKed 200 makes
+        the far end retransmit it for half a minute, and a call left up keeps
+        his phone occupied.
+
+        With a handler the ACK still has to go FIRST and the BYE still has to
+        go last, whatever the handler does or raises in between -- an
+        exception mid-conversation must not leak a call that stays up on his
+        phone until the far end times it out.
         """
         me = f"sip:{self.user}@{self.domain}"
         them = self.peer if self.peer.startswith("sip:") else f"sip:{self.peer}"
         to_value = to_header or f"<{them}>"
-        for method, seq in (("ACK", cseq), ("BYE", cseq + 1)):
+
+        def signal(method: str, seq: int) -> None:
             message = "\r\n".join([
                 f"{method} {them} SIP/2.0",
                 self._via(_tag()),
@@ -485,6 +554,14 @@ class SipTransport:
             ]) + "\r\n\r\n"
             with contextlib.suppress(OSError):
                 self._send(sock, message)
+
+        signal("ACK", cseq)
+        if self.on_answer is not None:
+            try:
+                self.on_answer(reply, self._media, self._srtp_key, self._srtp_salt)
+            except Exception:
+                log.exception("sip: the answered-call handler raised; hanging up")
+        signal("BYE", cseq + 1)
 
     def _cancel(self, sock: socket.socket, call_id: str, from_tag: str, cseq: int) -> None:
         """Stop it ringing. He is already reading the question in the app."""

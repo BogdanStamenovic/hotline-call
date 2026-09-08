@@ -332,3 +332,49 @@ async def test_an_answered_call_is_acked_and_byed_rather_than_cancelled(registra
     assert "ACK" in registrar.seen, registrar.seen
     assert "BYE" in registrar.seen, registrar.seen
     assert not registrar.saw_cancel
+
+
+# -- message framing over the TCP/TLS byte stream --------------------------
+
+
+class _ChunkedSocket:
+    """A socket that hands back a SIP message in pieces, as TCP actually does."""
+
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+
+    def settimeout(self, _t):
+        pass
+
+    def recv(self, _n):
+        return self.chunks.pop(0) if self.chunks else b""
+
+
+def test_a_body_split_across_segments_is_reassembled():
+    """The bug that made an answered call report 'nowhere to send audio'.
+
+    One recv() returned the 200's headers and none of its SDP, so the parse saw
+    a message with no c= line and blamed the far end for a short read here.
+    """
+    from hotline_ios.ring.sip import SipTransport
+
+    body = "v=0\r\nc=IN IP4 192.168.1.50\r\nm=audio 7078 RTP/SAVP 0\r\n"
+    head = ("SIP/2.0 200 OK\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n")
+    ring = SipTransport(user="u", password="p", peer="sip:x@y", domain="y")
+    sock = _ChunkedSocket([head.encode(), body.encode()])
+    got = ring._recv(sock, timeout=5)
+    assert got.endswith(body)
+    assert "c=IN IP4 192.168.1.50" in got
+
+
+def test_two_messages_in_one_segment_are_returned_one_at_a_time():
+    """100 Trying and 180 Ringing arrive back to back; neither may be dropped."""
+    from hotline_ios.ring.sip import SipTransport
+
+    both = (b"SIP/2.0 100 Trying\r\nContent-Length: 0\r\n\r\n"
+            b"SIP/2.0 180 Ringing\r\nContent-Length: 0\r\n\r\n")
+    ring = SipTransport(user="u", password="p", peer="sip:x@y", domain="y")
+    sock = _ChunkedSocket([both])
+    assert "100 Trying" in ring._recv(sock, timeout=5)
+    assert "180 Ringing" in ring._recv(sock, timeout=5)
