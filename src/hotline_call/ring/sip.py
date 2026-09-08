@@ -92,6 +92,7 @@ import string
 import time
 import uuid
 
+from ..media import srtp
 from .base import CallDeclined, CallTarget, CallUnanswered, CallUnreachable
 
 log = logging.getLogger("hotline-ios.ring.sip")
@@ -175,7 +176,10 @@ class SipTransport:
         # Bound lazily per call: the offer has to name a port that exists, and
         # port 9 (discard) is one of the things a client rejects with 488.
         self._media: socket.socket | None = None
-        self._crypto_key = ""
+        # Master key/salt for the SDES offer. Held so the media leg can build
+        # the SrtpSession from the same material the offer advertised.
+        self._srtp_key: bytes = b""
+        self._srtp_salt: bytes = b""
         self.ringing = asyncio.Event()
         self._sock: socket.socket | None = None
         self._local: tuple[str, int] = ("0.0.0.0", 0)
@@ -278,12 +282,17 @@ class SipTransport:
         them = self.peer if self.peer.startswith("sip:") else f"sip:{self.peer}"
         host, port = self._local
         media_port = self._open_media()
-        if not self._crypto_key:
-            self._crypto_key = base64.b64encode(secrets.token_bytes(30)).decode()
+        if not self._srtp_key:
+            self._srtp_key, self._srtp_salt = srtp.new_key_salt()
         # RTP/SAVP with an SDES key. His client refuses plain RTP/AVP with 488,
         # and because the push has already fired by then the phone lights up and
         # dies a second later -- which looks like a notification bug rather than
-        # a negotiation failure. The key is real but never used: no media is sent.
+        # a negotiation failure.
+        #
+        # The key used to be 30 random bytes that nothing could decrypt, which
+        # was fine while this only rang and hung up. It is now real SRTP master
+        # material (16-byte key || 14-byte salt) and `media/srtp.py` can build a
+        # working session from it, so an answered call has somewhere to go.
         sdp = (
             "v=0\r\n"
             f"o=- {random.randint(1, 2**31)} 1 IN IP4 {host}\r\n"
@@ -291,7 +300,7 @@ class SipTransport:
             f"c=IN IP4 {host}\r\n"
             "t=0 0\r\n"
             f"m=audio {media_port} RTP/SAVP 0 8 101\r\n"
-            f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{self._crypto_key}\r\n"
+            f"{srtp.crypto_line(self._srtp_key, self._srtp_salt)}\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
             "a=rtpmap:8 PCMA/8000\r\n"
             "a=rtpmap:101 telephone-event/8000\r\n"

@@ -8,9 +8,11 @@ point -- a ring transport now has exactly one job.
     ring the phone, or say plainly that you could not.
 
 It used to also carry the audio, because every option on the table at the time
-assumed the ringer and the talker were one program. They are not, so there is no
-`MediaStream` here any more. See `parked/` for that work; it is kept because if
-Telegram turns out not to be on his phone, the SIP branch is where we go back to.
+assumed the ringer and the talker were one program. They are not, and a ring
+transport still only rings -- but on 2026-09-08 Bogdan asked for a real two-way
+voice call over SIP, so `AudioFormat` is back from `parked/` and the media
+package alongside it. The transport does not own the audio; it only has to be
+able to describe what a given wire format is.
 
 What has NOT changed, and must not: **a ring is not delivered because we asked
 for it.** See `watch.py`.
@@ -19,6 +21,8 @@ for it.** See `watch.py`.
 from __future__ import annotations
 
 import enum
+
+import numpy as np
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
@@ -46,6 +50,25 @@ class CallState(enum.Enum):
     RINGING = "ringing"
     ANSWERED = "answered"
     ENDED = "ended"
+
+
+@dataclass
+class AudioFormat:
+    """What a given transport actually puts on the wire.
+
+    Never assume 48 kHz stereo here. Discord's pipeline could, because Discord
+    is the only thing it talked to. SIP hands us 8 kHz mono G.711 and WebRTC
+    hands us 48 kHz mono Opus, so the conversion has to be parameterised or the
+    first non-Discord transport silently transcribes chipmunks.
+    """
+
+    rate: int
+    channels: int = 1
+    frame_ms: int = 20
+
+    @property
+    def frame_bytes(self) -> int:
+        return int(self.rate * self.frame_ms / 1000) * self.channels * 2
 
 
 @dataclass
@@ -88,3 +111,25 @@ class RingTransport(Protocol):
         normally means it rang; it does not mean he has said anything, which
         arrives separately through the app.
         """
+
+
+def frames(pcm: bytes, fmt: AudioFormat) -> list[bytes]:
+    """Split a synthesis result into wire-sized frames, zero-padding the tail.
+
+    Padding rather than dropping: a short final frame is a click on most
+    codecs, and dropping it truncates the last syllable of every sentence.
+    """
+    size = fmt.frame_bytes
+    if size <= 0:
+        return [pcm] if pcm else []
+    out = [pcm[i : i + size] for i in range(0, len(pcm), size)]
+    if out and len(out[-1]) < size:
+        out[-1] = out[-1] + b"\x00" * (size - len(out[-1]))
+    return out
+
+
+def as_int16(audio: "np.ndarray") -> bytes:
+    """Float32 in [-1, 1] to little-endian int16, clipped."""
+    if audio.size == 0:
+        return b""
+    return (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
