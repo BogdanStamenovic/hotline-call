@@ -26,10 +26,13 @@ buffer on the far end discards as a flood.
 from __future__ import annotations
 
 import logging
+import queue
 import re
 import socket
 import struct
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -42,6 +45,7 @@ WIRE_RATE = 8000        # G.711 is 8 kHz, always
 FRAME_MS = 20
 FRAME_SAMPLES = WIRE_RATE * FRAME_MS // 1000   # 160
 PT_PCMU = 0             # payload type 0 is mu-law and is never negotiated away
+QUIET_FRAME = b"\xff" * FRAME_SAMPLES   # mu-law silence is 0xFF, not 0x00
 
 
 class SdpError(Exception):
@@ -105,6 +109,125 @@ def parse_sdp_answer(message: str) -> SdpAnswer:
     return SdpAnswer(host, port, key, salt, payload_types)
 
 
+
+class MediaPump(threading.Thread):
+    """Owns the socket and keeps the 20 ms clock, and does nothing else.
+
+    **Why this is its own thread.** Everything else in a call is bursty and slow:
+    Whisper on the GPU, cvoice over HTTP, a subprocess talking to Sonnet. RTP is
+    neither -- it is a metronome, and a frame that leaves 40 ms late is
+    indistinguishable at the far end from a frame that was lost. Running the
+    pacing on the same thread as the logic meant every transcription stalled the
+    stream, which showed up on his phone as the call-quality meter rising and
+    falling and as audio he described as "glitchy and segmented". No frame was
+    ever missing; they were simply late.
+
+    The thread does the minimum that has to be timely -- encrypt, send, receive,
+    decrypt -- and hands everything else off through queues. It never decodes
+    mu-law, never touches numpy, and never calls out to a model.
+
+    It ALWAYS sends. With nothing queued it sends silence, because a stream that
+    stops is not a quiet stream, it is a dead one.
+    """
+
+    def __init__(self, sock, tx, rx, remote, ssrc):
+        super().__init__(daemon=True, name="rtp-pump")
+        self.sock = sock
+        self.tx = tx
+        self.rx = rx
+        self.remote = remote
+        self.ssrc = ssrc
+        self._outbox: deque[bytes] = deque()
+        self._lock = threading.Lock()
+        self.inbox: queue.Queue = queue.Queue()
+        # NOT `_stop`: threading.Thread has an internal _stop() that join()
+        # calls, and shadowing it with an Event breaks join() with a
+        # TypeError from deep inside the stdlib.
+        self._stopping = threading.Event()
+        self._seq = 0
+        self._ts = 0
+        self.frames_sent = 0
+        self.frames_received = 0
+        self.auth_failures = 0
+        self.late_frames = 0
+
+    # -- what the call logic calls ---------------------------------------
+
+    def enqueue(self, frames: list[bytes]) -> None:
+        with self._lock:
+            self._outbox.extend(frames)
+
+    def drop_queued(self) -> int:
+        """Abandon un-sent audio. Used by barge-in: stopping means stopping now,
+        not after the rest of the sentence has drained."""
+        with self._lock:
+            n = len(self._outbox)
+            self._outbox.clear()
+        return n
+
+    def queued(self) -> int:
+        with self._lock:
+            return len(self._outbox)
+
+    def stop(self) -> None:
+        self._stopping.set()
+
+    # -- the clock --------------------------------------------------------
+
+    def run(self) -> None:
+        next_frame = time.monotonic()
+        while not self._stopping.is_set():
+            now = time.monotonic()
+            if now >= next_frame:
+                if now - next_frame > 0.04:
+                    self.late_frames += 1
+                with self._lock:
+                    payload = self._outbox.popleft() if self._outbox else QUIET_FRAME
+                self._send(payload)
+                next_frame += FRAME_MS / 1000.0
+                # Resynchronise rather than firing a catch-up burst: a burst is
+                # exactly what a jitter buffer discards.
+                if next_frame < now - 0.1:
+                    next_frame = now + FRAME_MS / 1000.0
+                continue
+            self._read(min(next_frame - now, 0.02))
+
+    def _send(self, payload: bytes) -> None:
+        packet = rtp.build_packet(self._seq & 0xFFFF, self._ts & 0xFFFFFFFF,
+                                  self.ssrc, payload)
+        try:
+            self.sock.sendto(self.tx.protect(packet), self.remote)
+        except OSError:
+            return
+        finally:
+            self._seq += 1
+            self._ts += FRAME_SAMPLES
+            self.frames_sent += 1
+
+    def _read(self, budget: float) -> None:
+        try:
+            self.sock.settimeout(max(0.001, budget))
+            data, _addr = self.sock.recvfrom(4096)
+        except (socket.timeout, TimeoutError):
+            return
+        except OSError:
+            return
+        try:
+            plain = self.rx.unprotect(data)
+        except srtp.AuthenticationFailure:
+            self.auth_failures += 1
+            return
+        except srtp.SrtpError:
+            return
+        parsed = rtp.parse_packet(plain)
+        if parsed is None:
+            return
+        self.frames_received += 1
+        # Unbounded on purpose: a turn is bounded in time by the caller, and
+        # dropping inbound audio to protect memory would lose his words.
+        self.inbox.put(parsed[3])
+
+
 class VoiceCall:
     """One answered call's audio, both directions.
 
@@ -126,10 +249,8 @@ class VoiceCall:
         # Ours encrypts outbound; his decrypts inbound. See the module docstring.
         self.tx = srtp.SrtpSession(our_key, our_salt)
         self.rx = srtp.SrtpSession(answer.srtp_key, answer.srtp_salt)
-        self.ssrc = ssrc if ssrc is not None else int.from_bytes(struct.pack("!I", id(self) & 0xFFFFFFFF), "big")
-        self._seq = 0
-        self._ts = 0
-        self.frames_sent = 0
+        self.ssrc = ssrc if ssrc is not None else int.from_bytes(
+            struct.pack("!I", id(self) & 0xFFFFFFFF), "big")
         # Frames that arrived while WE were speaking. On a barge-in these are
         # the opening of his sentence, so they are kept and handed to the next
         # receive_turn rather than dropped -- discarding them loses the first
@@ -144,8 +265,35 @@ class VoiceCall:
         # likely to be interrupted by the room.
         self.his_level: float | None = None
         self.his_voice: np.ndarray | None = None
-        self.frames_received = 0
-        self.auth_failures = 0
+        # The pump owns the socket and the 20 ms clock from here on. Nothing
+        # else in this class touches the wire.
+        self.pump = MediaPump(media_sock, self.tx, self.rx, self.remote, self.ssrc)
+        self.pump.start()
+
+    # Counters live on the pump, which is the only thing that sees a packet.
+    @property
+    def frames_sent(self) -> int:
+        return self.pump.frames_sent
+
+    @property
+    def frames_received(self) -> int:
+        return self.pump.frames_received
+
+    @property
+    def auth_failures(self) -> int:
+        return self.pump.auth_failures
+
+    @property
+    def late_frames(self) -> int:
+        """Frames the pump sent more than 40 ms behind schedule.
+
+        Non-zero means something is starving the media thread, which is heard as
+        chop even though no frame was ever lost.
+        """
+        return self.pump.late_frames
+
+    def close(self) -> None:
+        self.pump.stop()
 
     # -- outbound ---------------------------------------------------------
 
@@ -191,155 +339,92 @@ class VoiceCall:
     PENDING_RX_CAP = 60
 
     def send_audio(self, audio: np.ndarray, rate: int, *, interruptible: bool = False) -> float:
-        """Speak. Float32 mono in [-1, 1] at `rate`, paced to real time.
+        """Speak. Float32 mono in [-1, 1] at `rate`.
+
+        Pacing is the pump's job now; this only queues the audio and waits for
+        it to drain, watching for him cutting in if asked. That separation is
+        the point: this method can block on a lock or a slow queue without a
+        single frame going out late.
 
         With `interruptible`, stop the moment he starts talking over us and set
         `self.interrupted`. Talking over someone who has started answering is
-        the single rudest thing a voice agent does, and on a phone it is also
-        useless -- he has stopped listening either way.
-
-        Returns the wall-clock seconds spent, which should track the audio's own
-        duration closely unless it was cut short -- a large gap on an
-        uninterrupted send means the pacing is broken.
+        the rudest thing a voice agent does, and on a phone it is also useless.
         """
         wire = pcm.from_model(audio, rate=rate, out_rate=WIRE_RATE)
         ulaw = pcm.ulaw_encode(wire)
-        began = time.monotonic()
+        frames = [ulaw[i:i + FRAME_SAMPLES]
+                  for i in range(0, len(ulaw) - FRAME_SAMPLES + 1, FRAME_SAMPLES)]
         self.interrupted = False
-        loud_run = 0
-        started = self.frames_sent
         if interruptible:
             # Judge the interruption on audio from now, not on whatever queued
             # while we were quiet. Stale frames are why a reply could be cut off
             # by something he said before it started.
             self._flush_inbound()
-        for i in range(0, len(ulaw) - FRAME_SAMPLES + 1, FRAME_SAMPLES):
-            self._send_frame(ulaw[i:i + FRAME_SAMPLES])
-            # Absolute schedule, not `sleep(0.02)`: sleeping a fixed amount per
-            # frame accumulates every scheduling overshoot and the stream drifts
-            # progressively later than the clock it is meant to track.
-            due = began + ((self.frames_sent - started) * FRAME_MS / 1000.0)
-            slack = due - time.monotonic()
-            if interruptible:
-                loud_run = self._drain_inbound(slack, loud_run)
-                if loud_run >= self.BARGE_IN_FRAMES:
-                    self.interrupted = True
-                    log.info("barge-in: he started talking, stopping mid-utterance")
-                    break
-            elif slack > 0:
-                time.sleep(slack)
-        return time.monotonic() - began
+        began = time.monotonic()
+        expected = len(frames) * FRAME_MS / 1000.0
+        self.pump.enqueue(frames)
+
+        loud_run = 0
+        while self.pump.queued() > 0:
+            try:
+                payload = self.pump.inbox.get(timeout=FRAME_MS / 1000.0)
+            except queue.Empty:
+                continue
+            if not interruptible:
+                continue
+            self._pending_rx.append(payload)
+            if len(self._pending_rx) > self.PENDING_RX_CAP:
+                del self._pending_rx[:-self.PENDING_RX_CAP]
+            samples = np.frombuffer(pcm.ulaw_decode(payload), dtype="<i2")
+            level = float(np.sqrt(np.mean((samples / 32768.0) ** 2))) if samples.size else 0.0
+            bar = self._barge_threshold()
+            is_him = bar is not None and level >= bar and self._sounds_like_him(samples)
+            loud_run = loud_run + 1 if is_him else 0
+            if loud_run >= self.BARGE_IN_FRAMES:
+                dropped = self.pump.drop_queued()
+                self.interrupted = True
+                log.info("barge-in: he started talking, dropped %d queued frames", dropped)
+                break
+
+        spent = time.monotonic() - began
+        if not self.interrupted and expected > 0.5 and abs(spent - expected) > 0.25:
+            log.warning("send drift: %.2fs of audio took %.2fs", expected, spent)
+        return spent
 
     def _flush_inbound(self) -> int:
         """Discard anything already queued, and say how much there was."""
         dropped = 0
-        original = self.sock.gettimeout()
-        try:
-            self.sock.setblocking(False)
-            while True:
-                try:
-                    self.sock.recvfrom(4096)
-                    dropped += 1
-                except (BlockingIOError, socket.timeout, TimeoutError):
-                    break
-                except OSError:
-                    break
-        finally:
-            self.sock.settimeout(original)
+        while True:
+            try:
+                self.pump.inbox.get_nowait()
+                dropped += 1
+            except queue.Empty:
+                break
         if dropped:
             log.debug("flushed %d stale inbound frames before speaking", dropped)
         return dropped
 
-    def _drain_inbound(self, budget: float, loud_run: int) -> int:
-        """Read whatever has arrived, inside the pacing slack we already owe.
-
-        Runs in the gap between frames rather than on a thread: there is 20 ms
-        of scheduled idle per frame and this needs a fraction of it, so a thread
-        would add a lock around the SRTP receive state for no gain.
-        """
-        deadline = time.monotonic() + max(0.0, budget)
-        original = self.sock.gettimeout()
-        try:
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return loud_run
-                self.sock.settimeout(remaining)
-                try:
-                    data, _addr = self.sock.recvfrom(4096)
-                except (socket.timeout, TimeoutError):
-                    return loud_run
-                except OSError:
-                    return loud_run
-                try:
-                    plain = self.rx.unprotect(data)
-                except srtp.AuthenticationFailure:
-                    self.auth_failures += 1
-                    continue
-                except srtp.SrtpError:
-                    continue
-                parsed = rtp.parse_packet(plain)
-                if parsed is None:
-                    continue
-                payload = parsed[3]
-                self._pending_rx.append(payload)
-                if len(self._pending_rx) > self.PENDING_RX_CAP:
-                    del self._pending_rx[:-self.PENDING_RX_CAP]
-                self.frames_received += 1
-                samples = np.frombuffer(pcm.ulaw_decode(payload), dtype="<i2")
-                level = float(np.sqrt(np.mean((samples / 32768.0) ** 2))) if samples.size else 0.0
-                bar = self._barge_threshold()
-                is_him = (bar is not None and level >= bar
-                          and self._sounds_like_him(samples))
-                loud_run = loud_run + 1 if is_him else 0
-                if loud_run >= self.BARGE_IN_FRAMES:
-                    return loud_run
-        finally:
-            self.sock.settimeout(original)
-
-    def _send_frame(self, payload: bytes) -> None:
-        packet = rtp.build_packet(self._seq & 0xFFFF, self._ts & 0xFFFFFFFF,
-                                  self.ssrc, payload)
-        self.sock.sendto(self.tx.protect(packet), self.remote)
-        self._seq += 1
-        self._ts += FRAME_SAMPLES
-        self.frames_sent += 1
-
-    # How much silence to send before the first real audio of a call. His client
-    # cannot play anything until its jitter buffer has filled, so whatever
-    # arrives during that window is swallowed -- on the first live call he heard
-    # the greeting's opening syllable clipped and described it as "malo glitch
-    # na pocetku". 0.4 s was not enough; 1.2 s covers a buffer sized for the
-    # 172 ms jitter measured on this path with room to spare, and costs only a
-    # second of silence he is not listening to yet anyway.
-    PRIMING_SECONDS = 1.2
-
     def send_silence(self, seconds: float, *, calibrate: bool = False) -> None:
-        """Keep the stream alive while nothing is being said.
+        """Say nothing for `seconds`, without the stream ever stopping.
 
-        Some far ends tear down a call whose media stops; more practically, a
-        gap in the RTP timestamps is what makes his client's jitter buffer
-        decide the network died.
+        The pump emits silence whenever nothing is queued, so this only waits.
+        With `calibrate`, listen while doing it: this is the one moment in a
+        call when whatever arrives is definitionally the line's own noise, which
+        is what the barge-in threshold has to clear.
         """
-        quiet = self.QUIET_FRAME
-        began = time.monotonic()
+        deadline = time.monotonic() + seconds
         heard: list[float] = []
-        while time.monotonic() - began < seconds:
-            self._send_frame(quiet)
-            if calibrate:
-                # Listen while we are deliberately silent: this is the only
-                # moment in a call when whatever arrives is definitionally the
-                # line's own noise, which is what the threshold has to clear.
-                heard.extend(self._sample_levels(FRAME_MS / 1000.0))
-            else:
-                # Keepalive silence still has to DRAIN, even though it discards.
-                # This runs for seconds while the agent thinks, and his phone
-                # streams at us the whole time; leaving that in the socket
-                # buffer means the next utterance opens by reading a pile of
-                # audio from several seconds ago and scoring it as an
-                # interruption. Discarded rather than kept because he is
-                # listening to a filler here, not being asked anything.
-                self._sample_levels(FRAME_MS / 1000.0)
+        while time.monotonic() < deadline:
+            try:
+                payload = self.pump.inbox.get(
+                    timeout=min(0.05, max(0.001, deadline - time.monotonic())))
+            except queue.Empty:
+                continue
+            if not calibrate:
+                continue
+            samples = np.frombuffer(pcm.ulaw_decode(payload), dtype="<i2")
+            heard.append(float(np.sqrt(np.mean((samples / 32768.0) ** 2)))
+                         if samples.size else 0.0)
         if not calibrate:
             return
         if len(heard) >= 25:
@@ -350,6 +435,7 @@ class VoiceCall:
             # Too little to judge. Leaving line_floor None disables barge-in,
             # which is the safe direction -- see _barge_threshold.
             log.info("only %d frames during priming; barge-in stays off", len(heard))
+
 
     @staticmethod
     def _envelope(samples: np.ndarray, bands: int) -> np.ndarray:
@@ -426,82 +512,26 @@ class VoiceCall:
                        self.his_level * self.BARGE_IN_OF_HIS_LEVEL)
         return max(self.line_floor * self.BARGE_IN_OVER_FLOOR, self.MAX_THRESHOLD)
 
-    def _sample_levels(self, budget: float) -> list[float]:
-        """Read for `budget` seconds and return the frame energies seen."""
-        levels: list[float] = []
-        deadline = time.monotonic() + max(0.0, budget)
-        original = self.sock.gettimeout()
-        try:
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return levels
-                self.sock.settimeout(remaining)
-                try:
-                    data, _addr = self.sock.recvfrom(4096)
-                except (socket.timeout, TimeoutError, OSError):
-                    return levels
-                try:
-                    plain = self.rx.unprotect(data)
-                except srtp.AuthenticationFailure:
-                    self.auth_failures += 1
-                    continue
-                except srtp.SrtpError:
-                    continue
-                parsed = rtp.parse_packet(plain)
-                if parsed is None:
-                    continue
-                samples = np.frombuffer(pcm.ulaw_decode(parsed[3]), dtype="<i2")
-                levels.append(float(np.sqrt(np.mean((samples / 32768.0) ** 2)))
-                              if samples.size else 0.0)
-        finally:
-            self.sock.settimeout(original)
-
     # -- inbound ----------------------------------------------------------
 
     def receive_audio(self, seconds: float, out_rate: int = 16000) -> np.ndarray:
-        """Listen for `seconds` and return what arrived, at `out_rate`.
+        """Listen for `seconds` and return what arrived, at 16 kHz.
 
         Missing packets are not concealed -- a gap comes back as a gap. This
         feeds an ASR model, and inventing audio to paper over loss is exactly
         the kind of helpfulness that produces a confident wrong transcript.
         """
-        collected = bytearray()
+        collected: list[bytes] = []
         deadline = time.monotonic() + seconds
-        original = self.sock.gettimeout()
-        try:
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                self.sock.settimeout(min(0.5, remaining))
-                try:
-                    data, _addr = self.sock.recvfrom(4096)
-                except (socket.timeout, TimeoutError):
-                    continue
-                except OSError:
-                    break
-                try:
-                    plain = self.rx.unprotect(data)
-                except srtp.AuthenticationFailure:
-                    self.auth_failures += 1
-                    continue
-                except srtp.SrtpError:
-                    continue
-                parsed = rtp.parse_packet(plain)
-                if parsed is None:
-                    continue
-                collected += parsed[3]
-                self.frames_received += 1
-        finally:
-            self.sock.settimeout(original)
-
+        while time.monotonic() < deadline:
+            try:
+                collected.append(self.pump.inbox.get(
+                    timeout=max(0.001, min(0.1, deadline - time.monotonic()))))
+            except queue.Empty:
+                continue
         if not collected:
             return np.zeros(0, dtype=np.float32)
-        return pcm.to_model(pcm.ulaw_decode(bytes(collected)), rate=WIRE_RATE) \
-            if out_rate == 16000 else pcm.resample(
-                pcm.to_model(pcm.ulaw_decode(bytes(collected)), rate=WIRE_RATE),
-                16000, out_rate)
+        return pcm.to_model(pcm.ulaw_decode(b"".join(collected)), rate=WIRE_RATE)
 
 
     # -- turn taking ------------------------------------------------------
@@ -595,43 +625,18 @@ class VoiceCall:
             speech_frames = sum(1 for lv in levels if lv >= bar)
 
         deadline = time.monotonic() + max_seconds
-        original = self.sock.gettimeout()
         reason = "timeout"
-        next_frame = time.monotonic()
         try:
             while time.monotonic() < deadline:
-                # Keep the outbound stream alive on its own clock, whatever the
-                # inbound side is doing.
-                now = time.monotonic()
-                if now >= next_frame:
-                    self._send_frame(self.QUIET_FRAME)
-                    next_frame += FRAME_MS / 1000.0
-                    # If we fell far behind (a long transcribe on this thread),
-                    # resynchronise rather than sending a burst to catch up.
-                    if next_frame < now - 0.1:
-                        next_frame = now + FRAME_MS / 1000.0
-                budget = max(0.001, min(next_frame - time.monotonic(),
-                                        deadline - time.monotonic()))
-                self.sock.settimeout(budget)
+                # The pump keeps the outbound stream running on its own clock
+                # while this listens, so nothing here has to be timely and a
+                # slow chunk handler cannot stall the audio going to his phone.
                 try:
-                    data, _addr = self.sock.recvfrom(4096)
-                except (socket.timeout, TimeoutError):
+                    payload = self.pump.inbox.get(
+                        timeout=max(0.001, min(0.1, deadline - time.monotonic())))
+                except queue.Empty:
                     continue
-                except OSError:
-                    break
-                try:
-                    plain = self.rx.unprotect(data)
-                except srtp.AuthenticationFailure:
-                    self.auth_failures += 1
-                    continue
-                except srtp.SrtpError:
-                    continue
-                parsed = rtp.parse_packet(plain)
-                if parsed is None:
-                    continue
-                payload = parsed[3]
                 frames.append(payload)
-                self.frames_received += 1
 
                 samples = np.frombuffer(pcm.ulaw_decode(payload), dtype="<i2")
                 level = float(np.sqrt(np.mean((samples / 32768.0) ** 2))) if samples.size else 0.0
@@ -676,7 +681,7 @@ class VoiceCall:
                         except Exception:
                             log.exception("chunk handler raised; continuing to listen")
         finally:
-            self.sock.settimeout(original)
+            pass
 
         # "timeout" means he was still going when the cap hit; "silence" means
         # audio arrived and none of it was speech. Collapsing the two loses the
@@ -697,4 +702,5 @@ class VoiceCall:
             "frames_sent": self.frames_sent,
             "frames_received": self.frames_received,
             "auth_failures": self.auth_failures,
+            "late_frames": self.late_frames,
         }

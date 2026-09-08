@@ -325,6 +325,8 @@ def main() -> int:
 
         call.send_silence(0.4)
         log.info("call stats: %s", call.stats())
+        # Stop the media thread, or it keeps streaming to a call that has ended.
+        call.close()
 
     ring = SipTransport(on_answer=on_answer)
 

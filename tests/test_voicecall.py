@@ -87,6 +87,22 @@ def test_a_far_end_without_pcmu_is_refused():
 # -- the media path over real sockets --------------------------------------
 
 
+_LIVE_CALLS: list = []
+
+
+@pytest.fixture(autouse=True)
+def _stop_pumps():
+    """Every VoiceCall starts a thread that streams silence forever now.
+
+    Without this they accumulate across the suite, and a later test reads an
+    earlier test's audio off its own socket -- which looks like a real failure
+    and is not one.
+    """
+    yield
+    while _LIVE_CALLS:
+        _LIVE_CALLS.pop().close()
+
+
 def call_pair():
     """Us and a stand-in for his phone, on real UDP sockets."""
     ours = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); ours.bind(("127.0.0.1", 0))
@@ -95,7 +111,31 @@ def call_pair():
     their_key, their_salt = srtp.new_key_salt()
     answer = voicecall.SdpAnswer(*theirs.getsockname(), their_key, their_salt, [0])
     call = voicecall.VoiceCall(ours, answer, our_key, our_salt)
+    _LIVE_CALLS.append(call)
     return call, theirs, (our_key, our_salt), (their_key, their_salt), ours.getsockname()
+
+
+def read_frames(sock, session, limit=400, timeout=1.0):
+    """Read up to `limit` packets. Bounded on purpose.
+
+    Reading "until the socket times out" worked while the stream stopped between
+    utterances. It does not any more -- the pump sends silence forever, which is
+    the whole point of it -- so an unbounded loop never returns.
+    """
+    sock.settimeout(timeout)
+    out = []
+    for _ in range(limit):
+        try:
+            data, _addr = sock.recvfrom(4096)
+        except (socket.timeout, TimeoutError):
+            break
+        try:
+            parsed = rtp.parse_packet(session.unprotect(data))
+        except Exception:
+            continue
+        if parsed is not None:
+            out.append(parsed)
+    return out
 
 
 def test_what_we_send_is_readable_with_OUR_key_and_not_his():
@@ -144,15 +184,13 @@ def test_audio_survives_the_round_trip_recognisably():
     tone = (np.sin(2 * np.pi * freq * np.arange(n) / rate) * 0.6).astype(np.float32)
     call.send_audio(tone, rate=rate)
 
-    theirs.settimeout(1.0)
     reader = srtp.SrtpSession(*ours_ks)
-    body = bytearray()
-    while True:
-        try:
-            body += rtp.parse_packet(reader.unprotect(theirs.recvfrom(4096)[0]))[3]
-        except (socket.timeout, TimeoutError):
-            break
-    back = pcm.to_model(pcm.ulaw_decode(bytes(body)), rate=8000)
+    # Exactly the tone's own frames: anything past them is the pump's silence,
+    # which would drag the measured peak toward DC and fail the test for the
+    # wrong reason.
+    frames = read_frames(theirs, reader, limit=n // voicecall.FRAME_SAMPLES)
+    body = b"".join(f[3] for f in frames)
+    back = pcm.to_model(pcm.ulaw_decode(body), rate=8000)
     spectrum = np.abs(np.fft.rfft(back))
     peak = np.fft.rfftfreq(back.size, 1 / 16000)[int(np.argmax(spectrum))]
     assert abs(peak - freq) < 15, f"440 Hz came back as {peak:.0f} Hz"
@@ -172,9 +210,17 @@ def test_sending_is_paced_to_real_time_rather_than_flooded():
 
 
 def test_frame_accounting_matches_the_audio_length():
+    """At least the audio's own frames, and not wildly more.
+
+    Not an exact count any more: the pump runs continuously, so a silence frame
+    can go out either side of the utterance. That is the intended behaviour --
+    a stream that stops is a dead stream -- so the assertion is a band.
+    """
     call, _theirs, _, _, _ = call_pair()
+    before = call.frames_sent
     call.send_audio(np.zeros(8000, dtype=np.float32), rate=8000)  # 1.0 s
-    assert call.frames_sent == 50, f"1 s at 20 ms/frame is 50 frames, got {call.frames_sent}"
+    sent = call.frames_sent - before
+    assert 50 <= sent <= 56, f"1 s at 20 ms/frame is ~50 frames, got {sent}"
 
 
 def test_receive_returns_empty_rather_than_hanging_when_nothing_arrives():
@@ -276,9 +322,10 @@ def test_a_turn_is_capped_so_a_stuck_stream_cannot_hang_the_call():
 
 def test_speaking_uninterrupted_plays_the_whole_utterance():
     call, _theirs, _, _, _ = call_pair()
+    before = call.frames_sent
     call.send_audio(np.zeros(8000, dtype=np.float32), rate=8000, interruptible=True)
     assert call.interrupted is False
-    assert call.frames_sent == 50
+    assert call.frames_sent - before >= 50
 
 
 def test_he_can_talk_over_us_and_we_stop():
@@ -325,9 +372,10 @@ def test_a_non_interruptible_send_ignores_him_talking():
     """Fillers and goodbyes are sent non-interruptibly on purpose."""
     call, theirs, _, their_keys, our_addr = call_pair()
     feed(theirs, their_keys, our_addr, speech(1.0))
+    before = call.frames_sent
     call.send_audio(np.zeros(8000, dtype=np.float32), rate=8000)
     assert call.interrupted is False
-    assert call.frames_sent == 50
+    assert call.frames_sent - before >= 50
 
 
 def test_a_noisy_line_does_not_trigger_a_barge_in():
@@ -365,9 +413,10 @@ def test_an_unmeasured_line_refuses_to_interrupt_rather_than_guessing():
     assert call.line_floor is None
     assert call._barge_threshold() is None
     feed(theirs, their_keys, our_addr, speech(1.5))
+    before = call.frames_sent
     call.send_audio(np.zeros(8000, dtype=np.float32), rate=8000, interruptible=True)
     assert call.interrupted is False
-    assert call.frames_sent == 50, "the whole utterance must still go out"
+    assert call.frames_sent - before >= 50, "the whole utterance must still go out"
 
 
 def test_retained_audio_is_capped_so_a_long_reply_does_not_hoard_his_echo():
@@ -511,17 +560,11 @@ def test_rtp_timestamps_stay_continuous_across_a_listening_gap():
     call.send_audio(np.zeros(1600, dtype=np.float32), rate=8000)   # 0.2 s
     call.receive_turn(max_seconds=0.6, silence_ms=800)
     call.send_audio(np.zeros(1600, dtype=np.float32), rate=8000)
-    theirs.settimeout(0.5)
     reader = srtp.SrtpSession(*ours_ks)
-    stamps, seqs = [], []
-    while True:
-        try:
-            # parse_packet returns (payload_type, seq, timestamp, payload)
-            _pt, seq, ts, _payload = rtp.parse_packet(
-                reader.unprotect(theirs.recvfrom(4096)[0]))
-            seqs.append(seq); stamps.append(ts)
-        except Exception:
-            break
+    # parse_packet returns (payload_type, seq, timestamp, payload)
+    frames = read_frames(theirs, reader, limit=120)
+    seqs = [f[1] for f in frames]
+    stamps = [f[2] for f in frames]
     assert len(stamps) > 20, f"only {len(stamps)} packets crossed the wire"
     assert {b - a for a, b in zip(seqs, seqs[1:])} == {1}, "sequence numbers skipped"
     gaps = {b - a for a, b in zip(stamps, stamps[1:])}
@@ -541,3 +584,63 @@ def test_a_quiet_speaker_can_still_interrupt():
     feed_during(theirs, their_keys, our_addr, speech(2.0, amp=0.012))
     call.send_audio(np.zeros(16000, dtype=np.float32), rate=8000, interruptible=True)
     assert call.interrupted is True
+
+
+# -- the media pump --------------------------------------------------------
+
+
+def test_the_stream_keeps_pace_while_the_call_logic_is_blocked():
+    """The reason the pump exists.
+
+    Whisper on the GPU, cvoice over HTTP and a subprocess talking to Sonnet all
+    block for seconds at a time. While the pacing lived on the same thread,
+    every one of those stalled the stream, which reached his phone as the
+    call-quality meter rising and falling and as audio he called "glitchy and
+    segmented". No frame was ever missing -- they were late, which at the far
+    end is indistinguishable from loss.
+    """
+    call, theirs, ours_ks, _, _ = call_pair()
+    reader = srtp.SrtpSession(*ours_ks)
+    theirs.settimeout(1.0)
+    theirs.recvfrom(4096)              # wait for the stream to be running
+    time.sleep(0.05)
+    while True:                        # drain the backlog so timing starts clean
+        try:
+            theirs.settimeout(0.02); theirs.recvfrom(4096)
+        except (socket.timeout, TimeoutError):
+            break
+
+    # Exactly what a transcription does to this thread.
+    began = time.monotonic()
+    time.sleep(1.0)
+    frames = read_frames(theirs, reader, limit=200, timeout=0.5)
+    assert len(frames) >= 40, f"only {len(frames)} frames left during a 1 s stall"
+    assert call.late_frames == 0, f"{call.late_frames} frames went out over 40 ms late"
+
+
+def test_the_pump_sends_silence_rather_than_nothing_when_idle():
+    call, theirs, ours_ks, _, _ = call_pair()
+    reader = srtp.SrtpSession(*ours_ks)
+    frames = read_frames(theirs, reader, limit=10, timeout=1.0)
+    assert len(frames) >= 5
+    assert all(f[3] == voicecall.QUIET_FRAME for f in frames), \
+        "idle frames must be mu-law silence, not empty or absent"
+
+
+def test_barge_in_abandons_queued_audio_rather_than_draining_it():
+    """Stopping means stopping now, not after the rest of the sentence."""
+    call, theirs, _, their_keys, our_addr = call_pair()
+    feed(theirs, their_keys, our_addr, quiet(1.0))
+    call.send_silence(0.5, calibrate=True)
+    feed_during(theirs, their_keys, our_addr, speech(2.0))
+    call.send_audio(np.zeros(40000, dtype=np.float32), rate=8000, interruptible=True)  # 5 s
+    assert call.interrupted is True
+    assert call.pump.queued() == 0, "un-sent audio was left queued after a barge-in"
+
+
+def test_closing_a_call_stops_its_thread():
+    call, _theirs, _, _, _ = call_pair()
+    assert call.pump.is_alive()
+    call.close()
+    call.pump.join(timeout=2.0)
+    assert not call.pump.is_alive(), "the pump thread outlived the call"
