@@ -40,14 +40,20 @@ TOKEN = "eOuV4ySUiXOxmBMDsILZ3yJZAumdIq55EK-xxQgwxRs"
 PROFILE = "bogdan-stamenovic"
 WHEELS = "/home/bodas/data/cvoice/.venv/lib/python3.14/site-packages"
 WORKDIR = "/home/bodas/data/hotline"
-MAX_TURNS = 12
+MAX_CALL_SECONDS = 1800   # a backstop, not a policy
+# How long the line can be completely dead before we accept he has gone.
+# His instruction: do not hang up on him, wait for HIS hangup. A silent
+# stretch is him thinking; a stretch with no RTP at all is the phone gone.
+DEAD_LINE_SECONDS = 90
 AGENT_SLOW_AFTER = 3.0   # seconds before a second, apologetic filler goes out
 
 MANNERS = """You are on a LIVE PHONE CALL with Bogdan, speaking Serbian out loud. \
 Your words go straight to a text-to-speech engine and into his ear.
 
 RULES, all of them about being audible rather than readable:
-- ONE or TWO short sentences. Never more. He cannot skim a phone call.
+- ONE short sentence. Two only if the second is genuinely necessary. He cannot
+  skim a phone call, and anything past about eight seconds of speech is too long
+  to follow by ear.
 - NO markdown, NO lists, NO code, NO URLs, NO file paths read out character by \
 character. If you must name a file, say it the way a person would.
 - Serbian, with proper diacritics (c, c, s, z, dj as the real characters) -- the \
@@ -163,21 +169,34 @@ def main() -> int:
             if call.interrupted:
                 log.info("  (he cut in)")
 
-        call.send_silence(voicecall.VoiceCall.PRIMING_SECONDS)
+        call.send_silence(voicecall.VoiceCall.PRIMING_SECONDS, calibrate=True)
         play("greet", interruptible=True)
 
-        empty_turns = 0
-        for turn in range(MAX_TURNS):
-            heard, why = call.receive_turn(max_seconds=20.0, silence_ms=800)
-            log.info("turn %d: %s, %.1fs of audio", turn + 1, why, heard.size / 16000)
+        # He asked explicitly not to be hung up on: this end stays on the line
+        # until HIS hangup. Silence is him thinking, not him leaving, and the
+        # previous version ended the call twice while he was still there.
+        call_started = time.time()
+        dead_since: float | None = None
+        turn = 0
+        while time.time() - call_started < MAX_CALL_SECONDS:
+            turn += 1
+            heard, why = call.receive_turn(max_seconds=30.0, silence_ms=800)
+            log.info("turn %d: %s, %.1fs of audio", turn, why, heard.size / 16000)
 
-            if why in ("no-audio", "silence") or heard.size < 8000:
-                empty_turns += 1
-                if empty_turns >= 2:
-                    log.info("two empty turns; hanging up")
-                    play("bye"); break
-                play("notheard"); continue
-            empty_turns = 0
+            if why == "no-audio":
+                # No RTP at all. Either he hung up or the media died; only after
+                # a long stretch of it do we accept the call is over.
+                dead_since = dead_since or time.time()
+                if time.time() - dead_since > DEAD_LINE_SECONDS:
+                    log.info("no media for %ds; he is gone", DEAD_LINE_SECONDS)
+                    break
+                continue
+            dead_since = None
+
+            if why == "silence" or heard.size < 8000:
+                # Audio is flowing, he just is not speaking. Stay quiet and wait.
+                call.send_silence(1.0)
+                continue
 
             t0 = time.time()
             segs, _ = whisper.transcribe(heard, language="sr", beam_size=1)
@@ -217,8 +236,6 @@ def main() -> int:
             transcript.append(("hotline", text))
 
             speak(text)
-        else:
-            play("bye")
 
         call.send_silence(0.4)
         log.info("call stats: %s", call.stats())

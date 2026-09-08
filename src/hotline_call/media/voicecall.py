@@ -136,15 +136,36 @@ class VoiceCall:
         # syllable of every interruption, which reads as him mumbling.
         self._pending_rx: list[bytes] = []
         self.interrupted = False
+        # Measured during priming silence, when neither of us is talking.
+        # None means never measured; the absolute threshold is used instead.
+        self.line_floor: float | None = None
         self.frames_received = 0
         self.auth_failures = 0
 
     # -- outbound ---------------------------------------------------------
 
     # Consecutive loud frames before we accept that he has started talking.
-    # One frame is a click, a codec artefact, or the tail of our own audio
-    # echoing back; 160 ms of continuous energy is a person.
-    BARGE_IN_FRAMES = 8
+    #
+    # This was 8 (160 ms) against the fixed MAX_THRESHOLD, and on the first live
+    # conversation it cut off every single utterance about a sixth of a second
+    # in -- he heard "nothing for four seconds, then it started talking and just
+    # stopped". A real phone line is never as quiet as a synthesised test clip:
+    # room noise, comfort noise and our own audio echoing back through the relay
+    # all sit above a threshold picked for clean audio, so the barge-in
+    # triggered on us talking to ourselves.
+    #
+    # Two changes. Half a second, because a real interruption lasts longer than
+    # that and an echo burst usually does not. And the threshold is calibrated
+    # against the line's own measured noise rather than assumed -- see
+    # `line_floor`.
+    BARGE_IN_FRAMES = 25
+    # How far above the measured line noise counts as him talking.
+    BARGE_IN_OVER_FLOOR = 4.0
+    # Frames of inbound audio to retain while we speak. A barge-in needs its
+    # onset kept, not the whole utterance: without a cap this grew for the
+    # length of every reply and handed the next turn 19 s of mostly our own
+    # echo, which Whisper duly transcribed.
+    PENDING_RX_CAP = 60
 
     def send_audio(self, audio: np.ndarray, rate: int, *, interruptible: bool = False) -> float:
         """Speak. Float32 mono in [-1, 1] at `rate`, paced to real time.
@@ -164,6 +185,11 @@ class VoiceCall:
         self.interrupted = False
         loud_run = 0
         started = self.frames_sent
+        if interruptible:
+            # Judge the interruption on audio from now, not on whatever queued
+            # while we were quiet. Stale frames are why a reply could be cut off
+            # by something he said before it started.
+            self._flush_inbound()
         for i in range(0, len(ulaw) - FRAME_SAMPLES + 1, FRAME_SAMPLES):
             self._send_frame(ulaw[i:i + FRAME_SAMPLES])
             # Absolute schedule, not `sleep(0.02)`: sleeping a fixed amount per
@@ -180,6 +206,26 @@ class VoiceCall:
             elif slack > 0:
                 time.sleep(slack)
         return time.monotonic() - began
+
+    def _flush_inbound(self) -> int:
+        """Discard anything already queued, and say how much there was."""
+        dropped = 0
+        original = self.sock.gettimeout()
+        try:
+            self.sock.setblocking(False)
+            while True:
+                try:
+                    self.sock.recvfrom(4096)
+                    dropped += 1
+                except (BlockingIOError, socket.timeout, TimeoutError):
+                    break
+                except OSError:
+                    break
+        finally:
+            self.sock.settimeout(original)
+        if dropped:
+            log.debug("flushed %d stale inbound frames before speaking", dropped)
+        return dropped
 
     def _drain_inbound(self, budget: float, loud_run: int) -> int:
         """Read whatever has arrived, inside the pacing slack we already owe.
@@ -214,10 +260,13 @@ class VoiceCall:
                     continue
                 payload = parsed[3]
                 self._pending_rx.append(payload)
+                if len(self._pending_rx) > self.PENDING_RX_CAP:
+                    del self._pending_rx[:-self.PENDING_RX_CAP]
                 self.frames_received += 1
                 samples = np.frombuffer(pcm.ulaw_decode(payload), dtype="<i2")
                 level = float(np.sqrt(np.mean((samples / 32768.0) ** 2))) if samples.size else 0.0
-                loud_run = loud_run + 1 if level >= self.MAX_THRESHOLD else 0
+                bar = self._barge_threshold()
+                loud_run = loud_run + 1 if (bar is not None and level >= bar) else 0
                 if loud_run >= self.BARGE_IN_FRAMES:
                     return loud_run
         finally:
@@ -240,7 +289,7 @@ class VoiceCall:
     # second of silence he is not listening to yet anyway.
     PRIMING_SECONDS = 1.2
 
-    def send_silence(self, seconds: float) -> None:
+    def send_silence(self, seconds: float, *, calibrate: bool = False) -> None:
         """Keep the stream alive while nothing is being said.
 
         Some far ends tear down a call whose media stops; more practically, a
@@ -249,9 +298,77 @@ class VoiceCall:
         """
         quiet = b"\xff" * FRAME_SAMPLES  # mu-law silence is 0xFF, not 0x00
         began = time.monotonic()
+        heard: list[float] = []
         while time.monotonic() - began < seconds:
             self._send_frame(quiet)
-            time.sleep(FRAME_MS / 1000.0)
+            if calibrate:
+                # Listen while we are deliberately silent: this is the only
+                # moment in a call when whatever arrives is definitionally the
+                # line's own noise, which is what the threshold has to clear.
+                heard.extend(self._sample_levels(FRAME_MS / 1000.0))
+            else:
+                # Keepalive silence still has to DRAIN, even though it discards.
+                # This runs for seconds while the agent thinks, and his phone
+                # streams at us the whole time; leaving that in the socket
+                # buffer means the next utterance opens by reading a pile of
+                # audio from several seconds ago and scoring it as an
+                # interruption. Discarded rather than kept because he is
+                # listening to a filler here, not being asked anything.
+                self._sample_levels(FRAME_MS / 1000.0)
+        if not calibrate:
+            return
+        if len(heard) >= 25:
+            self.line_floor = float(np.percentile(heard, 75))
+            log.info("line noise floor %.4f -> barge-in above %.4f",
+                     self.line_floor, self._barge_threshold() or -1)
+        else:
+            # Too little to judge. Leaving line_floor None disables barge-in,
+            # which is the safe direction -- see _barge_threshold.
+            log.info("only %d frames during priming; barge-in stays off", len(heard))
+
+    def _barge_threshold(self) -> float | None:
+        """The level that counts as him interrupting, or None for "do not".
+
+        None rather than a guess when the line was never measured. The guess is
+        what broke the first conversation: an assumed threshold that a real line
+        clears on its own noise turns every utterance into a barge-in. Refusing
+        to interrupt is a mild failure -- we talk over him occasionally -- where
+        a wrong threshold is a total one, and he hears nothing at all.
+        """
+        if self.line_floor is None:
+            return None
+        return max(self.line_floor * self.BARGE_IN_OVER_FLOOR, self.MAX_THRESHOLD)
+
+    def _sample_levels(self, budget: float) -> list[float]:
+        """Read for `budget` seconds and return the frame energies seen."""
+        levels: list[float] = []
+        deadline = time.monotonic() + max(0.0, budget)
+        original = self.sock.gettimeout()
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return levels
+                self.sock.settimeout(remaining)
+                try:
+                    data, _addr = self.sock.recvfrom(4096)
+                except (socket.timeout, TimeoutError, OSError):
+                    return levels
+                try:
+                    plain = self.rx.unprotect(data)
+                except srtp.AuthenticationFailure:
+                    self.auth_failures += 1
+                    continue
+                except srtp.SrtpError:
+                    continue
+                parsed = rtp.parse_packet(plain)
+                if parsed is None:
+                    continue
+                samples = np.frombuffer(pcm.ulaw_decode(parsed[3]), dtype="<i2")
+                levels.append(float(np.sqrt(np.mean((samples / 32768.0) ** 2)))
+                              if samples.size else 0.0)
+        finally:
+            self.sock.settimeout(original)
 
     # -- inbound ----------------------------------------------------------
 
@@ -357,7 +474,8 @@ class VoiceCall:
             # Those frames were captured because they were loud, so credit them
             # as speech: a barge-in that then falls below min_speech_ms would
             # otherwise be reported as silence.
-            speech_frames = sum(1 for lv in levels if lv >= self.MAX_THRESHOLD)
+            bar = self._barge_threshold() or self.MAX_THRESHOLD
+            speech_frames = sum(1 for lv in levels if lv >= bar)
 
         deadline = time.monotonic() + max_seconds
         original = self.sock.gettimeout()

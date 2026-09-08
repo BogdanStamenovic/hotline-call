@@ -9,6 +9,7 @@ perfectly and cannot read one of his -- and every single-ended test passes.
 from __future__ import annotations
 
 import socket
+import threading
 import time
 
 import numpy as np
@@ -211,6 +212,21 @@ def quiet(seconds, rate=8000, amp=0.0008):
     return (np.random.randn(int(seconds * rate)) * amp).astype(np.float32)
 
 
+
+def feed_during(theirs_sock, their_keys, our_addr, audio, delay=0.15, rate=8000):
+    """Start streaming at us shortly AFTER the send begins.
+
+    Pre-feeding is not how an interruption happens, and it no longer works:
+    send_audio flushes stale inbound audio before it starts speaking, precisely
+    so a reply cannot be cut off by something that arrived while we were quiet.
+    """
+    def run():
+        time.sleep(delay)
+        feed(theirs_sock, their_keys, our_addr, audio, rate=rate)
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t
+
 def test_a_turn_ends_after_he_stops_talking():
     call, theirs, _, their_keys, our_addr = call_pair()
     clip = np.concatenate([quiet(0.4), speech(1.2), quiet(1.4)])
@@ -267,12 +283,15 @@ def test_speaking_uninterrupted_plays_the_whole_utterance():
 
 def test_he_can_talk_over_us_and_we_stop():
     call, theirs, _, their_keys, our_addr = call_pair()
-    # Two seconds of us talking, and he cuts in immediately.
-    feed(theirs, their_keys, our_addr, speech(1.5))
+    # A real call primes with silence first, which is when the line gets
+    # measured. Without that the barge-in is deliberately disabled.
+    feed(theirs, their_keys, our_addr, quiet(1.0))
+    call.send_silence(0.5, calibrate=True)
+    # Two seconds of us talking, and he cuts in a moment after we start.
+    feed_during(theirs, their_keys, our_addr, speech(1.5))
     spent = call.send_audio(np.zeros(16000, dtype=np.float32), rate=8000, interruptible=True)
     assert call.interrupted is True, "he talked over us and we kept going"
     assert spent < 1.5, f"took {spent:.2f}s to stop"
-    assert call.frames_sent < 100, "should have stopped well short of 2s"
 
 
 def test_quiet_line_noise_does_not_count_as_an_interruption():
@@ -287,7 +306,9 @@ def test_the_barge_in_audio_is_kept_and_becomes_his_next_turn():
     """The bug this guards: dropping what we consumed while detecting the
     interruption silently eats the first syllable of every interruption."""
     call, theirs, _, their_keys, our_addr = call_pair()
-    feed(theirs, their_keys, our_addr, speech(1.5))
+    feed(theirs, their_keys, our_addr, quiet(1.0))
+    call.send_silence(0.5, calibrate=True)
+    feed_during(theirs, their_keys, our_addr, speech(1.5))
     call.send_audio(np.zeros(16000, dtype=np.float32), rate=8000, interruptible=True)
     assert call.interrupted
     assert call._pending_rx, "the interrupting audio was thrown away"
@@ -307,3 +328,63 @@ def test_a_non_interruptible_send_ignores_him_talking():
     call.send_audio(np.zeros(8000, dtype=np.float32), rate=8000)
     assert call.interrupted is False
     assert call.frames_sent == 50
+
+
+def test_a_noisy_line_does_not_trigger_a_barge_in():
+    """The regression that made him hear nothing at all.
+
+    A live line is never as quiet as a synthesised clip -- room noise, comfort
+    noise, and our own audio echoing back through the relay all sit above a
+    threshold chosen for clean audio. With a fixed bar this cut off every
+    utterance about 160 ms in.
+    """
+    call, theirs, _, their_keys, our_addr = call_pair()
+    # Line noise well above the old fixed MAX_THRESHOLD, but it is not speech.
+    noisy = quiet(3.0, amp=0.03)
+    feed(theirs, their_keys, our_addr, noisy)
+    call.send_silence(0.6, calibrate=True)   # measure that noise
+    assert call.line_floor is not None, "the floor was never measured"
+    feed(theirs, their_keys, our_addr, noisy)
+    call.send_audio(np.zeros(8000, dtype=np.float32), rate=8000, interruptible=True)
+    assert call.interrupted is False, "line noise was mistaken for him talking"
+    assert call.frames_sent >= 50 + 30, "the utterance was cut short"
+
+
+def test_real_speech_still_interrupts_over_that_same_noise():
+    """The other half: calibrating must not make it deaf to an actual person."""
+    call, theirs, _, their_keys, our_addr = call_pair()
+    feed(theirs, their_keys, our_addr, quiet(2.0, amp=0.03))
+    call.send_silence(0.6, calibrate=True)
+    feed_during(theirs, their_keys, our_addr, speech(2.0))
+    call.send_audio(np.zeros(16000, dtype=np.float32), rate=8000, interruptible=True)
+    assert call.interrupted is True, "he talked and we did not stop"
+
+
+def test_an_unmeasured_line_refuses_to_interrupt_rather_than_guessing():
+    call, theirs, _, their_keys, our_addr = call_pair()
+    assert call.line_floor is None
+    assert call._barge_threshold() is None
+    feed(theirs, their_keys, our_addr, speech(1.5))
+    call.send_audio(np.zeros(8000, dtype=np.float32), rate=8000, interruptible=True)
+    assert call.interrupted is False
+    assert call.frames_sent == 50, "the whole utterance must still go out"
+
+
+def test_retained_audio_is_capped_so_a_long_reply_does_not_hoard_his_echo():
+    call, theirs, _, their_keys, our_addr = call_pair()
+    feed(theirs, their_keys, our_addr, quiet(4.0, amp=0.03))
+    call.send_audio(np.zeros(24000, dtype=np.float32), rate=8000, interruptible=True)
+    assert len(call._pending_rx) <= voicecall.VoiceCall.PENDING_RX_CAP
+
+
+def test_audio_that_arrived_before_we_spoke_cannot_interrupt_us():
+    """He said something, the agent thought about it, and then we answered.
+    What he said must not cut off the answer to it."""
+    call, theirs, _, their_keys, our_addr = call_pair()
+    feed(theirs, their_keys, our_addr, quiet(1.0))
+    call.send_silence(0.5, calibrate=True)
+    feed(theirs, their_keys, our_addr, speech(2.0))   # queued while we were quiet
+    time.sleep(0.1)
+    call.send_audio(np.zeros(8000, dtype=np.float32), rate=8000, interruptible=True)
+    assert call.interrupted is False, "stale audio cut off the reply to it"
+    assert call.frames_sent >= 50 + 25

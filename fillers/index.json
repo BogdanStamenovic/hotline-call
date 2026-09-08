@@ -1,8 +1,8 @@
 {
   "ack_mhm": {
-    "text": "Mhm.",
+    "text": "Mhm, važi.",
     "rate": 24000,
-    "seconds": 1.16
+    "seconds": 1.44
   },
   "ack_aha": {
     "text": "Aha, razumem.",
