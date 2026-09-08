@@ -248,8 +248,18 @@ def main() -> int:
                 play("notheard"); continue
             transcript.append(("bogdan", said))
 
+            # "cao" is NOT here, and that is the whole point: in Serbian it is a
+            # greeting at least as often as a farewell. He opened a call with
+            # "Cao brate" and this hung up on him mid-hello.
+            #
+            # These also have to appear near the END of what he said. "Reci mi
+            # kad zavrsis" contains a farewell word and is not one.
             low = said.lower()
-            if any(w in low for w in ("prekini", "ćao", "cao", "doviđenja", "dovidjenja", "zdravo i prijatno")):
+            tail = low[-40:]
+            farewells = ("prekini", "prekidam", "dovidjenja", "doviđenja",
+                         "cujemo se", "čujemo se", "prijatno", "zdravo i prijatno",
+                         "to je to", "hvala i prijatno")
+            if any(w in tail for w in farewells):
                 play("bye"); transcript.append(("hotline", "bye")); break
 
             # The agent runs in a thread so the line never goes quiet: an

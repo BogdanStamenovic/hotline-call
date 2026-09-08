@@ -173,7 +173,11 @@ class VoiceCall:
     # speaking directly into the handset, because distance costs it an order of
     # magnitude. His idea, 2026-09-08, after a call where the room kept
     # interrupting him.
-    BARGE_IN_OF_HIS_LEVEL = 0.45
+    # Measured on a live call: his speaking level came out at 0.0413, so 0.45
+    # of it is 0.0186 -- BELOW the noise-floor threshold, which meant the
+    # profile was not actually raising the bar at all. 0.6 puts it clear of
+    # the floor while still well under a normal speaking voice.
+    BARGE_IN_OF_HIS_LEVEL = 0.6
     # Spectral bands used to tell his voice from someone across the room. Coarse
     # on purpose: this is a cheap similarity check on 8 kHz telephony audio, not
     # speaker identification, and it is a SECOND opinion that only ever makes
