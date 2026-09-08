@@ -1,0 +1,47 @@
+{
+  "ack_mhm": {
+    "text": "Mhm.",
+    "rate": 24000,
+    "seconds": 1.16
+  },
+  "ack_aha": {
+    "text": "Aha, razumem.",
+    "rate": 24000,
+    "seconds": 1.6
+  },
+  "ack_dobro": {
+    "text": "Dobro.",
+    "rate": 24000,
+    "seconds": 1.32
+  },
+  "wait_sekund": {
+    "text": "Samo sekund.",
+    "rate": 24000,
+    "seconds": 1.56
+  },
+  "wait_proveri": {
+    "text": "Čekaj, samo da proverim.",
+    "rate": 24000,
+    "seconds": 1.92
+  },
+  "wait_vidim": {
+    "text": "Da vidim...",
+    "rate": 24000,
+    "seconds": 1.48
+  },
+  "greet": {
+    "text": "Zdravo Bogdane, ovde hotline. Slušam te.",
+    "rate": 24000,
+    "seconds": 2.4
+  },
+  "bye": {
+    "text": "Važi, prekidam. Javi se kad zatreba.",
+    "rate": 24000,
+    "seconds": 2.16
+  },
+  "notheard": {
+    "text": "Nisam te čuo, ponovi molim te.",
+    "rate": 24000,
+    "seconds": 2.04
+  }
+}

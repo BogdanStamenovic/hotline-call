@@ -182,3 +182,128 @@ def test_receive_returns_empty_rather_than_hanging_when_nothing_arrives():
     got = call.receive_audio(0.3)
     assert got.size == 0
     assert time.monotonic() - began < 1.5
+
+
+# -- turn taking -----------------------------------------------------------
+
+
+def feed(theirs_sock, their_keys, our_addr, audio, rate=8000):
+    """Push float32 audio at us as SRTP frames, as his phone would."""
+    session = srtp.SrtpSession(*their_keys)
+    wire = pcm.from_model(audio.astype(np.float32), rate=rate, out_rate=8000)
+    ulaw = pcm.ulaw_encode(wire)
+    n = voicecall.FRAME_SAMPLES
+    for i in range(0, len(ulaw) - n + 1, n):
+        seq = i // n
+        packet = rtp.build_packet(seq & 0xFFFF, seq * n, 0xFEED, ulaw[i:i + n])
+        theirs_sock.sendto(session.protect(packet), our_addr)
+
+
+def speech(seconds, rate=8000, amp=0.35):
+    t = np.arange(int(seconds * rate)) / rate
+    # Voiced speech is not a pure tone; a couple of harmonics plus a wobble
+    # keeps the RMS in a realistic place for the endpointer to judge.
+    sig = (np.sin(2 * np.pi * 180 * t) + 0.5 * np.sin(2 * np.pi * 360 * t))
+    return (sig * amp * (1 + 0.2 * np.sin(2 * np.pi * 3 * t))).astype(np.float32)
+
+
+def quiet(seconds, rate=8000, amp=0.0008):
+    return (np.random.randn(int(seconds * rate)) * amp).astype(np.float32)
+
+
+def test_a_turn_ends_after_he_stops_talking():
+    call, theirs, _, their_keys, our_addr = call_pair()
+    clip = np.concatenate([quiet(0.4), speech(1.2), quiet(1.4)])
+    feed(theirs, their_keys, our_addr, clip)
+    audio, reason = call.receive_turn(max_seconds=6.0, silence_ms=600)
+    assert reason == "endpointed", f"expected endpointing, got {reason}"
+    assert audio.size > 0
+
+
+def test_a_turn_of_pure_silence_says_so_rather_than_pretending_he_spoke():
+    call, theirs, _, their_keys, our_addr = call_pair()
+    feed(theirs, their_keys, our_addr, quiet(2.0))
+    audio, reason = call.receive_turn(max_seconds=2.5, silence_ms=600)
+    assert reason in ("silence", "timeout"), reason
+    assert audio.size > 0, "the audio still arrived; it just was not speech"
+
+
+def test_nothing_arriving_at_all_is_distinguished_from_silence():
+    call, _theirs, _, _, _ = call_pair()
+    audio, reason = call.receive_turn(max_seconds=0.6)
+    assert reason == "no-audio"
+    assert audio.size == 0
+
+
+def test_a_short_pause_mid_sentence_does_not_end_the_turn():
+    """The known weakness of energy endpointing, held to a documented bound."""
+    call, theirs, _, their_keys, our_addr = call_pair()
+    clip = np.concatenate([quiet(0.4), speech(0.8), quiet(0.3), speech(0.8), quiet(1.2)])
+    feed(theirs, their_keys, our_addr, clip)
+    audio, reason = call.receive_turn(max_seconds=8.0, silence_ms=800)
+    assert reason == "endpointed"
+    # The whole utterance, both halves, not just the first clause.
+    assert audio.size / 16000 > 1.8, f"turn was cut short at {audio.size/16000:.2f}s"
+
+
+def test_a_turn_is_capped_so_a_stuck_stream_cannot_hang_the_call():
+    call, theirs, _, their_keys, our_addr = call_pair()
+    feed(theirs, their_keys, our_addr, speech(4.0))
+    began = time.monotonic()
+    _audio, reason = call.receive_turn(max_seconds=1.0, silence_ms=800)
+    assert time.monotonic() - began < 2.5
+    assert reason == "timeout"
+
+
+# -- barge-in --------------------------------------------------------------
+
+
+def test_speaking_uninterrupted_plays_the_whole_utterance():
+    call, _theirs, _, _, _ = call_pair()
+    call.send_audio(np.zeros(8000, dtype=np.float32), rate=8000, interruptible=True)
+    assert call.interrupted is False
+    assert call.frames_sent == 50
+
+
+def test_he_can_talk_over_us_and_we_stop():
+    call, theirs, _, their_keys, our_addr = call_pair()
+    # Two seconds of us talking, and he cuts in immediately.
+    feed(theirs, their_keys, our_addr, speech(1.5))
+    spent = call.send_audio(np.zeros(16000, dtype=np.float32), rate=8000, interruptible=True)
+    assert call.interrupted is True, "he talked over us and we kept going"
+    assert spent < 1.5, f"took {spent:.2f}s to stop"
+    assert call.frames_sent < 100, "should have stopped well short of 2s"
+
+
+def test_quiet_line_noise_does_not_count_as_an_interruption():
+    """One loud frame is a click. Only a sustained run is a person."""
+    call, theirs, _, their_keys, our_addr = call_pair()
+    feed(theirs, their_keys, our_addr, quiet(1.2))
+    call.send_audio(np.zeros(8000, dtype=np.float32), rate=8000, interruptible=True)
+    assert call.interrupted is False
+
+
+def test_the_barge_in_audio_is_kept_and_becomes_his_next_turn():
+    """The bug this guards: dropping what we consumed while detecting the
+    interruption silently eats the first syllable of every interruption."""
+    call, theirs, _, their_keys, our_addr = call_pair()
+    feed(theirs, their_keys, our_addr, speech(1.5))
+    call.send_audio(np.zeros(16000, dtype=np.float32), rate=8000, interruptible=True)
+    assert call.interrupted
+    assert call._pending_rx, "the interrupting audio was thrown away"
+    kept = len(call._pending_rx)
+
+    audio, reason = call.receive_turn(max_seconds=2.0, silence_ms=400)
+    assert audio.size >= kept * voicecall.FRAME_SAMPLES * 2, \
+        "his opening words did not make it into the turn"
+    assert reason in ("endpointed", "timeout")
+    assert call._pending_rx == [], "pending audio must be consumed exactly once"
+
+
+def test_a_non_interruptible_send_ignores_him_talking():
+    """Fillers and goodbyes are sent non-interruptibly on purpose."""
+    call, theirs, _, their_keys, our_addr = call_pair()
+    feed(theirs, their_keys, our_addr, speech(1.0))
+    call.send_audio(np.zeros(8000, dtype=np.float32), rate=8000)
+    assert call.interrupted is False
+    assert call.frames_sent == 50
