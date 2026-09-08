@@ -526,3 +526,18 @@ def test_rtp_timestamps_stay_continuous_across_a_listening_gap():
     assert {b - a for a, b in zip(seqs, seqs[1:])} == {1}, "sequence numbers skipped"
     gaps = {b - a for a, b in zip(stamps, stamps[1:])}
     assert gaps == {voicecall.FRAME_SAMPLES}, f"timestamp discontinuity: {sorted(gaps)}"
+
+
+def test_a_quiet_speaker_can_still_interrupt():
+    """He enrolled at 0.0112 on one call while the absolute floor sat at 0.0200,
+    which meant he had to shout louder than he speaks to be heard over us."""
+    call, theirs, _, their_keys, our_addr = call_pair()
+    feed(theirs, their_keys, our_addr, quiet(1.0, amp=0.0004))
+    call.send_silence(0.5, calibrate=True)
+    call.enrol_voice(speech(2.0, rate=16000, amp=0.012), rate=16000)
+    assert call.his_level is not None
+    assert call._barge_threshold() < call.his_level, \
+        "the bar is above his own speaking level"
+    feed_during(theirs, their_keys, our_addr, speech(2.0, amp=0.012))
+    call.send_audio(np.zeros(16000, dtype=np.float32), rate=8000, interruptible=True)
+    assert call.interrupted is True

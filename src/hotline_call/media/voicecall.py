@@ -415,10 +415,16 @@ class VoiceCall:
         """
         if self.line_floor is None:
             return None
-        bar = max(self.line_floor * self.BARGE_IN_OVER_FLOOR, self.MAX_THRESHOLD)
         if self.his_level is not None:
-            bar = max(bar, self.his_level * self.BARGE_IN_OF_HIS_LEVEL)
-        return bar
+            # Once we have heard him, HE is the reference and the absolute
+            # minimum stops applying. On a quiet line he enrolled at 0.0112
+            # while MAX_THRESHOLD held the bar at 0.0200 -- he would have had to
+            # shout louder than he speaks to interrupt, so barge-in was dead
+            # without saying so. His own level is the better yardstick, and the
+            # noise floor still guards the bottom.
+            return max(self.line_floor * self.BARGE_IN_OVER_FLOOR,
+                       self.his_level * self.BARGE_IN_OF_HIS_LEVEL)
+        return max(self.line_floor * self.BARGE_IN_OVER_FLOOR, self.MAX_THRESHOLD)
 
     def _sample_levels(self, budget: float) -> list[float]:
         """Read for `budget` seconds and return the frame energies seen."""

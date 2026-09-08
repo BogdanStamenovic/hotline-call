@@ -249,9 +249,13 @@ def main() -> int:
                 break
             log.info("turn %d: %s, %d phrase(s)", turn, why, len(pending))
 
-            if why == "no-audio":
-                # No RTP at all. Either he hung up or the media died; only after
-                # a long stretch of it do we accept the call is over.
+            # Anything he actually said gets answered, whatever the turn ended
+            # on. He spoke three phrases and then the media went quiet; the
+            # dead-line check fired first and discarded all three, so he got no
+            # reply to something he had just said.
+            if why == "no-audio" and not pending:
+                # No RTP at all and nothing captured. Either he hung up or the
+                # media died; only after a long stretch do we accept it is over.
                 dead_since = dead_since or time.time()
                 if time.time() - dead_since > DEAD_LINE_SECONDS:
                     log.info("no media for %ds; he is gone", DEAD_LINE_SECONDS)
