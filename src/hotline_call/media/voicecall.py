@@ -321,7 +321,7 @@ class VoiceCall:
         gap in the RTP timestamps is what makes his client's jitter buffer
         decide the network died.
         """
-        quiet = b"\xff" * FRAME_SAMPLES  # mu-law silence is 0xFF, not 0x00
+        quiet = self.QUIET_FRAME
         began = time.monotonic()
         heard: list[float] = []
         while time.monotonic() - began < seconds:
@@ -516,6 +516,10 @@ class VoiceCall:
     # comfort noise below 0.01, so this separates them with room on both sides.
     MAX_THRESHOLD = 0.02
 
+    # mu-law silence. Sent continuously whenever we are not saying anything, so
+    # the stream never stops.
+    QUIET_FRAME = b"\xff" * FRAME_SAMPLES
+
     def receive_turn(
         self,
         *,
@@ -549,6 +553,16 @@ class VoiceCall:
         Chunking happens at pauses rather than on a timer because a fixed
         boundary lands mid-word, and Whisper given half a word transcribes half
         a word.
+
+        **This keeps sending while it listens, and that is not cosmetic.** An
+        RTP stream that simply stops is not a quiet stream, it is a dead one:
+        his Linphone showed the call quality meter dropping and recovering on
+        every turn, and each restart resets the far end's jitter buffer, which
+        is heard as the start of our next sentence being chopped. He described
+        the audio as clean at the start of a call and degrading after his first
+        answer, which is exactly the shape of a stream that stops the moment we
+        start listening. Silence goes out at the same 20 ms cadence as speech,
+        so from his phone's point of view the stream never breaks.
         """
         # Whatever arrived while we were speaking IS the start of his turn.
         frames: list[bytes] = list(self._pending_rx)
@@ -577,9 +591,22 @@ class VoiceCall:
         deadline = time.monotonic() + max_seconds
         original = self.sock.gettimeout()
         reason = "timeout"
+        next_frame = time.monotonic()
         try:
             while time.monotonic() < deadline:
-                self.sock.settimeout(min(0.5, max(0.01, deadline - time.monotonic())))
+                # Keep the outbound stream alive on its own clock, whatever the
+                # inbound side is doing.
+                now = time.monotonic()
+                if now >= next_frame:
+                    self._send_frame(self.QUIET_FRAME)
+                    next_frame += FRAME_MS / 1000.0
+                    # If we fell far behind (a long transcribe on this thread),
+                    # resynchronise rather than sending a burst to catch up.
+                    if next_frame < now - 0.1:
+                        next_frame = now + FRAME_MS / 1000.0
+                budget = max(0.001, min(next_frame - time.monotonic(),
+                                        deadline - time.monotonic()))
+                self.sock.settimeout(budget)
                 try:
                     data, _addr = self.sock.recvfrom(4096)
                 except (socket.timeout, TimeoutError):

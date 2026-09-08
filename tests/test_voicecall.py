@@ -475,3 +475,54 @@ def test_a_raising_chunk_handler_does_not_kill_the_turn():
     _audio, reason = call.receive_turn(max_seconds=8.0, silence_ms=900,
                                        chunk_at_ms=300, on_chunk=boom)
     assert reason == "endpointed", "a broken transcriber must not end the call"
+
+
+def test_the_outbound_stream_never_stops_while_we_listen():
+    """The cause of every "it degrades after the first answer" report.
+
+    An RTP stream that stops is not a quiet stream, it is a dead one. His
+    Linphone showed the quality meter dropping and recovering on every turn, and
+    each restart resets the far end's jitter buffer -- heard as the start of our
+    next sentence being chopped.
+    """
+    call, theirs, ours_ks, their_keys, our_addr = call_pair()
+    feed_during(theirs, their_keys, our_addr, quiet(1.5), delay=0.05)
+    before = call.frames_sent
+    call.receive_turn(max_seconds=1.0, silence_ms=800)
+    sent = call.frames_sent - before
+    # 1 s at 20 ms a frame is 50; allow slack for scheduling either way.
+    assert 35 <= sent <= 65, f"sent {sent} frames while listening for 1 s"
+
+
+def test_the_keepalive_frames_are_real_srtp_his_phone_can_read():
+    call, theirs, ours_ks, _their, _addr = call_pair()
+    call.receive_turn(max_seconds=0.4, silence_ms=800)
+    theirs.settimeout(0.5)
+    reader = srtp.SrtpSession(*ours_ks)
+    data, _ = theirs.recvfrom(4096)
+    parsed = rtp.parse_packet(reader.unprotect(data))
+    assert parsed is not None, "keepalive frames must be valid SRTP, not padding"
+
+
+def test_rtp_timestamps_stay_continuous_across_a_listening_gap():
+    """Contiguous timestamps with a wall-clock hole make the far end treat the
+    next utterance as arriving from the past."""
+    call, theirs, ours_ks, _their, _addr = call_pair()
+    call.send_audio(np.zeros(1600, dtype=np.float32), rate=8000)   # 0.2 s
+    call.receive_turn(max_seconds=0.6, silence_ms=800)
+    call.send_audio(np.zeros(1600, dtype=np.float32), rate=8000)
+    theirs.settimeout(0.5)
+    reader = srtp.SrtpSession(*ours_ks)
+    stamps, seqs = [], []
+    while True:
+        try:
+            # parse_packet returns (payload_type, seq, timestamp, payload)
+            _pt, seq, ts, _payload = rtp.parse_packet(
+                reader.unprotect(theirs.recvfrom(4096)[0]))
+            seqs.append(seq); stamps.append(ts)
+        except Exception:
+            break
+    assert len(stamps) > 20, f"only {len(stamps)} packets crossed the wire"
+    assert {b - a for a, b in zip(seqs, seqs[1:])} == {1}, "sequence numbers skipped"
+    gaps = {b - a for a, b in zip(stamps, stamps[1:])}
+    assert gaps == {voicecall.FRAME_SAMPLES}, f"timestamp discontinuity: {sorted(gaps)}"
