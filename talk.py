@@ -56,8 +56,9 @@ Your words go straight to a text-to-speech engine and into his ear.
 
 RULES, all of them about being audible rather than readable:
 - ONE short sentence. Two only if the second is genuinely necessary. He cannot
-  skim a phone call, and anything past about eight seconds of speech is too long
-  to follow by ear.
+  skim a phone call, and anything past about six seconds of speech is too long
+  to follow by ear. Never recite numbers, test counts or version strings unless
+  he asks for them -- they are unlistenable and he can read them later.
 - NO markdown, NO lists, NO code, NO URLs, NO file paths read out character by \
 character. If you must name a file, say it the way a person would.
 - Serbian, with proper diacritics (c, c, s, z, dj as the real characters) -- the \
@@ -156,11 +157,38 @@ def main() -> int:
     # shorter than the speech still arriving behind them.
     pool = ThreadPoolExecutor(max_workers=1)
 
+    # Whisper invents these out of near-silence. Measured directly: two seconds
+    # of room noise transcribes as "Hvala vam." every time. vad_filter removes
+    # almost all of it -- and is 6x faster on silence, 0.45s to 0.07s, with real
+    # speech coming back byte-identical -- but a blocklist catches the rest,
+    # because one hallucinated phrase per chunk is enough to make the agent
+    # answer a question he never asked.
+    HALLUCINATIONS = {
+        "hvala vam.", "hvala vam", "hvala na gledanju.", "hvala.", "hvala",
+        "titlovi", "prevod", "prodavanje", "продавање", "хвала вам.",
+        "titlovi hrt", "podnapisi", "amara.org", "subscribe",
+    }
+
     def transcribe(audio) -> str:
         if audio is None or audio.size < 4000:
             return ""
-        segs, _ = whisper.transcribe(audio, language="sr", beam_size=1)
-        return "".join(seg.text for seg in segs).strip()
+        segs, _ = whisper.transcribe(
+            audio, language="sr", beam_size=1,
+            # Its own bundled Silero ONNX -- no torch, which is why this is
+            # available at all after the CUDA/torch purge.
+            vad_filter=True,
+            # Without this a hallucinated phrase becomes context for the next
+            # chunk and the model repeats it down the whole turn.
+            condition_on_previous_text=False,
+        )
+        kept = []
+        for seg in segs:
+            text = seg.text.strip()
+            if text.lower().strip(" .,!?") in {h.strip(" .") for h in HALLUCINATIONS}:
+                log.debug("dropped hallucination %r", text)
+                continue
+            kept.append(text)
+        return " ".join(kept).strip()
 
     def on_answer(reply_msg, media_sock, our_key, our_salt):
         try:
@@ -244,7 +272,9 @@ def main() -> int:
                 # The first thing he says is definitionally him: he answered the
                 # phone. Everything quieter or unlike it afterwards is the room.
                 call.enrol_voice(np.concatenate(captured))
-            if not said:
+            if not said or len(said) < 3:
+                # Everything he said was noise or hallucination. Do not hand
+                # that to the agent; it answers a question he never asked.
                 play("notheard"); continue
             transcript.append(("bogdan", said))
 
