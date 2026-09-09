@@ -90,6 +90,47 @@ and turn 4 lost the opening half of a dictated phone number. **19 of the 29 tran
 on those two turns alone** — words he said which never reached any model. Swapping
 models cannot recover them; only capturing them can.
 
+## What the second call (2026-09-10 01:41Z) changed, and what it did not
+
+110 seconds, eleven scripted turns plus two of deliberate gibberish, on the code
+with the retention fix in. Same script, same scorer, and **he read line 6 as
+written this time** — "u pola devet", where on the first call he said "pola pet"
+and told us so. The reference belongs to the call, not to the script.
+
+| | 22:59 call | 01:41 call |
+|---|---|---|
+| total, translit | 38.6% | **37.3%** |
+| line 5, the dictated number | 72.7% | **18.2%** |
+| lines 3+4 together | 6 errors / 12 words | 7 errors / 12 words |
+| line 1 | 0.0% | 40.0% |
+| line 2 | 0.0% | 33.3% |
+| turns beginning mid-word | 6 of 9 | 0 of 11 |
+
+**The capture fix did exactly what it was supposed to on the line that proved
+it.** Line 5 went from `"321 207"` to `"Moj broj je 065... 3, 2, 1... 207"` — the
+opening words that had never reached the model arrived, and that line's error
+rate fell 54.5 points. Line 3, which the first call lost entirely, is now
+present.
+
+**And the total did not move.** 38.6% to 37.3% is one word on 83, which is
+noise. Three things ate the gain:
+
+- Line 3 is now *heard* and *mis-transcribed* (5 substitutions) where before it
+  was *absent* (6 deletions). Nearly the same score for a much better recording.
+- Line 4 slipped from 0 to 2 errors.
+- **Lines 1 and 2 went from 0.0% to 40.0% and 33.3%.** Those were perfect on the
+  first call. The most likely cause is mine: retaining up to three seconds of
+  pre-roll hands Whisper more leading ambient, and this call's turn 1 was 7.4 s
+  of which 86% was silence because I asked him to stay quiet through the
+  greeting. Two `"Hvala vam."` hallucinations were caught and dropped in that
+  same window.
+
+So the honest statement is: **the words that were being lost are now being
+captured, and that has not yet produced a better transcript.** The earlier claim
+that two thirds of the WER was recoverable by fixing capture is supported at the
+level of the specific lost words and **not** supported at the level of the total.
+It may need the leading ambient trimmed before it shows up.
+
 ## Barge-in cannot fire, and that is arithmetic
 
 `BARGE_IN_FRAMES = 25` required 25 **consecutive** 20 ms frames above the bar.
@@ -106,17 +147,31 @@ frames** fires on **9/9** of his turns and on **0/6** synthetic room-noise and
 distant-chatter cases (`barge-sweep.json`). Five settings separate him from his
 room completely; the fastest is 8 of 10 (200 ms).
 
-**It is deliberately not changed yet.** The interferer that decides the question
-is our own audio echoing back off his handset, which is the exact failure the 25
-was written to fix — *"on the first live conversation it cut off every single
-utterance about a sixth of a second in"*. In the windows where we were speaking,
-inbound audio measured RMS 0.03–0.09 — **louder than his own enrolled level of
-0.0399** — and 100% of it passed the voice profile. That is either him talking
-over us (in which case firing is correct) or our voice coming back (in which case
-firing is the old bug). The inbound stream alone cannot tell them apart, and
-wall-clock offsets do not survive his phone's silence suppression. So the
-outbound stream is now recorded alongside the inbound one, tagged frame by frame,
-and the constant changes when there is a call to measure it against.
+**Changed on 2026-09-10 after the echo was measured rather than feared.** The
+interferer that decided the question was our own audio coming back off his
+handset — the exact failure the 25 was written to fix, *"on the first live
+conversation it cut off every single utterance about a sixth of a second in"*.
+
+`bench/echo_check.py` cross-correlates the two recorded directions on the
+outbound frame clock. Validated in both directions first, on a loopback whose
+stand-in handset can be told to leak what it hears back into its microphone:
+
+| condition | correlation peak | measured ratio |
+|---|---|---|
+| 0.5 amplitude leaked back (−6.02 dB) | **1.000** at 220 ms | −6.0 dB |
+| no leak | 0.019 at 356 ms | −31.0 dB |
+| **his real call, 01:41Z** | **0.020** at 344 ms | −8.4 dB |
+
+His line reads at the noise floor of the instrument. **There is no echo on this
+path**, and the audio arriving while we speak is him. The rule is now six of any
+ten frames — 200 ms — at the same bar: 11/11 of his turns, 0/8 of synthetic room
+noise, distant chatter and that call's own measured ambient of 0.0199.
+
+Two things about that number worth keeping. It rests on **one** 9.68-second
+window from one call, though it agrees with a validated negative control. And
+`their RMS` in that window was 0.0199 — not silence — while calibration in the
+first 1.2 s reported `line noise floor 0.0000`, which is the same
+too-early-to-measure problem enrolment had.
 
 ## What the voice profile does and does not do
 
@@ -136,7 +191,7 @@ profile. Whether real distant chatter is as easy to fake is not established here
 — the interferer is synthetic, and that is the honest limit of this particular
 result.
 
-## Enrolment understates his voice
+## Enrolment measured the silence, not his voice — fixed
 
 `enrol_voice` takes the frames above the 60th percentile as "his voice" and the
 rest as "the gaps between words". On a turn that is more than 60% silence, the
@@ -144,10 +199,22 @@ rest as "the gaps between words". On a turn that is more than 60% silence, the
 
     p20 0.0001   p60 0.0003   p90 0.0728   max 0.2093
 
-so the "loud half" admitted near-silent frames. Whole-turn enrolment gives
-`his_level` 0.0399 against a true speaking level nearer 0.07–0.10, and the live
-path — which also sees the retained pre-roll — reported **0.0107**, roughly 4x
-low. Every threshold derived from `his_level` inherits that error.
+so the "loud half" admitted near-silent frames. Measured across the eleven turns
+of the 01:41 call, which are 39–86% silence:
+
+| rule | median | spread across turns |
+|---|---|---|
+| p60 (was) | 0.0401 | **0.0010 – 0.0776, a factor of 78** |
+| p85 (now) | 0.0985 | 0.0647 – 0.1497, a factor of 2.3 |
+| ≥20% of peak | 0.0803 | 0.0494 – 0.1241 |
+
+The old rule was measuring **how much silence the turn happened to contain**. On
+the 01:41 call it returned `his_level` **0.0010**, putting the barge-in bar at
+0.0006 — below that line's own ambient of 0.0199 — and on the 22:59 call 0.0107.
+p85 is now used: still not the true speaking level, but stable, and every
+threshold in this class derives from it so stability matters more than precision.
+With it, the old 25-consecutive barge-in fires on **0 of 11** of his turns, which
+is how that rule was finally shown to be impossible rather than merely untuned.
 
 ## What these numbers cannot tell you
 

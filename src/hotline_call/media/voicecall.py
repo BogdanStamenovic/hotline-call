@@ -402,37 +402,40 @@ class VoiceCall:
 
     # -- outbound ---------------------------------------------------------
 
-    # Consecutive loud frames before we accept that he has started talking.
+    # How much of a short window has to sound like him before we accept that he
+    # has started talking.
     #
-    # This was 8 (160 ms) against the fixed MAX_THRESHOLD, and on the first live
-    # conversation it cut off every single utterance about a sixth of a second
-    # in -- he heard "nothing for four seconds, then it started talking and just
-    # stopped". A real phone line is never as quiet as a synthesised test clip:
-    # room noise, comfort noise and our own audio echoing back through the relay
-    # all sit above a threshold picked for clean audio, so the barge-in
-    # triggered on us talking to ourselves.
+    # This was 25 CONSECUTIVE frames -- half a second with not one dip -- and it
+    # could not fire on human speech at all. Measured 2026-09-10 on eleven turns
+    # of him reading a script down a real line: the longest unbroken run he
+    # produces is 16 frames, and against a correctly enrolled level the old rule
+    # fired on **0 of 11** of them. Two live calls agreed, 87 seconds and then
+    # 110 seconds with him deliberately talking over us, and not one barge-in
+    # either time. Word gaps are short but not zero, and each one reset the
+    # count to nothing.
     #
-    # Two changes. Half a second, because a real interruption lasts longer than
-    # that and an echo burst usually does not. And the threshold is calibrated
-    # against the line's own measured noise rather than assumed -- see
-    # `line_floor`.
+    # The 25 was itself a fix for a real failure -- an early call where barge-in
+    # "cut off every single utterance about a sixth of a second in", because a
+    # threshold picked for clean audio was cleared by room noise and by our own
+    # voice coming back through the relay. Both halves of that are addressed
+    # elsewhere now: the bar is calibrated against the line (`line_floor`) and
+    # against his own enrolled voice, and the echo has been MEASURED rather than
+    # feared -- `bench/echo_check.py` cross-correlates the two recorded
+    # directions and reports 0.020 on the live call, against 1.000 for a
+    # deliberately injected -6 dB echo. There is no echo on this path.
     #
-    # **Measured 2026-09-10, and it cannot fire on natural speech.** On nine
-    # turns of his own recorded voice the longest run of CONSECUTIVE frames
-    # above the bar is 16 -- 320 ms -- because the gaps between words are short
-    # but not zero and every one of them resets the count. The live call agreed:
-    # 87 seconds, nine turns, six of them spoken over us, and not one barge-in.
+    # So: a sliding window, which is what every VAD does and for this reason.
+    # Six of any ten frames, at the SAME bar as before -- the bar was never the
+    # problem and is not retuned here. Swept against his eleven real turns on
+    # one side and synthetic room noise, distant chatter, and that call's own
+    # measured ambient of 0.0199 on the other: 11/11 of his turns, 0/8 of the
+    # room.
     #
-    # A sliding window is what every VAD uses and it separates him from his room
-    # cleanly: at the same bar, "9 of the last 15 frames" fires on 9/9 of his
-    # turns and on 0/6 of synthetic room noise and distant chatter
-    # (`barge-sweep.json`). It is NOT changed here, deliberately. The one
-    # interferer that decides the question is our own audio echoing back off his
-    # handset, which is the exact failure this 25 was written to fix -- and it
-    # cannot be told apart from him talking over us without recording the
-    # outbound stream alongside the inbound one. That recording now happens; the
-    # constant changes when there is a call to measure it against, not before.
-    BARGE_IN_FRAMES = 25
+    # 200 ms is quick, deliberately, now that his overlapped speech is retained
+    # rather than dropped. Cutting our own sentence short costs a sentence;
+    # failing to cut it cost two thirds of the words on a benchmark call.
+    BARGE_IN_WINDOW = 10
+    BARGE_IN_HITS = 6
     # How far above the measured line noise counts as him talking.
     BARGE_IN_OVER_FLOOR = 4.0
     # ...and, once we have heard him, what fraction of HIS OWN speaking level a
@@ -451,6 +454,9 @@ class VoiceCall:
     # on purpose: this is a cheap similarity check on 8 kHz telephony audio, not
     # speaker identification, and it is a SECOND opinion that only ever makes
     # the barge-in harder to trigger.
+    # Which frames of a turn count as "him speaking" when enrolling. See
+    # `enrol_voice` for the measurements that chose 85 over 60.
+    HIS_LEVEL_PERCENTILE = 85
     VOICE_BANDS = 8
     VOICE_SIMILARITY = 0.82
     # Frames of inbound audio to retain while we speak. Without a cap this grew
@@ -467,7 +473,7 @@ class VoiceCall:
     #
     # This still keeps the TAIL of what arrived, so a long overlap still loses
     # its beginning. The real fix for that is barge-in working, which it does
-    # not -- see BARGE_IN_FRAMES.
+    # not -- see BARGE_IN_WINDOW.
     PENDING_RX_CAP = 150
 
     def send_audio(self, audio: np.ndarray, rate: int, *, interruptible: bool = False,
@@ -510,7 +516,9 @@ class VoiceCall:
         expected = len(frames) * FRAME_MS / 1000.0
         self.pump.enqueue(frames)
 
-        loud_run = 0
+        # The last `BARGE_IN_WINDOW` decisions, so one dip between two words
+        # does not throw away everything heard before it.
+        recent: deque[int] = deque(maxlen=self.BARGE_IN_WINDOW)
         while self.pump.queued() > 0:
             try:
                 payload = self.pump.inbox.get(timeout=FRAME_MS / 1000.0)
@@ -525,8 +533,8 @@ class VoiceCall:
             level = float(np.sqrt(np.mean((samples / 32768.0) ** 2))) if samples.size else 0.0
             bar = self._barge_threshold()
             is_him = bar is not None and level >= bar and self._sounds_like_him(samples)
-            loud_run = loud_run + 1 if is_him else 0
-            if loud_run >= self.BARGE_IN_FRAMES:
+            recent.append(1 if is_him else 0)
+            if len(recent) == recent.maxlen and sum(recent) >= self.BARGE_IN_HITS:
                 dropped = self.pump.drop_queued()
                 self.interrupted = True
                 log.info("barge-in: he started talking, dropped %d queued frames", dropped)
@@ -613,12 +621,28 @@ class VoiceCall:
         levels = np.array([float(np.sqrt(np.mean(f ** 2))) for f in frames])
         if not levels.size:
             return
-        # The loud half is his voice; the quiet half is the gaps between words.
-        speaking = levels[levels >= np.percentile(levels, 60)]
+        # The loudest sixth is his voice. It used to be the loudest 60%, on the
+        # reasoning that "the loud half is his voice; the quiet half is the gaps
+        # between words" -- which is true of a turn that is half speech and
+        # false of every real one.
+        #
+        # Measured across eleven turns of him reading a script on 2026-09-10:
+        # those turns are 39-86% silence, and the p60 rule returned his_level
+        # anywhere from 0.0010 to 0.0776 -- a factor of SEVENTY-EIGHT, tracking
+        # how much silence the turn happened to contain rather than how loudly
+        # he speaks. On the live call it landed on 0.0010, which put the barge-in
+        # bar at 0.0006, below the line's own ambient of 0.0199.
+        #
+        # p85 spreads 0.0647-0.1497 over the same turns, a factor of 2.3, with a
+        # median of 0.0985 against a true speaking level near 0.10. Every
+        # threshold in this class derives from this number, so its stability
+        # matters more than its precision.
+        speaking = levels[levels >= np.percentile(levels, self.HIS_LEVEL_PERCENTILE)]
         if not speaking.size:
             return
         self.his_level = float(np.median(speaking))
-        loud = [f for f, lv in zip(frames, levels) if lv >= np.percentile(levels, 60)]
+        loud = [f for f, lv in zip(frames, levels)
+                if lv >= np.percentile(levels, self.HIS_LEVEL_PERCENTILE)]
         envs = [self._envelope(f, self.VOICE_BANDS) for f in loud]
         if envs:
             mean = np.mean(envs, axis=0)

@@ -784,3 +784,65 @@ def test_an_unrecorded_call_keeps_nothing():
     assert call.pump.wire_out is None
     assert call.recorded() == b""
     assert call.recorded_outbound() == b""
+
+
+# -- barge-in over a real speech pattern -----------------------------------
+
+
+def broken_speech(seconds, gap_ms=60, on_ms=180, rate=8000, amp=0.35):
+    """Speech with the gaps real speech has.
+
+    The old rule needed 25 unbroken frames -- 500 ms with not one dip -- and
+    measured on eleven turns of him reading down a real line the longest run he
+    produces is 16. Every word boundary reset it to nothing, which is why two
+    live calls recorded zero barge-ins while he was deliberately talking over us.
+    """
+    out = []
+    while sum(len(c) for c in out) < int(seconds * rate):
+        t = np.arange(int(on_ms * rate / 1000)) / rate
+        voiced = (np.sin(2 * np.pi * 180 * t) + 0.5 * np.sin(2 * np.pi * 360 * t)) * amp
+        out.append(voiced.astype(np.float32))
+        out.append(np.zeros(int(gap_ms * rate / 1000), dtype=np.float32))
+    return np.concatenate(out)[:int(seconds * rate)]
+
+
+def enrolled(call, level=0.09):
+    """Give the call a measured line and a measured voice, as a real one has."""
+    call.line_floor = 0.0007
+    call.enrol_voice(broken_speech(2.0, rate=16000, amp=level * 2.2), rate=16000)
+    assert call.his_level is not None
+    return call
+
+
+def test_a_pause_between_two_words_does_not_reset_the_barge_in():
+    """The whole failure, in one test. He speaks over us in words, not in one
+    unbroken half-second, and the old rule could not see that as speech."""
+    call, theirs, _ours, their_keys, our_addr = call_pair()
+    enrolled(call)
+    feed_during(theirs, their_keys, our_addr, broken_speech(2.5), delay=0.05)
+    call.send_audio(np.zeros(24000, dtype=np.float32), rate=8000, interruptible=True)
+    assert call.interrupted is True, "he talked over us in words and was not heard"
+
+
+def test_the_gaps_are_what_the_old_rule_choked_on():
+    """Guards the fix rather than the symptom: the same audio never produces the
+    unbroken run the previous rule demanded, so a regression to it would be
+    caught here even if the barge-in test above were somehow satisfied."""
+    frames = [f for f in
+              (broken_speech(2.5)[i:i + voicecall.FRAME_SAMPLES]
+               for i in range(0, 20000 - voicecall.FRAME_SAMPLES, voicecall.FRAME_SAMPLES))]
+    loud = [float(np.sqrt(np.mean(f ** 2))) > 0.05 for f in frames]
+    longest = run = 0
+    for hit in loud:
+        run = run + 1 if hit else 0
+        longest = max(longest, run)
+    assert longest < 25, "this fixture no longer reproduces the gap pattern"
+    assert longest >= voicecall.VoiceCall.BARGE_IN_HITS
+
+
+def test_the_room_still_cannot_interrupt_us_over_that_window():
+    call, theirs, _ours, their_keys, our_addr = call_pair()
+    enrolled(call)
+    feed_during(theirs, their_keys, our_addr, quiet(2.5, amp=0.02), delay=0.05)
+    call.send_audio(np.zeros(24000, dtype=np.float32), rate=8000, interruptible=True)
+    assert call.interrupted is False, "room noise at the line's own level interrupted us"
