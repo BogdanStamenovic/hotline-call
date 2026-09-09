@@ -143,6 +143,10 @@ class MediaPump(threading.Thread):
         # Where his packets actually come FROM, once we have seen one. See
         # `_latch`.
         self.latched: tuple[str, int] | None = None
+        # Every inbound payload, still mu-law, when something asked for it.
+        # None -- not an empty list -- so an unrecorded call does not pay a
+        # branch per frame that appends to something nobody reads.
+        self.wire: list[bytes] | None = None
         # NOT `_stop`: threading.Thread has an internal _stop() that join()
         # calls, and shadowing it with an Event breaks join() with a
         # TypeError from deep inside the stdlib.
@@ -254,6 +258,12 @@ class MediaPump(threading.Thread):
             return
         self._latch(_addr)
         self.frames_received += 1
+        if self.wire is not None:
+            # Kept as it arrived: G.711 mu-law at 8 kHz, before anything decodes
+            # or resamples it. A recording of what Whisper was given is not the
+            # same artefact as a recording of what the line carried, and only
+            # the second one can score a different model fairly.
+            self.wire.append(parsed[3])
         # Unbounded on purpose: a turn is bounded in time by the caller, and
         # dropping inbound audio to protect memory would lose his words.
         self.inbox.put(parsed[3])
@@ -325,6 +335,25 @@ class VoiceCall:
 
     def close(self) -> None:
         self.pump.stop()
+
+    # -- keeping the audio ------------------------------------------------
+
+    def record(self) -> None:
+        """Keep every inbound payload from here on. Off unless asked."""
+        if self.pump.wire is None:
+            self.pump.wire = []
+
+    @property
+    def recorded_frames(self) -> int:
+        """How many payloads are held, which is also the cursor a caller uses to
+        mark where one turn ended and the next began."""
+        return 0 if self.pump.wire is None else len(self.pump.wire)
+
+    def recorded(self, start: int = 0, end: int | None = None) -> bytes:
+        """The mu-law between two frame cursors, concatenated."""
+        if self.pump.wire is None:
+            return b""
+        return b"".join(self.pump.wire[start:end])
 
     # -- outbound ---------------------------------------------------------
 
@@ -582,6 +611,12 @@ class VoiceCall:
     # pause reads as silence. Telephony speech sits around 0.02-0.15 RMS and
     # comfort noise below 0.01, so this separates them with room on both sides.
     MAX_THRESHOLD = 0.02
+    # And once he has been enrolled, a floor relative to his own voice. Low on
+    # purpose -- a fifth of his speaking level, so it still hears him when he
+    # drops his voice -- but far enough above comfort noise that a quiet line
+    # cannot hold a turn open. Measured against his enrolment of 0.0948 this is
+    # 0.0190: 4.7x the absolute minimum, and just under MAX_THRESHOLD.
+    SPEECH_OF_HIS_LEVEL = 0.2
 
     # mu-law silence. Sent continuously whenever we are not saying anything, so
     # the stream never stops.
@@ -689,6 +724,21 @@ class VoiceCall:
                         max(floor * self.SPEECH_OVER_FLOOR, self.MIN_THRESHOLD),
                         self.MAX_THRESHOLD,
                     )
+                    if self.his_level is not None:
+                        # Once we have heard him, HE is the reference -- the same
+                        # rule `_barge_threshold` already applies, and it belongs
+                        # here for the same reason.
+                        #
+                        # On the live call of 2026-09-10 the line was digitally
+                        # silent at calibration (`line noise floor 0.0000`), so
+                        # this landed on MIN_THRESHOLD, 0.004. He had enrolled at
+                        # 0.0948. Everything above a twentieth of his speaking
+                        # voice counted as speech, and one turn ran 14.48 s of
+                        # which Whisper's own VAD then discarded 13.26 -- fourteen
+                        # seconds in which he was saying nothing and heard nothing
+                        # back, because we were still waiting for him to finish.
+                        threshold = max(threshold,
+                                        self.his_level * self.SPEECH_OF_HIS_LEVEL)
 
                 if level >= threshold:
                     speech_frames += 1

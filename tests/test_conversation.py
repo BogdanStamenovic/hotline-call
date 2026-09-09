@@ -9,6 +9,7 @@ G.711. The models are faked; everything between them is not.
 
 from __future__ import annotations
 
+import pathlib
 import socket
 import threading
 import time
@@ -253,18 +254,34 @@ def test_he_hears_a_voice_and_it_hears_him():
     assert handler.stats["auth_failures"] == 0
 
 
-def test_his_first_words_go_to_the_waiting_agent_and_not_to_a_session():
-    """A ring exists because an agent asked him something. Routing his answer to
-    a fresh session would answer "yes" at the wrong thing entirely."""
-    asked: list[str] = []
-    handler, phone, reply = dial(ask=lambda text: (asked.append(text), "noted")[1])
-    phone.say_after(0.05, quiet(1.2))
-    phone.say_after(1.5, np.concatenate([speech(1.0), quiet(1.5)]))
+def test_the_answer_the_waiting_agent_gets_is_his_words_and_not_the_session_s():
+    """A ring exists because an agent asked him something. What comes back on
+    hotline-call has to be what HE said -- the session's reply to it is for his
+    ear, and confusing the two answers the caller with the wrong voice."""
+    handler, phone, reply = dial(ask=lambda text: "svakako, uradio sam to")
+    phone.say_after(0.05, quiet(1.4))
+    phone.say_after(1.7, np.concatenate([speech(1.0), quiet(1.6)]))
     thread = run(handler, phone, reply)
     thread.join(timeout=20)
     phone.stop()
     assert handler.delivered == ["da samo napred"]
-    assert asked == [], "his answer to the ring must not be routed as a prompt"
+    assert handler.answered == "da samo napred"
+
+
+def test_his_first_turn_is_answered_out_loud_rather_than_with_a_one_word_clip():
+    """On the live call of 2026-09-10 he answered the question, heard "Dobro.",
+    and then got sixteen seconds of nothing. The session is seeded with what the
+    ring asked; it can acknowledge what he actually said."""
+    asked: list[str] = []
+    handler, phone, reply = dial(
+        ask=lambda text: (asked.append(text), "Važi, krećem odmah.")[1])
+    phone.say_after(0.05, quiet(1.4))
+    phone.say_after(1.7, np.concatenate([speech(1.0), quiet(1.6)]))
+    thread = run(handler, phone, reply)
+    thread.join(timeout=20)
+    phone.stop()
+    assert asked == ["da samo napred"], asked
+    assert "Važi, krećem odmah." in handler.said, handler.said
 
 
 def test_a_later_turn_does_go_to_a_session_and_is_spoken_back():
@@ -278,7 +295,7 @@ def test_a_later_turn_does_go_to_a_session_and_is_spoken_back():
     thread = run(handler, phone, reply)
     thread.join(timeout=30)
     phone.stop()
-    assert asked == ["da samo napred"], asked
+    assert asked == ["da samo napred", "da samo napred"], asked
     assert "Disk je pun osamdeset jedan posto." in handler.said, handler.said
 
 
@@ -367,7 +384,7 @@ def test_a_hangup_ends_the_call_without_waiting_for_the_cap():
     thread.join(timeout=25)
     phone.stop()
     assert not thread.is_alive()
-    assert handler.ended == "he hung up"
+    assert handler.ended == "the far end ended the call"
     assert time.monotonic() - began < 15, "it waited for the cap instead of the hangup"
 
 
@@ -419,3 +436,73 @@ def test_a_session_that_fails_is_said_out_loud_rather_than_dropped():
     thread.join(timeout=30)
     phone.stop()
     assert any("zaglavilo" in line for line in handler.said), handler.said
+
+
+# -- keeping the audio, for scoring a second model later -------------------
+
+
+def test_a_recorded_turn_is_kept_as_it_arrived_not_as_whisper_saw_it(tmp_path):
+    """8 kHz mu-law off the wire, not the 16 kHz float the model was handed. The
+    two carry the same information and only the first still looks like a phone
+    line to whoever scores a model against it a week from now."""
+    import json
+    import wave
+
+    from hotline_ios.media.record import Recorder
+
+    recorder = Recorder(str(tmp_path))
+    handler, phone, reply = dial(recorder=recorder, model="large-v3", call_seconds=6.0,
+                                 dead_line_seconds=60.0)
+    phone.say_after(0.05, quiet(1.4))
+    phone.say_after(1.7, np.concatenate([speech(1.0), quiet(1.6)]))
+    thread = run(handler, phone, reply)
+    thread.join(timeout=25)
+    phone.stop()
+
+    where = pathlib.Path(handler.recording)
+    manifest = json.loads((where / "manifest.json").read_text())
+    assert manifest["rate"] == 8000
+    assert manifest["turns"], manifest
+    first = manifest["turns"][0]
+    assert first["heard"] == "da samo napred"
+    assert first["model"] == "large-v3"
+    assert first["ended"] == "endpointed"
+
+    with wave.open(str(where / first["file"])) as clip:
+        assert clip.getframerate() == 8000
+        assert clip.getsampwidth() == 2
+        assert clip.getnchannels() == 1
+        assert clip.getnframes() > 8000, "less than a second of a turn he spoke into"
+
+    with wave.open(str(where / "inbound.wav")) as whole:
+        assert whole.getnframes() >= clip.getnframes()
+
+
+def test_nothing_is_written_unless_a_recorder_was_asked_for(tmp_path):
+    """He is on these calls. An always-on recorder of his voice is not a default."""
+    handler, phone, reply = dial(call_seconds=4.0, dead_line_seconds=60.0)
+    phone.say_after(0.05, quiet(1.4))
+    phone.say_after(1.7, np.concatenate([speech(1.0), quiet(1.6)]))
+    thread = run(handler, phone, reply)
+    thread.join(timeout=25)
+    phone.stop()
+    assert handler.recording == ""
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_recorder_that_cannot_write_does_not_cost_the_call(tmp_path):
+    from hotline_ios.media.record import Recorder
+
+    blocked = tmp_path / "not-a-directory"
+    blocked.write_text("in the way")
+    recorder = Recorder(str(blocked))
+    handler, phone, reply = dial(recorder=recorder, call_seconds=5.0,
+                                 dead_line_seconds=60.0)
+    phone.say_after(0.05, quiet(1.4))
+    phone.say_after(1.7, np.concatenate([speech(1.0), quiet(1.6)]))
+    thread = run(handler, phone, reply)
+    thread.join(timeout=25)
+    phone.stop()
+    assert not thread.is_alive()
+    assert handler.delivered == ["da samo napred"], "the call carried on regardless"
+    assert recorder.failed

@@ -91,6 +91,19 @@ def _is_invented(text: str) -> bool:
 class Ears:
     """One Whisper model, and the phone-call settings around it."""
 
+    # A screen, not a verdict, and both have to fail before anything is dropped.
+    #
+    # The reference point is measured rather than assumed: his own voice through
+    # a real G.711 roundtrip on 2026-09-09 scored `no_speech=0.127,
+    # avg_logprob=-0.123`, which is nowhere near either bar. On 2026-09-10 a turn
+    # whose VAD had discarded 13.26 of 14.48 seconds produced the English phrase
+    # "Hello there!" out of a Serbian model -- and I could not reproduce that
+    # synthetically, so this is deliberately loose. It exists to catch the
+    # obviously-bad, and the per-segment numbers are now logged either way so the
+    # next occurrence is diagnosable instead of arguable.
+    NO_SPEECH_MAX = 0.6
+    LOGPROB_MIN = -0.8
+
     def __init__(
         self,
         model: str = "large-v3",
@@ -148,8 +161,16 @@ class Ears:
             text = segment.text.strip()
             if not text:
                 continue
+            no_speech = float(getattr(segment, "no_speech_prob", 0.0))
+            logprob = float(getattr(segment, "avg_logprob", 0.0))
+            log.info("heard %r (no_speech=%.3f avg_logprob=%+.3f, %.2fs)",
+                     text, no_speech, logprob, segment.end - segment.start)
             if _is_invented(text):
-                log.debug("dropped an invented phrase: %r", text)
+                log.info("dropped an invented phrase: %r", text)
+                continue
+            if no_speech >= self.NO_SPEECH_MAX and logprob <= self.LOGPROB_MIN:
+                log.warning("dropped %r as low confidence (no_speech=%.3f "
+                            "avg_logprob=%+.3f)", text, no_speech, logprob)
                 continue
             kept.append(text)
         return " ".join(kept).strip()

@@ -145,6 +145,8 @@ class AnsweredCall:
         ask: Callable[[str], str] | None = None,
         hung_up: Callable[[], bool] | None = None,
         note: Callable[[str, str], None] | None = None,
+        recorder: Any = None,
+        model: str = "",
         turn_seconds: float = TURN_SECONDS,
         call_seconds: float = MAX_CALL_SECONDS,
         dead_line_seconds: float = DEAD_LINE_SECONDS,
@@ -160,6 +162,14 @@ class AnsweredCall:
         self.ask = ask
         self.hung_up = hung_up
         self.note = note or (lambda kind, text: None)
+        # Off unless something handed one in. See `media/record.py` for why an
+        # always-on recorder of his voice is not a default.
+        self.recorder = recorder
+        # What produced the live transcript, written beside it so a later
+        # scorer knows which hypothesis it is comparing against.
+        self.model = model
+        self.recording = ""
+        self._wire_at = 0
         self.turn_seconds = turn_seconds
         self.call_seconds = call_seconds
         self.dead_line_seconds = dead_line_seconds
@@ -190,6 +200,8 @@ class AnsweredCall:
             return
         log.info("ANSWERED -- his media at %s:%d", answer.host, answer.port)
         call = VoiceCall(media_sock, answer, srtp_key, srtp_salt)
+        if self.recorder is not None:
+            call.record()
         # One worker: faster-whisper is not thread safe for concurrent
         # transcribes on the same model, and serialising is fine because each is
         # far shorter than the speech still arriving behind it.
@@ -201,6 +213,9 @@ class AnsweredCall:
             call.close()
             call.pump.join(timeout=1.0)
             self.stats = call.stats()
+            if self.recorder is not None:
+                self.recording = self.recorder.finish(
+                    call.recorded(), self.stats, ended=self.ended)
             log.info("call ended (%s) after %d turn(s): %s",
                      self.ended, self.turns, self.stats)
 
@@ -216,9 +231,17 @@ class AnsweredCall:
         dead_since: float | None = None
         while time.monotonic() - began < self.call_seconds:
             if self.gone():
-                self.ended = "he hung up"
+                # NOT "he hung up". A BYE says the dialog ended at the far end,
+                # which is not the same claim -- his phone will send one all by
+                # itself if our ACK never reached it, and on 2026-09-10 that is
+                # exactly what happened while he was still listening. The log
+                # said he hung up on us, which would have told the next person
+                # the rule was working. `SipTransport` owns the explanation and
+                # says so loudly; this only reports what it can actually see.
+                self.ended = "the far end ended the call"
                 return
             said, captured, why = self.listen(call, worker)
+            wire_end = call.recorded_frames
 
             if not captured and why == "no-audio":
                 # No RTP at all and nothing captured: he hung up, or the media
@@ -250,6 +273,9 @@ class AnsweredCall:
             self.turns += 1
             self.transcript.append(("you", said))
             log.info("turn %d (%s): %r", self.turns, why, said)
+            if self.recorder is not None:
+                self.recorder.turn(self.turns, call.recorded(self._wire_at, wire_end),
+                                   said, model=self.model, reason=why)
             if call.his_level is None and captured:
                 # The first thing he says is definitionally him -- he answered
                 # the phone. Everything quieter or unlike it afterwards is the
@@ -266,8 +292,16 @@ class AnsweredCall:
                 # His answer to the question the ring was placed to ask. It goes
                 # back to whoever is blocked on `hotline-call`, not to a session:
                 # answering "da" at a fresh Claude answers the wrong thing.
+                #
+                # But he still gets a real answer out loud. The first version
+                # played a one-word clip and went back to listening, and on the
+                # live call that left him with "Dobro." and then sixteen seconds
+                # of nothing -- he had answered the question and the phone went
+                # quiet on him. The session is seeded with what the ring asked,
+                # so it can acknowledge what he said rather than acknowledging
+                # that something was said.
                 self.hand_over(said)
-                self.play(call, "ack_dobro")
+                self.reply_to(call, said)
                 continue
 
             self.reply_to(call, said)
@@ -308,6 +342,10 @@ class AnsweredCall:
         """
         pending: list = []
         captured: list[np.ndarray] = []
+        # Where this turn starts in the recorded stream. Taken as a cursor into
+        # the pump's own payload list rather than by timestamp, so the slice is
+        # exact rather than approximately aligned.
+        self._wire_at = call.recorded_frames
 
         def on_chunk(phrase: np.ndarray) -> None:
             captured.append(phrase)

@@ -644,6 +644,7 @@ class Service:
         """
         from .callagent import CallAgent, default_context
         from .conversation import AnsweredCall
+        from .media.record import from_environment
 
         loop = asyncio.get_running_loop()
         speaker, transcriber = self.speaker, self.transcriber
@@ -680,6 +681,8 @@ class Service:
             ask=agent.reply if agent is not None else None,
             hung_up=getattr(link, "far_end_hung_up", None),
             note=append,
+            recorder=from_environment(f"{target.caller_id}: {target.reason}"),
+            model=repr(transcriber),
         )
 
     async def place(self, body: dict[str, Any]) -> dict[str, Any]:

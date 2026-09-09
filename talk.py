@@ -56,12 +56,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-agent", action="store_true",
                         help="carry audio but do not route his turns to a session")
     parser.add_argument("--timeout", type=float, default=45.0, help="how long to ring")
+    parser.add_argument("--record", default="",
+                        help="keep the inbound audio here, as received (8 kHz G.711)")
     args = parser.parse_args(argv)
 
     load_env()
     from hotline_ios.callagent import CallAgent, default_context
     from hotline_ios.conversation import AnsweredCall
     from hotline_ios.media.ears import Ears
+    from hotline_ios.media.record import Recorder, from_environment
     from hotline_ios.media.tts import Fillers, Voice
     from hotline_ios.ring.base import CallTarget
     from hotline_ios.ring.sip import SipTransport
@@ -88,6 +91,9 @@ def main(argv: list[str] | None = None) -> int:
         greeting=args.reason,
         ask=agent.reply if agent is not None else None,
         hung_up=ring.far_end_hung_up,
+        recorder=(Recorder(args.record, note=args.reason) if args.record
+                  else from_environment(args.reason)),
+        model=repr(ears),
     )
     ring.on_answer = handler
 
@@ -103,6 +109,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\n=== {handler.ended} after {handler.turns} turn(s) ===")
     print(f"stats: {handler.stats}")
+    if handler.recording:
+        print(f"recording: {handler.recording}")
     for who, what in handler.transcript:
         print(f"  {who:8}: {what}")
     return 0
