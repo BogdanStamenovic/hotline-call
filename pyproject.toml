@@ -20,6 +20,12 @@ dependencies = []
 # The doorbell he chose. A user account, not a bot: MTProto's phone.requestCall
 # is user-only, so a bot token cannot place a call.
 telegram = ["telethon>=1.44"]
+# Carrying audio on an answered call. numpy and faster-whisper are what the
+# media stack and the transcriber need; soxr is not optional in practice --
+# `pcm.resample` falls back to linear interpolation without it, which downsamples
+# 24 kHz speech to 8 kHz with no anti-aliasing and folds the noise straight into
+# the band Whisper listens to. The TTS is cvoiced over HTTP and needs nothing.
+voice = ["numpy>=2", "soxr>=0.5", "faster-whisper>=1.1"]
 dev = [
   "pytest>=8.0,<10",
   "pytest-asyncio>=0.23,<2",
@@ -53,6 +59,19 @@ warn_redundant_casts = true
 # for faster-whisper and piper.
 [[tool.mypy.overrides]]
 module = ["hotline.*"]
+ignore_missing_imports = true
+
+# faster-whisper ships no type information; `Ears.transcribe` narrows every
+# segment to its stripped `.text` on the line after the call. Same override
+# hotline carries for the same package.
+[[tool.mypy.overrides]]
+module = ["faster_whisper"]
+ignore_missing_imports = true
+
+# soxr ships no type information. `pcm.resample` narrows its result to a float32
+# ndarray on the line after the call, which is the whole of the surface.
+[[tool.mypy.overrides]]
+module = ["soxr"]
 ignore_missing_imports = true
 
 # telethon ships no type information. Everything it returns is immediately

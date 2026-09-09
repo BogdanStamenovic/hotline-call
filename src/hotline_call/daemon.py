@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import os
 import pathlib
@@ -178,6 +179,7 @@ class Service:
         api_key: str = "",
         page_fallback: Any = None,
         segmenter_factory: Any = None,
+        fillers: Any = None,
         store: Store | None = None,
     ) -> None:
         self.transport = transport
@@ -190,6 +192,9 @@ class Service:
         # Injectable so a test can be deterministic, and so a transport with an
         # unusual rate can tune the VAD. None means hotline's Segmenter.
         self.segmenter_factory = segmenter_factory
+        # Pre-rendered Serbian holding phrases. None is a working call with more
+        # dead air in it, never a broken one -- see `media/tts.py:Fillers`.
+        self.fillers = fillers
         # The in-memory INDEX over persisted rows, not the record itself. The
         # store is the record. This holds the conversations that are warm --
         # recent or still open -- because that is what `EventLog`'s long-poll
@@ -577,6 +582,101 @@ class Service:
         known = ", ".join(sorted(self.links)) or "none"
         raise HttpError(400, f"unknown transport {requested!r}; this daemon has: {known}")
 
+    # ---- giving an answered ring a voice ---------------------------------
+
+    @contextlib.contextmanager
+    def _voice_leg(self, doorbell: Any, target: CallTarget, conversation: str) -> Any:
+        """Give this one ring a voice, and take it away again afterwards.
+
+        Installed per ring rather than once at construction -- which is where
+        `SipTransport(on_answer=...)` makes it look like it belongs -- because
+        the handler has to know *which* conversation it is answering, and
+        `place()` is the only place that knows. A handler built at startup would
+        have to guess, and the guess would be wrong the moment two agents ring
+        him in the same minute.
+
+        Taking it away again is not tidiness. A `SipTransport` with no handler
+        ACKs the 200 and hangs up at once, and `hotline-page` and the
+        confirmed-ring path both depend on that: a ring that holds a call it has
+        nothing to say on is worse than one that does not.
+        """
+        links = holds_calls(doorbell) if self.can_talk else []
+        if not links:
+            yield None
+            return
+        try:
+            handlers = [self._answered_call(target, conversation, link) for link in links]
+        except Exception:
+            # A doorbell that rings is worth more than one that talks. This is
+            # the ring path; nothing here may take it down.
+            log.exception("could not build the answered-call handler; ringing anyway")
+            yield None
+            return
+        restore = [(link, link.on_answer) for link in links]
+        for link, handler in zip(links, handlers, strict=True):
+            link.on_answer = handler
+        try:
+            yield handlers[0] if len(handlers) == 1 else _the_one_that_ran(handlers)
+        finally:
+            for link, was in restore:
+                link.on_answer = was
+
+    @property
+    def can_talk(self) -> bool:
+        """Whether an answered call could carry audio at all.
+
+        Both halves or neither: a call that can speak and not hear leaves him
+        talking to something that never replies, and one that can hear and not
+        speak is the silence this whole path exists to end."""
+        return self.speaker is not None and self.transcriber is not None
+
+    def _answered_call(self, target: CallTarget, conversation: str, link: Any) -> Any:
+        """The handler `SipTransport` calls when he picks up.
+
+        Everything crossing into it is a plain callable, so `conversation.py`
+        needs neither this daemon nor hotline to be tested -- and so `talk.py`
+        can build the same object out of different parts.
+        """
+        from .callagent import CallAgent, default_context
+        from .conversation import AnsweredCall
+
+        loop = asyncio.get_running_loop()
+        speaker, transcriber = self.speaker, self.transcriber
+        speakable = _speakable()
+
+        def speak(text: str) -> tuple[Any, int]:
+            audio = speaker.synthesize(text)
+            return audio, int(getattr(speaker, "rate", 24_000))
+
+        def append(kind: str, text: str) -> None:
+            # Called from the media thread. `_append` touches an EventLog whose
+            # waiters are parked on the event loop, so it is handed back there
+            # rather than called across threads.
+            loop.call_soon_threadsafe(self._append, conversation, kind, text)
+
+        agent = None
+        if os.environ.get("HOTLINE_IOS_CALL_SESSION", "1") != "0":
+            agent = CallAgent(default_context(
+                f"THIS CALL: {target.caller_id} rang him to ask -- {target.reason}\n"
+                "He has just been asked that and is answering it out loud. His first\n"
+                "answer goes back to the agent that rang; anything after it is yours."
+            ))
+            # Seeded WHILE the phone rings, not after he answers. Costs ~4.7 s
+            # and there are usually more than that between the INVITE and him
+            # picking up; `CallAgent.reply` waits for it if there were not.
+            agent.start()
+
+        return AnsweredCall(
+            speak=speak,
+            transcribe=lambda audio: str(transcriber.transcribe(audio)),
+            fillers=self.fillers,
+            greeting=str(speakable(f"{target.caller_id}: {target.reason}")),
+            deliver=lambda text: append("you", text),
+            ask=agent.reply if agent is not None else None,
+            hung_up=getattr(link, "far_end_hung_up", None),
+            note=append,
+        )
+
     async def place(self, body: dict[str, Any]) -> dict[str, Any]:
         """Ring him, then wait for him to answer in the app.
 
@@ -617,9 +717,18 @@ class Service:
         if str(body.get("context", "")):
             self._append(conversation, "summary", str(body["context"])[:1200])
         began = time.monotonic()
+        # Taken BEFORE the ring and not after. Since the call can now carry
+        # audio, his answer can arrive as an entry appended *during*
+        # `doorbell.ring()`; a cursor read afterwards would already be past it
+        # and `_await_reply` would wait its full timeout for a question he had
+        # answered out loud thirty seconds earlier. Nothing could append during a
+        # ring before this change, which is why the old ordering was fine and is
+        # not any more.
+        cursor = events.latest
 
         try:
-            await doorbell.ring(target, timeout=ring_timeout)
+            with self._voice_leg(doorbell, target, conversation) as spoken:
+                await doorbell.ring(target, timeout=ring_timeout)
         except CallDeclined as exc:
             self._append(conversation, "state", "declined")
             self._close_conversation(conversation)
@@ -645,7 +754,12 @@ class Service:
         if not wait:
             return self._outcome(conversation, "ringing", began, "not waiting", transport=doorbell)
 
-        reply = await self._await_reply(events, reply_timeout)
+        # He may already have answered out loud, in which case the entry is
+        # sitting past `cursor` and this returns at once.
+        if spoken is not None and spoken.answered:
+            log.info("call %s answered by voice after %d turn(s): %s",
+                     conversation, spoken.turns, spoken.stats)
+        reply = await self._await_reply(events, reply_timeout, cursor)
         if not reply:
             # Rang, connected, but no answer came back in time. Same rule as the
             # ring-out above: say it went unanswered, then close it. He can still
@@ -657,10 +771,17 @@ class Service:
                                  transport=doorbell)
         return self._outcome(conversation, "answered", began, "", reply, transport=doorbell)
 
-    async def _await_reply(self, events: EventLog, timeout: float) -> str:
-        """Block until he types something in the app, or time runs out."""
+    async def _await_reply(self, events: EventLog, timeout: float,
+                           cursor: int | None = None) -> str:
+        """Block until he answers -- typed in the app, or spoken on the call.
+
+        `cursor` is passed in by `place()`, which takes it before the ring. The
+        default of "wherever the log is now" is only correct for a caller that
+        could not have been answered already.
+        """
         deadline = time.monotonic() + timeout
-        cursor = events.latest
+        if cursor is None:
+            cursor = events.latest
         while time.monotonic() < deadline:
             found = await events.wait(cursor, min(20.0, deadline - time.monotonic()))
             for entry in found:
@@ -2598,6 +2719,98 @@ def build_server(service: Service, host: str | Sequence[str], port: int) -> Any:
     return server
 
 
+def build_voice() -> tuple[Any, Any, Any]:
+    """The three things an answered call needs: a voice, ears, and holding phrases.
+
+    A missing voice or missing ears means the daemon still rings, still opens a
+    conversation and still takes a typed answer in the app -- it simply hangs up
+    on the 200 the way it always did. That degradation is the point: a missing
+    model must cost the voice leg and never the doorbell. Missing fillers cost
+    only dead air.
+
+    **Why `large-v3` on the GPU is the default.** Measured on this box on
+    2026-09-09, on 2.5 s of his own cloned Serbian put through a real G.711
+    8 kHz roundtrip:
+
+    | model | where | time | what it heard |
+    |---|---|---|---|
+    | `large-v3` | cuda int8_float16 | **0.38 s** | word-perfect |
+    | `large-v3` | cpu int8 | 5.39 s | word-perfect |
+    | `small` | cpu int8 | 0.99 s | *"Zdravo o The Hotline, imam pitanju za tebe"* |
+
+    Fast and wrong is the worse failure on a phone call, so `small` is only the
+    fallback. The GPU is available at all because `cvoiced` at `takes=1` holds
+    2406 MiB rather than the 6452 it holds once it has loaded its take-scorer --
+    which leaves 5.7 GB, and `large-v3` int8_float16 wants about 1.9.
+    """
+    if os.environ.get("HOTLINE_IOS_VOICE", "1") == "0":
+        log.info("voice leg disabled by HOTLINE_IOS_VOICE=0; calls will ring and hang up")
+        return None, None, None
+    speaker: Any = None
+    transcriber: Any = None
+    fillers: Any = None
+    try:
+        from .media.tts import Voice
+
+        speaker = Voice()
+        health = speaker.health()
+        log.info("tts: %s, model_loaded=%s", speaker, health.get("model_loaded"))
+    except Exception as exc:  # noqa: BLE001 - a mute doorbell still rings
+        log.error("no voice for answered calls: %s", exc)
+        speaker = None
+    try:
+        from .media.ears import Ears
+
+        transcriber = Ears(
+            model=os.environ.get("HOTLINE_IOS_ASR_MODEL", "large-v3"),
+            device=os.environ.get("HOTLINE_IOS_ASR_DEVICE", "cuda"),
+            compute_type=os.environ.get("HOTLINE_IOS_ASR_COMPUTE", "int8_float16"),
+            language=os.environ.get("HOTLINE_IOS_ASR_LANGUAGE", "sr"),
+        )
+    except Exception as exc:  # noqa: BLE001 - same rule as above
+        log.error("no transcriber for answered calls: %s", exc)
+        transcriber = None
+    try:
+        from .media.tts import Fillers
+
+        fillers = Fillers()
+        fillers.load()
+    except Exception as exc:  # noqa: BLE001 - dead air, not a dead call
+        log.error("no holding phrases: %s", exc)
+        fillers = None
+    return speaker, transcriber, fillers
+
+
+def holds_calls(doorbell: Any) -> list[Any]:
+    """Every transport inside `doorbell` that can hold an answered call.
+
+    Walked rather than passed in, because what `place()` is handed depends on
+    `HOTLINE_IOS_RING`: one `ConfirmedRing` around a `SipTransport`, or a
+    `RingChain` of several. Both wrappers expose what they wrap (`inner`,
+    `links`), so this needs no cooperation from either.
+    """
+    if doorbell is None:
+        return []
+    inner = getattr(doorbell, "inner", None)
+    if inner is not None:
+        return holds_calls(inner)
+    links = getattr(doorbell, "links", None)
+    if links is not None:
+        return [found for link in links for found in holds_calls(link)]
+    return [doorbell] if hasattr(doorbell, "on_answer") else []
+
+
+def _the_one_that_ran(handlers: Sequence[Any]) -> Any:
+    """Which handler actually took the call, when a chain had several.
+
+    Only one link in a chain ever answers -- the chain stops at the first that
+    works -- so this is a lookup, not a merge."""
+    for handler in handlers:
+        if getattr(handler, "turns", 0) or getattr(handler, "answered", ""):
+            return handler
+    return handlers[0] if handlers else None
+
+
 def build_transport(
     names: Sequence[str],
     *,
@@ -2722,12 +2935,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         for ip in os.environ.get("HOTLINE_ALLOW_IPS", "").split(",")
         if ip.strip()
     }
+    speaker, transcriber, fillers = build_voice()
     service = Service(
         transport,
         SessionPool(),
+        transcriber=transcriber,
+        speaker=speaker,
+        fillers=fillers,
         allow_ips=allow,
         api_key=os.environ.get("HOTLINE_API_KEY", ""),
     )
+    if not service.can_talk:
+        # On /health rather than only in the log. A doorbell that rings and then
+        # gives him thirty seconds of silence is the exact failure this whole
+        # path exists to end, and it must not be something you can only discover
+        # by answering the phone.
+        service.degradations.append(
+            "answered calls carry no audio: this daemon can ring him but not talk"
+        )
 
     service.set_links(links)
 
@@ -2767,6 +2992,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         # the suite.
         poll = asyncio.ensure_future(service.safety_poll())
         poll.add_done_callback(lambda task: task.cancelled() or task.exception())
+        if service.transcriber is not None:
+            # Paid now rather than in the first three seconds of a call he has
+            # just answered. Measured at 0.7 s for `small` on CPU, which is
+            # cheap here and expensive there.
+            warm = asyncio.ensure_future(asyncio.to_thread(service.transcriber.load))
+            warm.add_done_callback(lambda task: task.cancelled() or task.exception())
         log.info(
             "hotline-iosd on %s:%d, ring=%s, rings_when_closed=%s",
             args.host, args.port, getattr(transport, "name", "?"),
