@@ -150,6 +150,50 @@ def header_of(message: str, name: str) -> str:
     return ""
 
 
+def headers_of(message: str, name: str) -> list[str]:
+    """Every value of a header that may legally appear more than once.
+
+    Record-Route is the one that matters here, and it is the one header where
+    taking only the first is not a simplification but a different route."""
+    found = []
+    for line in message.split("\r\n"):
+        if line.lower().startswith(name.lower() + ":"):
+            found.append(line.split(":", 1)[1].strip())
+    return found
+
+
+def uri_of(header: str) -> str:
+    """The bare URI out of a Contact or Route value.
+
+    Handles `Bogdan <sip:x@y;transport=tls>;expires=60` and a bare
+    `sip:x@y` alike. Only the angle-bracketed form may carry header
+    parameters after it, which is precisely why the brackets exist.
+    """
+    header = header.strip()
+    start = header.find("<")
+    if start >= 0:
+        end = header.find(">", start)
+        if end > start:
+            return header[start + 1:end].strip()
+    return header.split(";")[0].strip()
+
+
+def route_set(reply: str) -> list[str]:
+    """The route set for a dialog, from the 200 OK's Record-Route headers.
+
+    RFC 3261 12.1.2: a UAC's route set is the Record-Route values of the
+    response, **in reverse order**. Getting the order wrong sends the request
+    back out through the proxies in the sequence they were traversed on the way
+    in, which is a different path and generally a dead one.
+
+    Commas matter: a proxy may fold several Record-Route values onto one line.
+    """
+    values: list[str] = []
+    for header in headers_of(reply, "Record-Route"):
+        values.extend(part.strip() for part in header.split(",") if part.strip())
+    return list(reversed(values))
+
+
 class SipTransport:
     """Ring him by placing a SIP call to his Linphone account."""
 
@@ -217,6 +261,13 @@ class SipTransport:
         # Set when the far end ends the dialog first, so `_finish_answered` does
         # not send a BYE to a call that is already gone.
         self._dialog_over = False
+        # How many times the far end has had to retransmit its 200 OK. Anything
+        # but zero means our ACK is not arriving, and a call that dies around
+        # 32 seconds in died of that rather than of him hanging up.
+        self.unacked = 0
+        # Re-sends the ACK for the call in progress, or None outside one.
+        self._ack: Callable[[], None] | None = None
+        self._answered_at = 0.0
 
     async def start(self) -> None:
         if not (self.user and self.password and self.peer):
@@ -355,9 +406,21 @@ class SipTransport:
             if message is None:
                 break
             if message.upper().startswith("BYE "):
-                log.info("sip: the far end hung up")
+                log.info("sip: the far end sent BYE after %.1fs", time.monotonic() - self._answered_at)
                 self._respond_200(sock, message)
                 self._dialog_over = True
+            elif status_of(message) // 100 == 2 and "INVITE" in header_of(message, "CSeq"):
+                # A retransmitted 200 means our ACK did not arrive. RFC 3261
+                # 13.2.2.4 says to re-send it, which is both correct and the
+                # only self-healing move available: if the route set we computed
+                # is right the retransmissions stop, and if it is wrong the
+                # count says so in one line instead of costing another call.
+                self.unacked += 1
+                if self.unacked <= 3 or self.unacked % 5 == 0:
+                    log.warning("sip: 200 OK retransmitted (%d); re-sending ACK",
+                                self.unacked)
+                if self._ack is not None:
+                    self._ack()
             else:
                 log.debug("sip: ignoring an in-dialog message: %s",
                           message.split("\r\n", 1)[0])
@@ -529,6 +592,7 @@ class SipTransport:
 
         call_id = uuid.uuid4().hex
         self._dialog_over = False
+        self.unacked = 0
         self._authenticate_register(sock, call_id)
         self._invite_and_watch(sock, call_id, timeout)
 
@@ -591,6 +655,7 @@ class SipTransport:
                 continue
             if code == 200:
                 answered = True
+                self._answered_at = time.monotonic()
                 # RFC 3261: a 200 to an INVITE must be ACKed, and a call that
                 # has been answered is ended with BYE, not CANCEL. This only
                 # started mattering when he actually picked one up -- before
@@ -633,30 +698,76 @@ class SipTransport:
         me = f"sip:{self.user}@{self.domain}"
         them = self.peer if self.peer.startswith("sip:") else f"sip:{self.peer}"
         to_value = to_header or f"<{them}>"
+        host, port = self._local
+
+        # THE REMOTE TARGET, and it is not his address-of-record.
+        #
+        # RFC 3261 13.2.2.4: the ACK to a 2xx is its own transaction, sent to
+        # the URI in the response's Contact -- the actual handset -- carrying
+        # the route set from 12.1.2. This used to send `ACK sip:b0g13a@
+        # sip.linphone.org` with no Route at all, which is an AOR and a proxy's
+        # problem rather than a destination, and it did not arrive.
+        #
+        # That was invisible for as long as this hung up in the same breath as
+        # it ACKed: the call was over in milliseconds and nobody was on the line
+        # to find out. Held open, it is a 37-second call that ends itself --
+        # 13.3.1.4 has the far end retransmit its 200 for 64*T1 and then send a
+        # BYE, which is exactly what he experienced on 2026-09-10 at 00:26:23Z
+        # while audio was still flowing perfectly in both directions.
+        target = uri_of(header_of(reply, "Contact")) or them
+        routes = route_set(reply)
+        if routes:
+            # A strict router puts itself in the Request-URI; a loose one (every
+            # modern proxy, and everything with `;lr`) stays in a Route header
+            # and leaves the target alone. Only loose routing is implemented,
+            # because a strict-routing proxy has not existed in the wild for
+            # roughly two decades and guessing wrong would be worse than not
+            # trying.
+            log.info("sip: dialog routes via %s to %s", ", ".join(routes), target)
+        else:
+            log.info("sip: dialog target %s, no route set", target)
 
         def signal(method: str, seq: int) -> None:
-            message = "\r\n".join([
-                f"{method} {them} SIP/2.0",
+            lines = [
+                f"{method} {target} SIP/2.0",
                 self._via(_tag()),
+                *[f"Route: {route}" for route in routes],
                 f"From: <{me}>;tag={from_tag}",
                 f"To: {to_value}",
                 f"Call-ID: {call_id}",
                 f"CSeq: {seq} {method}",
+                # So the far end knows where to send its own in-dialog requests
+                # -- its BYE, above all. Its absence is why one could only ever
+                # reach us by way of the proxy.
+                f"Contact: <sip:{self.user}@{host}:{port};transport={self.transport}>",
                 "Max-Forwards: 70",
                 "Content-Length: 0",
-            ]) + "\r\n\r\n"
+            ]
             with contextlib.suppress(OSError):
-                self._send(sock, message)
+                self._send(sock, "\r\n".join(lines) + "\r\n\r\n")
 
-        signal("ACK", cseq)
+        self._ack = lambda: signal("ACK", cseq)
+        self._ack()
         if self.on_answer is not None:
             try:
                 self.on_answer(reply, self._media, self._srtp_key, self._srtp_salt)
             except Exception:
                 log.exception("sip: the answered-call handler raised; hanging up")
-        # Only if the dialog is still ours to end. When he hung up first,
-        # `far_end_hung_up` has already answered his BYE with a 200 and sending
-        # our own would be a BYE for a dialog that no longer exists.
+        self._ack = None
+        if self.unacked:
+            # Loud, and at the end, because this is the difference between "he
+            # hung up on us" and "he never heard from us". A retransmitted 200
+            # means the far end is still waiting for an ACK it should have had
+            # in the first hundred milliseconds.
+            log.warning(
+                "sip: the far end retransmitted its 200 OK %d time(s) -- our ACK "
+                "was not reaching it, and a call that ends around 32s in ended "
+                "itself for that reason rather than because he hung up",
+                self.unacked,
+            )
+        # Only if the dialog is still ours to end. When the far end ended it
+        # first, `far_end_hung_up` has already answered its BYE with a 200 and
+        # sending our own would be a BYE for a dialog that no longer exists.
         if not self._dialog_over:
             signal("BYE", cseq + 1)
 

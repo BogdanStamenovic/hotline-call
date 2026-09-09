@@ -378,3 +378,138 @@ def test_two_messages_in_one_segment_are_returned_one_at_a_time():
     sock = _ChunkedSocket([both])
     assert "100 Trying" in ring._recv(sock, timeout=5)
     assert "180 Ringing" in ring._recv(sock, timeout=5)
+
+
+# -- routing an answered dialog --------------------------------------------
+#
+# He answered a real call on 2026-09-10 at 00:25:46Z, heard all of it, and was
+# cut off 37.24s in while audio was still flowing perfectly both ways. Nothing
+# had hung up: the ACK went to his address-of-record with no Route set, never
+# reached his handset, and RFC 3261 13.3.1.4 had his phone retransmit its 200
+# for 64*T1 and then send a BYE. It was invisible for as long as this hung up
+# in the same breath as it ACKed.
+
+
+ANSWER_200 = (
+    "SIP/2.0 200 OK\r\n"
+    "Via: SIP/2.0/TLS 192.168.1.139:44321;branch=z9hG4bKabc;rport=44321\r\n"
+    "Record-Route: <sip:91.121.209.194:5061;transport=tls;lr>\r\n"
+    "Record-Route: <sip:176.31.149.179;transport=tls;lr>, <sip:proxy2;lr>\r\n"
+    "From: <sip:hotline-caller@sip.linphone.org>;tag=fromtag\r\n"
+    "To: <sip:b0g13a@sip.linphone.org>;tag=totag\r\n"
+    "Call-ID: callid\r\n"
+    "CSeq: 2 INVITE\r\n"
+    'Contact: <sip:b0g13a@10.44.2.9:41234;transport=tls>;+sip.instance="<urn:uuid:x>"\r\n'
+    "Content-Length: 0\r\n"
+    "\r\n"
+)
+
+
+class Wire:
+    """Collects what we put on the socket, without being one."""
+
+    def __init__(self):
+        self.sent = []
+
+    def sendall(self, data):
+        self.sent.append(data.decode())
+
+    def requests(self, method):
+        return [m for m in self.sent if m.startswith(method + " ")]
+
+
+def answered(transport, wire, reply=ANSWER_200):
+    transport._finish_answered(wire, "callid", "fromtag",
+                               "<sip:b0g13a@sip.linphone.org>;tag=totag", 2,
+                               reply=reply)
+
+
+def test_the_ack_goes_to_his_handset_not_to_his_address_of_record():
+    wire = Wire()
+    answered(SipTransport(user="u", password="p", peer="sip:b0g13a@sip.linphone.org"), wire)
+    ack = wire.requests("ACK")[0]
+    assert ack.splitlines()[0] == "ACK sip:b0g13a@10.44.2.9:41234;transport=tls SIP/2.0"
+
+
+def test_the_ack_carries_the_route_set_in_reverse():
+    """RFC 3261 12.1.2. The wrong order sends it back out through the proxies in
+    the sequence they were traversed on the way in, which is a different path
+    and generally a dead one."""
+    wire = Wire()
+    answered(SipTransport(user="u", password="p", peer="sip:b0g13a@sip.linphone.org"), wire)
+    routes = [line.split(":", 1)[1].strip()
+              for line in wire.requests("ACK")[0].splitlines()
+              if line.lower().startswith("route:")]
+    assert routes == [
+        "<sip:proxy2;lr>",
+        "<sip:176.31.149.179;transport=tls;lr>",
+        "<sip:91.121.209.194:5061;transport=tls;lr>",
+    ]
+
+
+def test_the_ack_says_where_to_reach_us():
+    wire = Wire()
+    answered(SipTransport(user="u", password="p", peer="sip:b0g13a@sip.linphone.org"), wire)
+    assert any(line.lower().startswith("contact:")
+               for line in wire.requests("ACK")[0].splitlines())
+
+
+def test_the_bye_goes_the_same_way_as_the_ack():
+    wire = Wire()
+    answered(SipTransport(user="u", password="p", peer="sip:b0g13a@sip.linphone.org"), wire)
+    ack, bye = wire.requests("ACK")[0], wire.requests("BYE")[0]
+    def routing(message):
+        return [line for line in message.splitlines()
+                if line.startswith(("ACK ", "BYE ", "Route:"))]
+    assert routing(bye)[1:] == routing(ack)[1:]
+    assert bye.splitlines()[0].endswith("sip:b0g13a@10.44.2.9:41234;transport=tls SIP/2.0")
+
+
+def test_a_200_with_no_contact_still_gets_an_ack_at_the_address_of_record():
+    """Degrading to what it did before is right: an AOR is a poor target and no
+    ACK at all is a worse one."""
+    wire = Wire()
+    stripped = "\r\n".join(line for line in ANSWER_200.split("\r\n")
+                           if not line.lower().startswith("contact:"))
+    answered(SipTransport(user="u", password="p", peer="sip:b0g13a@sip.linphone.org"),
+             wire, reply=stripped)
+    assert wire.requests("ACK")[0].startswith("ACK sip:b0g13a@sip.linphone.org SIP/2.0")
+
+
+def test_a_retransmitted_200_is_counted_and_re_acked():
+    """The instrument, not just the fix. Zero retransmissions means the ACK
+    landed; anything else says so in one line instead of costing another call."""
+    transport = SipTransport(user="u", password="p", peer="sip:b0g13a@sip.linphone.org")
+    wire = Wire()
+    seen = []
+
+    def on_answer(reply, media, key, salt):
+        # What the conversation loop does every time round its own loop.
+        transport._sock = _Retransmitting(ANSWER_200)
+        transport.far_end_hung_up()
+        seen.append(transport.unacked)
+
+    transport.on_answer = on_answer
+    answered(transport, wire)
+    assert seen == [1]
+    assert transport.unacked == 1
+    # Two ACKs: the original, and the one the retransmission asked for.
+    assert len(wire.requests("ACK")) == 2
+
+
+class _Retransmitting:
+    """A socket that hands over one retransmitted 200 OK and then nothing."""
+
+    def __init__(self, message):
+        self.pending = [message.encode()]
+
+    def settimeout(self, _timeout):
+        pass
+
+    def recv(self, _size):
+        if self.pending:
+            return self.pending.pop(0)
+        raise BlockingIOError
+
+    def sendall(self, data):
+        pass
