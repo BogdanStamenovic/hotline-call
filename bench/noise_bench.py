@@ -18,7 +18,12 @@ reimplementation of them. Three questions, one per interferer:
 Offline, synthetic and repeatable, so it can be re-run after any change to the
 thresholds without costing him a phone call.
 """
-import glob, json, os, sys, wave
+import glob
+import json
+import os
+import sys
+import wave
+
 import numpy as np
 
 sys.path.insert(0, "/home/bodas/data/hotline-ios/server/src")

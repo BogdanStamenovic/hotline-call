@@ -17,7 +17,10 @@ choice between them is a formatting decision exactly like "16" for "šesnaest".
 Folding Cyrillic to Latin preserves every distinction this test measures, because
 ђ->đ and џ->dž are one-to-one. Judge a model on what it HEARD.
 """
-import json, re, sys, unicodedata
+import json
+import re
+import sys
+import unicodedata
 
 # Serbian Cyrillic to Latin, one to one. Same table cvoice's asr.py uses, minus
 # its diacritic stripping -- that would erase the contrasts being measured.
@@ -98,7 +101,7 @@ for t in sorted(mapping, key=int):
         e, n = wer(words(reference, digits, tr), words(hypothesis, digits, tr))
         tot[key][0] += e; tot[key][1] += n
         row.append(f"{100*e/n:6.1f}%")
-    print(f"{t:<5} {str(mapping[t]):<7} {row[0]:>7} {row[1]:>7} {row[2]:>9}")
+    print(f"{t:<5} {mapping[t]!s:<7} {row[0]:>7} {row[1]:>7} {row[2]:>9}")
     print(f"      REF  {reference}")
     print(f"      HYP  {hypothesis}")
 print()

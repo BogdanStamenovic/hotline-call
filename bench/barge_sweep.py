@@ -11,12 +11,18 @@ This sweeps the three knobs against real audio on both sides of the question and
 prints the ones that separate him from the room. A window rule ("most of the last
 N frames") is what every VAD uses, and for the same reason.
 """
-import glob, itertools, json, os, sys, wave
+import glob
+import itertools
+import json
+import os
+import sys
+
 import numpy as np
 
 sys.path.insert(0, "/home/bodas/data/hotline-ios/server/src")
 from hotline_ios.media import pcm
-from hotline_ios.media.voicecall import FRAME_SAMPLES, WIRE_RATE, VoiceCall
+from hotline_ios.media.voicecall import WIRE_RATE, VoiceCall
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from noise_bench import Bare, chatter, frames_of, load, rms, room_noise, telephony
 

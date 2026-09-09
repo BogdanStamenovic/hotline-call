@@ -8,7 +8,15 @@ as 8 kHz G.711 through linphone.org's relay.
 Reports WER, VRAM and per-turn latency together, because a model that wins on
 WER and does not fit beside cvoiced, or takes four seconds a turn, has not won.
 """
-import argparse, ctypes, glob, json, os, subprocess, sys, time, wave
+import argparse
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+import wave
+
 import numpy as np
 
 BENCH = os.environ.get(

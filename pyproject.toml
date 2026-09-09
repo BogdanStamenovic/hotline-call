@@ -48,6 +48,14 @@ asyncio_mode = "auto"
 [tool.ruff]
 line-length = 100
 
+# The measurement scripts are held to a different bar than the daemon, on
+# purpose. `dict(...)` reads better than a literal when the thing being built is
+# a row of results, `open()` without a context manager is fine for a script that
+# exits straight after, and a bare `except Exception` around a model load IS the
+# behaviour wanted: one model that will not fit in VRAM must not end the sweep.
+[tool.ruff.lint.per-file-ignores]
+"bench/*.py" = ["BLE001", "C408", "SIM115", "I001"]
+
 [tool.mypy]
 python_version = "3.12"
 warn_unused_ignores = true
