@@ -147,6 +147,22 @@ class MediaPump(threading.Thread):
         # None -- not an empty list -- so an unrecorded call does not pay a
         # branch per frame that appends to something nobody reads.
         self.wire: list[bytes] | None = None
+        # What WE sent, and when each inbound frame arrived relative to it.
+        #
+        # The outbound stream is a perfect 50 fps clock -- the pump never skips
+        # a frame -- so `frames_sent` at the moment a frame arrives is an exact
+        # 20 ms timestamp for it. Inbound has gaps (his phone suppresses
+        # silence) and wall-clock offsets do not survive them, which is why
+        # aligning the two by timestamp did not work.
+        #
+        # This exists to answer one question that cannot be answered without it:
+        # when audio arrives WHILE WE ARE TALKING, is that him talking over us
+        # or our own voice echoing back off his handset? Those want opposite
+        # responses -- keep it, or discard it -- and they are indistinguishable
+        # from the inbound stream alone. Cross-correlating against what we sent
+        # at the same instant separates them.
+        self.wire_out: list[bytes] | None = None
+        self.wire_at: list[int] = []
         # NOT `_stop`: threading.Thread has an internal _stop() that join()
         # calls, and shadowing it with an Event breaks join() with a
         # TypeError from deep inside the stdlib.
@@ -200,6 +216,8 @@ class MediaPump(threading.Thread):
             self._read(min(next_frame - now, 0.02))
 
     def _send(self, payload: bytes) -> None:
+        if self.wire_out is not None:
+            self.wire_out.append(payload)
         packet = rtp.build_packet(self._seq & 0xFFFF, self._ts & 0xFFFFFFFF,
                                   self.ssrc, payload)
         try:
@@ -259,6 +277,7 @@ class MediaPump(threading.Thread):
         self._latch(_addr)
         self.frames_received += 1
         if self.wire is not None:
+            self.wire_at.append(self.frames_sent)
             # Kept as it arrived: G.711 mu-law at 8 kHz, before anything decodes
             # or resamples it. A recording of what Whisper was given is not the
             # same artefact as a recording of what the line carried, and only
@@ -339,9 +358,10 @@ class VoiceCall:
     # -- keeping the audio ------------------------------------------------
 
     def record(self) -> None:
-        """Keep every inbound payload from here on. Off unless asked."""
+        """Keep both directions from here on. Off unless asked."""
         if self.pump.wire is None:
             self.pump.wire = []
+            self.pump.wire_out = []
 
     @property
     def recorded_frames(self) -> int:
@@ -354,6 +374,22 @@ class VoiceCall:
         if self.pump.wire is None:
             return b""
         return b"".join(self.pump.wire[start:end])
+
+    def recorded_outbound(self) -> bytes:
+        """Everything we sent, which is a gapless 50 fps clock."""
+        if self.pump.wire_out is None:
+            return b""
+        return b"".join(self.pump.wire_out)
+
+    def outbound_at(self, cursor: int) -> int:
+        """Which outbound frame we were on when inbound frame `cursor` arrived.
+
+        The alignment between the two streams, and the only thing that makes
+        them comparable -- see `MediaPump.wire_at`."""
+        at = self.pump.wire_at
+        if not at:
+            return 0
+        return at[min(cursor, len(at) - 1)]
 
     # -- outbound ---------------------------------------------------------
 
@@ -371,6 +407,22 @@ class VoiceCall:
     # that and an echo burst usually does not. And the threshold is calibrated
     # against the line's own measured noise rather than assumed -- see
     # `line_floor`.
+    #
+    # **Measured 2026-09-10, and it cannot fire on natural speech.** On nine
+    # turns of his own recorded voice the longest run of CONSECUTIVE frames
+    # above the bar is 16 -- 320 ms -- because the gaps between words are short
+    # but not zero and every one of them resets the count. The live call agreed:
+    # 87 seconds, nine turns, six of them spoken over us, and not one barge-in.
+    #
+    # A sliding window is what every VAD uses and it separates him from his room
+    # cleanly: at the same bar, "9 of the last 15 frames" fires on 9/9 of his
+    # turns and on 0/6 of synthetic room noise and distant chatter
+    # (`barge-sweep.json`). It is NOT changed here, deliberately. The one
+    # interferer that decides the question is our own audio echoing back off his
+    # handset, which is the exact failure this 25 was written to fix -- and it
+    # cannot be told apart from him talking over us without recording the
+    # outbound stream alongside the inbound one. That recording now happens; the
+    # constant changes when there is a call to measure it against, not before.
     BARGE_IN_FRAMES = 25
     # How far above the measured line noise counts as him talking.
     BARGE_IN_OVER_FLOOR = 4.0
@@ -392,13 +444,25 @@ class VoiceCall:
     # the barge-in harder to trigger.
     VOICE_BANDS = 8
     VOICE_SIMILARITY = 0.82
-    # Frames of inbound audio to retain while we speak. A barge-in needs its
-    # onset kept, not the whole utterance: without a cap this grew for the
-    # length of every reply and handed the next turn 19 s of mostly our own
-    # echo, which Whisper duly transcribed.
-    PENDING_RX_CAP = 60
+    # Frames of inbound audio to retain while we speak. Without a cap this grew
+    # for the length of every reply and handed the next turn 19 s of mostly our
+    # own echo, which Whisper duly transcribed.
+    #
+    # Raised from 60 (1.2 s) on 2026-09-10, measured. On the live benchmark call
+    # SIX of his NINE turns began mid-word -- the recorded audio starts at RMS
+    # 0.03-0.12 with no leading silence -- and two thirds of that call's word
+    # errors were words he said which never reached the model at all. He speaks
+    # over a holding clip of 1.16-2.4 s and then over the reply behind it, so
+    # 1.2 s of retention could not cover even the filler. Three seconds covers a
+    # filler and the first sentence after it.
+    #
+    # This still keeps the TAIL of what arrived, so a long overlap still loses
+    # its beginning. The real fix for that is barge-in working, which it does
+    # not -- see BARGE_IN_FRAMES.
+    PENDING_RX_CAP = 150
 
-    def send_audio(self, audio: np.ndarray, rate: int, *, interruptible: bool = False) -> float:
+    def send_audio(self, audio: np.ndarray, rate: int, *, interruptible: bool = False,
+                   flush: bool | None = None) -> float:
         """Speak. Float32 mono in [-1, 1] at `rate`.
 
         Pacing is the pump's job now; this only queues the audio and waits for
@@ -409,16 +473,29 @@ class VoiceCall:
         With `interruptible`, stop the moment he starts talking over us and set
         `self.interrupted`. Talking over someone who has started answering is
         the rudest thing a voice agent does, and on a phone it is also useless.
+
+        **What arrives while we talk is kept either way**, and that is a change
+        of 2026-09-10. Retention used to be tied to `interruptible`, so audio
+        that arrived during a non-interruptible filler was retained by nothing
+        and then deleted by the next interruptible send's flush. On the live
+        benchmark call that is where his words went: six of nine turns began
+        mid-word, and two thirds of that call's word errors were words he said
+        that never reached the model. Whether we are willing to be INTERRUPTED
+        by a sound and whether we are willing to LOSE it are different
+        questions, and only the first one is about the clip being played.
+
+        `flush` discards what is already queued before starting, so a reply is
+        not cut off by something he said before it began. It defaults to
+        `interruptible` for exactly the callers that always wanted it -- but a
+        multi-sentence answer must pass False after its first piece, or each
+        piece deletes what he said during the one before it.
         """
         wire = pcm.from_model(audio, rate=rate, out_rate=WIRE_RATE)
         ulaw = pcm.ulaw_encode(wire)
         frames = [ulaw[i:i + FRAME_SAMPLES]
                   for i in range(0, len(ulaw) - FRAME_SAMPLES + 1, FRAME_SAMPLES)]
         self.interrupted = False
-        if interruptible:
-            # Judge the interruption on audio from now, not on whatever queued
-            # while we were quiet. Stale frames are why a reply could be cut off
-            # by something he said before it started.
+        if interruptible if flush is None else flush:
             self._flush_inbound()
         began = time.monotonic()
         expected = len(frames) * FRAME_MS / 1000.0
@@ -430,11 +507,11 @@ class VoiceCall:
                 payload = self.pump.inbox.get(timeout=FRAME_MS / 1000.0)
             except queue.Empty:
                 continue
-            if not interruptible:
-                continue
             self._pending_rx.append(payload)
             if len(self._pending_rx) > self.PENDING_RX_CAP:
                 del self._pending_rx[:-self.PENDING_RX_CAP]
+            if not interruptible:
+                continue
             samples = np.frombuffer(pcm.ulaw_decode(payload), dtype="<i2")
             level = float(np.sqrt(np.mean((samples / 32768.0) ** 2))) if samples.size else 0.0
             bar = self._barge_threshold()

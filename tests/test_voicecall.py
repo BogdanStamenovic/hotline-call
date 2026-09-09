@@ -694,3 +694,74 @@ def test_a_packet_that_fails_authentication_cannot_move_the_stream():
     assert call.pump.remote == before
     assert call.pump.latched is None
     assert call.pump.auth_failures > 0
+
+
+# -- not losing what he says while we are talking --------------------------
+#
+# On the live benchmark call of 2026-09-10, SIX of his NINE turns began
+# mid-word, and two thirds of that call's word errors were words he said which
+# never reached the model. Retention used to be tied to `interruptible`, so
+# audio arriving during a non-interruptible filler was kept by nothing and then
+# deleted by the next send's flush.
+
+
+def test_what_he_says_over_a_filler_is_kept_and_becomes_his_next_turn():
+    call, theirs, _, their_keys, our_addr = call_pair()
+    feed_during(theirs, their_keys, our_addr, speech(0.8), delay=0.05)
+    # A filler: sent non-interruptibly on purpose, because a half-spoken "mhm"
+    # is worse than none. That must not mean losing him.
+    call.send_audio(np.zeros(8000, dtype=np.float32), rate=8000)
+    assert call._pending_rx, "his words during a filler were thrown away"
+    assert call.interrupted is False, "a filler still must not be interruptible"
+
+
+def test_a_second_sentence_does_not_delete_what_he_said_during_the_first():
+    """A multi-piece answer used to flush before every piece, which deleted
+    whatever he said during the piece before it."""
+    call, theirs, _, their_keys, our_addr = call_pair()
+    call.send_audio(np.zeros(8000, dtype=np.float32), rate=8000, interruptible=True,
+                    flush=True)
+    feed_during(theirs, their_keys, our_addr, speech(0.8), delay=0.05)
+    call.send_audio(np.zeros(8000, dtype=np.float32), rate=8000, interruptible=True,
+                    flush=False)
+    assert call._pending_rx, "the second sentence flushed away his interruption"
+
+
+def test_the_first_sentence_still_flushes_what_came_before_it():
+    call, theirs, _, their_keys, our_addr = call_pair()
+    feed(theirs, their_keys, our_addr, speech(0.6))
+    time.sleep(0.1)
+    call.send_audio(np.zeros(4000, dtype=np.float32), rate=8000, interruptible=True)
+    assert call.interrupted is False, "a reply was cut off by something said before it"
+
+
+# -- recording both directions --------------------------------------------
+
+
+def test_recording_keeps_what_we_sent_as_well_as_what_arrived():
+    """Audio arriving while we talk is either him over us or us echoing back off
+    his handset. Those want opposite handling and are identical from the inbound
+    side alone; only what we sent at the same instant separates them."""
+    call, theirs, _, their_keys, our_addr = call_pair()
+    call.record()
+    feed(theirs, their_keys, our_addr, speech(0.4))
+    call.receive_audio(0.5)
+    call.send_audio(np.zeros(4000, dtype=np.float32), rate=8000)
+
+    assert call.recorded(), "nothing inbound was kept"
+    assert call.recorded_outbound(), "nothing outbound was kept"
+    # The outbound stream is gapless, so it is the clock: at least as many
+    # frames as the call has been running.
+    assert len(call.pump.wire_out) >= len(call.pump.wire)
+    assert call.outbound_at(0) >= 0
+    assert call.outbound_at(len(call.pump.wire) - 1) >= call.outbound_at(0)
+
+
+def test_an_unrecorded_call_keeps_nothing():
+    call, theirs, _, their_keys, our_addr = call_pair()
+    feed(theirs, their_keys, our_addr, speech(0.3))
+    call.receive_audio(0.4)
+    assert call.pump.wire is None
+    assert call.pump.wire_out is None
+    assert call.recorded() == b""
+    assert call.recorded_outbound() == b""

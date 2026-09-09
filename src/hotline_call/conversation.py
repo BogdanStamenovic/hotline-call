@@ -215,7 +215,8 @@ class AnsweredCall:
             self.stats = call.stats()
             if self.recorder is not None:
                 self.recording = self.recorder.finish(
-                    call.recorded(), self.stats, ended=self.ended)
+                    call.recorded(), self.stats, ended=self.ended,
+                    outbound=call.recorded_outbound())
             log.info("call ended (%s) after %d turn(s): %s",
                      self.ended, self.turns, self.stats)
 
@@ -274,8 +275,11 @@ class AnsweredCall:
             self.transcript.append(("you", said))
             log.info("turn %d (%s): %r", self.turns, why, said)
             if self.recorder is not None:
-                self.recorder.turn(self.turns, call.recorded(self._wire_at, wire_end),
-                                   said, model=self.model, reason=why)
+                self.recorder.turn(
+                    self.turns, call.recorded(self._wire_at, wire_end), said,
+                    model=self.model, reason=why,
+                    outbound_span=(call.outbound_at(self._wire_at),
+                                   call.outbound_at(max(0, wire_end - 1))))
             if call.his_level is None and captured:
                 # The first thing he says is definitionally him -- he answered
                 # the phone. Everything quieter or unlike it afterwards is the
@@ -342,10 +346,16 @@ class AnsweredCall:
         """
         pending: list = []
         captured: list[np.ndarray] = []
-        # Where this turn starts in the recorded stream. Taken as a cursor into
-        # the pump's own payload list rather than by timestamp, so the slice is
-        # exact rather than approximately aligned.
-        self._wire_at = call.recorded_frames
+        # Where this turn starts in the recorded stream. A cursor into the
+        # pump's own payload list rather than a timestamp, so the slice is exact.
+        #
+        # Wound BACK past whatever was retained while we were speaking, because
+        # `receive_turn` begins with those frames and the recording has to be
+        # what the model was actually given. Without this the benchmark audio was
+        # missing up to a second of every overlapped turn -- the same words that
+        # were missing from the transcript, which made it look like the model had
+        # dropped them.
+        self._wire_at = max(0, call.recorded_frames - len(call._pending_rx))
 
         def on_chunk(phrase: np.ndarray) -> None:
             captured.append(phrase)
@@ -463,7 +473,11 @@ class AnsweredCall:
                 ahead = (pool.submit(self.speak, chunks[index + 1])
                          if index + 1 < len(chunks) else None)
                 if audio.size:
-                    call.send_audio(audio, rate, interruptible=True)
+                    # Flush before the first piece only. Flushing before each
+                    # one deletes whatever he said during the piece before it,
+                    # which on a three-sentence answer is most of his reply.
+                    call.send_audio(audio, rate, interruptible=True,
+                                    flush=(index == 0))
                 if call.interrupted:
                     log.info("he cut in %d chunk(s) into %d", index + 1, len(chunks))
                     if ahead is not None:

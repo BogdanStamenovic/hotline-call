@@ -47,7 +47,7 @@ class Recorder:
         self.failed = ""
 
     def turn(self, index: int, wire: bytes, text: str, model: str = "",
-             reason: str = "") -> None:
+             reason: str = "", outbound_span: tuple[int, int] | None = None) -> None:
         """One turn of his, as it arrived, beside what the live model made of it."""
         name = f"turn-{index:02d}.wav"
         try:
@@ -65,19 +65,32 @@ class Recorder:
             "model": model,
             "ended": reason,
             "at": round(time.time() - self.started, 2),
+            # Which outbound frames we were sending while this turn arrived, so
+            # `outbound.wav` can be sliced at the same instant. Wall clock does
+            # not survive his phone's silence suppression; this does.
+            "outbound_frames": list(outbound_span) if outbound_span else None,
         })
         log.info("recorded turn %d: %.1fs -> %s", index, len(wire) / WIRE_RATE, name)
 
-    def finish(self, wire: bytes, stats: dict | None = None, ended: str = "") -> str:
-        """The whole inbound stream and a manifest. Returns where it went."""
+    def finish(self, wire: bytes, stats: dict | None = None, ended: str = "",
+               outbound: bytes = b"") -> str:
+        """Both streams and a manifest. Returns where it went.
+
+        `outbound.wav` is what WE sent: gapless, 50 frames a second, and the
+        only way to tell his voice arriving over ours from our own voice coming
+        back off his handset. Those want opposite handling and look identical
+        from the inbound side alone."""
         try:
             if wire:
                 self._write(self.directory / "inbound.wav", wire)
+            if outbound:
+                self._write(self.directory / "outbound.wav", outbound)
             manifest = {
                 "started": self.started,
                 "note": self.note,
                 "rate": WIRE_RATE,
                 "codec": "G.711 mu-law, as received",
+                "outbound_seconds": round(len(outbound) / WIRE_RATE, 2),
                 "ended": ended,
                 "stats": stats or {},
                 "turns": self.turns,
