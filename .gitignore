@@ -20,3 +20,6 @@ ci/Info.plist
 DerivedData/
 out/
 drop/
+
+# Call audio: his voice, on a PUBLIC repo. Never commit these.
+recordings/
