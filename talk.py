@@ -1,376 +1,109 @@
 #!/usr/bin/env python3
-"""A real phone conversation: ring him, then talk until one of us hangs up.
+"""Ring him and hold a real conversation, without going through the daemon.
 
-**The design is his, from 2026-09-08.** A separate Sonnet session owns the call,
-seeded with context before dialling so it does not have to discover anything
-mid-sentence, and instructed in phone manners: short turns, and if it needs to
-go and check something it SAYS so before it goes quiet.
+**What this is for now that the daemon does the same thing.** It is the bench
+version: one process, one call, everything it uses passed in on the command
+line, and a transcript printed at the end. When a call sounds wrong, this is
+where you change one thing and ring again without restarting `hotline-iosd` or
+involving the roster, the store or a blocked agent.
 
-**Why that matters, with the numbers.** After he stops speaking the pipeline
-costs, measured on this box: 0.80 s to be sure he stopped, 0.93 s of Whisper,
-2.8-4.3 s for the agent, 1.7-2.5 s of cvoice. Around seven seconds of silence,
-against roughly one that a person tolerates on a phone. Nothing in that chain is
-going to get 7x faster, so the fix is not to make the wait shorter but to stop it
-being silent.
+**Everything that decides how the call FEELS moved out of here** into
+`hotline_ios.conversation`, `media/tts.py`, `media/ears.py` and `callagent.py`,
+because the daemon needs exactly the same behaviour and two copies of it would
+drift within a week. The rules that were learned here -- Serbian, never hanging
+up on him, "ćao" not being a farewell, fillers off disk -- are documented where
+they now live.
 
-**Why the fillers are pre-rendered and not synthesised.** A filler that has to go
-through cvoice first costs 1.7 s, which is most of the gap it exists to hide.
-These are rendered once into `fillers/` and played from disk, so the first audio
-he hears lands about 1.5 s after he stops talking instead of seven.
-
-**Why a separate session rather than the one that placed the call.** Partly
-speed -- Sonnet with a small context answers in ~2.8 s where a large session is
-slower. Mostly it is that two agents answering him at once is the failure the
-operator brief exists to prevent: this one owns the call, and the caller stays
-off Discord while it is up.
+This used to crash the instant he answered: it called
+`voicecall.VoiceCall.PRIMING_SECONDS`, which commit `1ad8e2b` deleted on
+2026-09-08 without updating this caller. `on_answer` raised `AttributeError`,
+`_finish_answered` logged it and hung up, and from his end that is
+indistinguishable from the daemon's own bug -- he answers and hears silence.
 """
 from __future__ import annotations
 
-import asyncio, base64, ctypes, glob, io, json, logging, os, queue, subprocess, sys, threading, time, wave
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor
-import numpy as np
+import argparse
+import asyncio
+import logging
+import os
+import pathlib
+import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "src"))
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE / "src"))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("talk")
 
-CVOICE = "http://100.72.2.62:8760"
-TOKEN = "eOuV4ySUiXOxmBMDsILZ3yJZAumdIq55EK-xxQgwxRs"
-PROFILE = "bogdan-stamenovic"
-WHEELS = "/home/bodas/data/cvoice/.venv/lib/python3.14/site-packages"
-WORKDIR = "/home/bodas/data/hotline"
-MAX_CALL_SECONDS = 1800   # a backstop, not a policy
-# How long the line can be completely dead before we accept he has gone.
-# His instruction: do not hang up on him, wait for HIS hangup. A silent
-# stretch is him thinking; a stretch with no RTP at all is the phone gone.
-DEAD_LINE_SECONDS = 90
-# A single answer can run long; only stop extending it well past any
-# plausible sentence.
-MAX_UTTERANCE_SECONDS = 180
-AGENT_SLOW_AFTER = 3.0   # seconds before a second, apologetic filler goes out
 
-MANNERS = """You are on a LIVE PHONE CALL with Bogdan, speaking Serbian out loud. \
-Your words go straight to a text-to-speech engine and into his ear.
-
-RULES, all of them about being audible rather than readable:
-- ONE short sentence. Two only if the second is genuinely necessary. He cannot
-  skim a phone call, and anything past about six seconds of speech is too long
-  to follow by ear. Never recite numbers, test counts or version strings unless
-  he asks for them -- they are unlistenable and he can read them later.
-- NO markdown, NO lists, NO code, NO URLs, NO file paths read out character by \
-character. If you must name a file, say it the way a person would.
-- Serbian, with proper diacritics (c, c, s, z, dj as the real characters) -- the \
-TTS mispronounces stripped ASCII.
-- If you need to run a command or check something before you can answer, your \
-FIRST words must say so: "Samo sekund, da proverim." Then check, then answer. \
-Never go silent while you work.
-- Numbers and technical terms: say them as a person would speak them.
-- If you did not understand him, say so and ask him to repeat.
-- If he says goodbye, say a short goodbye back and nothing else.
-- Do not mention that you are an AI, and do not narrate your own tooling."""
-
-
-def load_fillers():
-    index = json.load(open(os.path.join(HERE, "fillers/index.json")))
-    return {k: (np.load(os.path.join(HERE, f"fillers/{k}.npy")), v["rate"])
-            for k, v in index.items()}
-
-
-def say(text: str) -> tuple[np.ndarray, int]:
-    body = json.dumps({"text": text, "profile": PROFILE, "takes": 1}).encode()
-    req = urllib.request.Request(f"{CVOICE}/speak", data=body, headers={
-        "Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"})
-    d = json.loads(urllib.request.urlopen(req, timeout=300).read())
-    w = wave.open(io.BytesIO(base64.b64decode(d["audio_b64"])))
-    pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768
-    return pcm, w.getframerate()
-
-
-def load_whisper():
-    for lib in glob.glob(f"{WHEELS}/nvidia/*/lib/*.so*"):
-        if os.path.basename(lib).startswith(("libcublas", "libcudnn", "libcudart", "libnvrtc")):
-            try: ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
-            except OSError: pass
-    from faster_whisper import WhisperModel
-    return WhisperModel("large-v3", device="cuda", compute_type="float16")
-
-
-class CallAgent:
-    """The Sonnet session on the other end of the conversation.
-
-    Keyless via `claude -p`, resumed by session id so each turn keeps the last.
-    Measured: 4.7 s to open the session, 2.8 s per resumed turn.
-    """
-
-    def __init__(self, context: str):
-        self.session: str | None = None
-        self.context = context
-
-    def _run(self, prompt: str, timeout: float) -> str:
-        cmd = ["claude", "-p", "--model", "sonnet", "--output-format", "json"]
-        if self.session:
-            cmd += ["--resume", self.session]
-        cmd.append(prompt)
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout, cwd=WORKDIR)
-        if proc.returncode != 0:
-            raise RuntimeError(proc.stderr.strip()[:200] or "claude exited nonzero")
-        payload = json.loads(proc.stdout)
-        self.session = payload.get("session_id", self.session)
-        return (payload.get("result") or "").strip()
-
-    def open(self) -> None:
-        """Seed the session before dialling, so no discovery happens mid-call."""
-        self._run(f"{MANNERS}\n\nCONTEXT for this call:\n{self.context}\n\n"
-                  "Do not reply to this message with anything but the single word OK.", 180)
-
-    def reply(self, heard: str) -> str:
-        return self._run(f"Bogdan je upravo rekao, preko telefona: \"{heard}\"", 120)
-
-
-def main() -> int:
-    from hotline_ios.media import voicecall
-    from hotline_ios.speculate import Speculator
-    from hotline_ios.ring.sip import SipTransport
-    from hotline_ios.ring.base import CallTarget
-
+def load_env() -> None:
+    """SIP_* out of hotline-ios's own .env, the same file the daemon reads."""
     os.environ.setdefault("SIP_MEDIA_HOST", "100.72.2.62")
-    for line in open("/home/bodas/data/hotline-ios/.env"):
+    try:
+        lines = (HERE.parent / ".env").read_text().splitlines()
+    except OSError:
+        return
+    for line in lines:
         line = line.strip()
-        if line.startswith("SIP_") and "=" in line:
-            k, v = line.split("=", 1); os.environ.setdefault(k, v.strip().strip('"'))
+        if line.startswith(("SIP_", "HOTLINE_")) and "=" in line:
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key, value.strip().strip('"'))
 
-    context = open(os.path.join(HERE, "call_context.txt")).read() \
-        if os.path.exists(os.path.join(HERE, "call_context.txt")) else "Nema posebnog konteksta."
 
-    fillers = load_fillers()
-    whisper = load_whisper()
-    # Warmed BEFORE the phone rings: the first embed loads the model, and paying
-    # that inside a live turn would cost seconds at the worst possible moment.
-    speculator = Speculator()
-    log.info("speculator: %s", "embeddings" if speculator.warm() else "keywords only")
-    agent = CallAgent(context)
-    log.info("seeding the call agent before dialling")
-    t = time.time(); agent.open()
-    log.info("agent ready in %.1fs (session %s)", time.time() - t, (agent.session or "?")[:12])
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="talk", description=__doc__)
+    parser.add_argument("--reason", default="", help="what to say after the greeting")
+    parser.add_argument("--no-agent", action="store_true",
+                        help="carry audio but do not route his turns to a session")
+    parser.add_argument("--timeout", type=float, default=45.0, help="how long to ring")
+    args = parser.parse_args(argv)
 
-    transcript: list[tuple[str, str]] = []
-    # One worker: faster-whisper is not thread-safe for concurrent transcribes on
-    # the same model, and serialising them is fine because they are each far
-    # shorter than the speech still arriving behind them.
-    pool = ThreadPoolExecutor(max_workers=1)
+    load_env()
+    from hotline_ios.callagent import CallAgent, default_context
+    from hotline_ios.conversation import AnsweredCall
+    from hotline_ios.media.ears import Ears
+    from hotline_ios.media.tts import Fillers, Voice
+    from hotline_ios.ring.base import CallTarget
+    from hotline_ios.ring.sip import SipTransport
 
-    # Whisper invents these out of near-silence. Measured directly: two seconds
-    # of room noise transcribes as "Hvala vam." every time. vad_filter removes
-    # almost all of it -- and is 6x faster on silence, 0.45s to 0.07s, with real
-    # speech coming back byte-identical -- but a blocklist catches the rest,
-    # because one hallucinated phrase per chunk is enough to make the agent
-    # answer a question he never asked.
-    HALLUCINATIONS = {
-        "hvala vam.", "hvala vam", "hvala na gledanju.", "hvala.", "hvala",
-        "titlovi", "prevod", "prodavanje", "продавање", "хвала вам.",
-        "titlovi hrt", "podnapisi", "amara.org", "subscribe",
-    }
+    voice = Voice()
+    log.info("cvoiced: %s", voice.health())
+    ears = Ears()
+    ears.load()
+    fillers = Fillers()
+    fillers.load()
 
-    def transcribe(audio) -> str:
-        if audio is None or audio.size < 4000:
-            return ""
-        segs, _ = whisper.transcribe(
-            audio, language="sr", beam_size=1,
-            # Its own bundled Silero ONNX -- no torch, which is why this is
-            # available at all after the CUDA/torch purge.
-            vad_filter=True,
-            # Without this a hallucinated phrase becomes context for the next
-            # chunk and the model repeats it down the whole turn.
-            condition_on_previous_text=False,
-        )
-        kept = []
-        for seg in segs:
-            text = seg.text.strip()
-            if text.lower().strip(" .,!?") in {h.strip(" .") for h in HALLUCINATIONS}:
-                log.debug("dropped hallucination %r", text)
-                continue
-            kept.append(text)
-        return " ".join(kept).strip()
+    agent = None
+    if not args.no_agent:
+        agent = CallAgent(default_context(
+            f"THIS CALL: {args.reason}" if args.reason else ""))
+        log.info("seeding the call agent before dialling")
+        agent.open()
 
-    def on_answer(reply_msg, media_sock, our_key, our_salt):
-        try:
-            answer = voicecall.parse_sdp_answer(reply_msg)
-        except voicecall.SdpError as exc:
-            log.error("SDP: %s", exc); return
-        log.info("ANSWERED -- his media at %s:%d", answer.host, answer.port)
-        call = voicecall.VoiceCall(media_sock, answer, our_key, our_salt)
+    ring = SipTransport()
+    handler = AnsweredCall(
+        speak=lambda text: (voice.synthesize(text), voice.rate),
+        transcribe=ears.transcribe,
+        fillers=fillers,
+        greeting=args.reason,
+        ask=agent.reply if agent is not None else None,
+        hung_up=ring.far_end_hung_up,
+    )
+    ring.on_answer = handler
 
-        def play(name, interruptible=False):
-            """Fillers are short and go out whole; only real answers are worth
-            interrupting, and a half-spoken "mhm" is worse than none."""
-            audio, rate = fillers[name]
-            call.send_audio(audio, rate, interruptible=interruptible)
-
-        def speak(text):
-            t0 = time.time(); audio, rate = say(text)
-            log.info("  cvoice %.2fs for %.1fs", time.time() - t0, audio.size / rate)
-            call.send_audio(audio, rate, interruptible=True)
-            if call.interrupted:
-                log.info("  (he cut in)")
-
-        call.send_silence(voicecall.VoiceCall.PRIMING_SECONDS, calibrate=True)
-        play("greet", interruptible=True)
-
-        # He asked explicitly not to be hung up on: this end stays on the line
-        # until HIS hangup. Silence is him thinking, not him leaving, and the
-        # previous version ended the call twice while he was still there.
-        call_started = time.time()
-        dead_since: float | None = None
-        turn = 0
-        while time.time() - call_started < MAX_CALL_SECONDS:
-            turn += 1
-            # Transcribe each phrase as he finishes it, on a worker, so the ASR
-            # cost lands under his own speech instead of in the pause after it.
-            pending: list = []
-            captured: list[np.ndarray] = []
-
-            # Updated as each phrase is transcribed -- i.e. WHILE he is still
-            # talking -- so by the time he stops we already know which holding
-            # phrase fits and can play it with no synthesis at all.
-            partial = {"text": "", "intent": "NEJASNO"}
-
-            def on_chunk(phrase, _p=pending, _c=captured, _st=partial):
-                _c.append(phrase)
-                fut = pool.submit(transcribe, phrase)
-                _p.append(fut)
-
-                def guess(f, _st=_st):
-                    try:
-                        piece = f.result()
-                    except Exception:
-                        return
-                    if not piece:
-                        return
-                    _st["text"] = (_st["text"] + " " + piece).strip()
-                    intent, margin = speculator.intent(_st["text"])
-                    if intent != _st["intent"]:
-                        log.info("  speculation: %s (margin %.3f) <- %r",
-                                 intent, margin, _st["text"][:60])
-                    _st["intent"] = intent
-                fut.add_done_callback(guess)
-
-            listened = 0.0
-            while True:
-                heard, why = call.receive_turn(max_seconds=30.0, silence_ms=800,
-                                               on_chunk=on_chunk)
-                if heard.size:
-                    captured.append(heard)
-                    pending.append(pool.submit(transcribe, heard))
-                listened += 30.0
-                # "timeout" means the cap hit while he was STILL TALKING. Ending
-                # the turn there is talking over him, which is what cut him off
-                # mid-sentence on the 19:10 call. Keep listening.
-                if why == "timeout" and listened < MAX_UTTERANCE_SECONDS:
-                    log.info("turn %d: still going at %.0fs, keeping the line open",
-                             turn, listened)
-                    continue
-                break
-            log.info("turn %d: %s, %d phrase(s)", turn, why, len(pending))
-
-            # Anything he actually said gets answered, whatever the turn ended
-            # on. He spoke three phrases and then the media went quiet; the
-            # dead-line check fired first and discarded all three, so he got no
-            # reply to something he had just said.
-            if why == "no-audio" and not pending:
-                # No RTP at all and nothing captured. Either he hung up or the
-                # media died; only after a long stretch do we accept it is over.
-                dead_since = dead_since or time.time()
-                if time.time() - dead_since > DEAD_LINE_SECONDS:
-                    log.info("no media for %ds; he is gone", DEAD_LINE_SECONDS)
-                    break
-                continue
-            dead_since = None
-
-            if not pending and (why == "silence" or heard.size < 8000):
-                # Audio is flowing, he just is not speaking. Stay quiet and wait.
-                call.send_silence(1.0)
-                continue
-
-            t0 = time.time()
-            said = " ".join(f.result() for f in pending).strip()
-            log.info("  heard (%.2fs to finish, %d phrases, intent %s): %r",
-                     time.time() - t0, len(pending), partial["intent"], said)
-            if call.his_level is None and captured:
-                # The first thing he says is definitionally him: he answered the
-                # phone. Everything quieter or unlike it afterwards is the room.
-                call.enrol_voice(np.concatenate(captured))
-            if not said or len(said) < 3:
-                # Everything he said was noise or hallucination. Do not hand
-                # that to the agent; it answers a question he never asked.
-                play("notheard"); continue
-            transcript.append(("bogdan", said))
-
-            # "cao" is NOT here, and that is the whole point: in Serbian it is a
-            # greeting at least as often as a farewell. He opened a call with
-            # "Cao brate" and this hung up on him mid-hello.
-            #
-            # These also have to appear near the END of what he said. "Reci mi
-            # kad zavrsis" contains a farewell word and is not one.
-            low = said.lower()
-            tail = low[-40:]
-            farewells = ("prekini", "prekidam", "dovidjenja", "doviđenja",
-                         "cujemo se", "čujemo se", "prijatno", "zdravo i prijatno",
-                         "to je to", "hvala i prijatno")
-            if any(w in tail for w in farewells):
-                play("bye"); transcript.append(("hotline", "bye")); break
-
-            # The agent runs in a thread so the line never goes quiet: an
-            # acknowledgement goes out at once, and a second filler if it is slow.
-            result: queue.Queue = queue.Queue(maxsize=1)
-            def work(text=said):
-                try: result.put(("ok", agent.reply(text)))
-                except Exception as exc: result.put(("err", f"{type(exc).__name__}: {exc}"))
-            worker = threading.Thread(target=work, daemon=True); worker.start()
-
-            # Instant, contextual, and safe: a holding phrase asserts nothing, so
-            # unlike a speculative ANSWER it cannot be contradicted by the rest
-            # of his sentence. Measured on his own transcripts, a speculative
-            # answer is flatly wrong 25% of the time however much has been heard.
-            play(speculator.holding_clip(partial["intent"], turn))
-            began = time.time()
-            while worker.is_alive() and time.time() - began < 25:
-                if time.time() - began > AGENT_SLOW_AFTER and result.empty():
-                    play(["wait_sekund", "wait_proveri", "wait_vidim"][turn % 3])
-                    began = time.time() - AGENT_SLOW_AFTER - 90  # only once per turn
-                else:
-                    call.send_silence(0.2)
-            try:
-                status, text = result.get(timeout=1.0)
-            except queue.Empty:
-                status, text = "err", "agent did not answer in time"
-            log.info("  agent (%s): %r", status, text[:120])
-            if status != "ok" or not text:
-                text = "Izvini, nešto mi se zaglavilo. Pokušaj ponovo."
-            transcript.append(("hotline", text))
-
-            speak(text)
-
-        call.send_silence(0.4)
-        log.info("call stats: %s", call.stats())
-        # Stop the media thread, or it keeps streaming to a call that has ended.
-        call.close()
-
-    ring = SipTransport(on_answer=on_answer)
-
-    async def go():
+    async def go() -> None:
         await ring.start()
-        await ring.ring(CallTarget(device="iphone", reason="conversation"), timeout=45.0)
+        await ring.ring(CallTarget(device="iphone", reason=args.reason or "conversation"),
+                        timeout=args.timeout)
 
     try:
         asyncio.run(go())
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - the outcome is the point, not a traceback
         log.error("call ended: %s: %s", type(exc).__name__, exc)
 
-    print("\n=== TRANSCRIPT ===")
-    for who, what in transcript:
+    print(f"\n=== {handler.ended} after {handler.turns} turn(s) ===")
+    print(f"stats: {handler.stats}")
+    for who, what in handler.transcript:
         print(f"  {who:8}: {what}")
     return 0
 
