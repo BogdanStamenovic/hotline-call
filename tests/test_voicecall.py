@@ -138,6 +138,25 @@ def read_frames(sock, session, limit=400, timeout=1.0):
     return out
 
 
+def drained(call):
+    """`frames_sent` after the pump has finished accounting for the last frame.
+
+    `send_audio` returns when the outbox empties, which is when the final frame
+    is POPPED -- `MediaPump._send` increments `frames_sent` in a `finally` after
+    the socket write, so the counter lags the pop by one frame. Under an idle
+    suite that gap closes before the assertion reads it and under a loaded one it
+    does not, which is a test that fails once every few hundred runs on a
+    system that is working correctly. One frame period settles it.
+
+    Found by a full-suite run failing `(50 - 1) >= 50` on 2026-09-10 while the
+    same test passed alone. Do not "fix" this by lowering a threshold to 49: the
+    thing these assertions are for is catching an utterance cut SHORT, and a
+    barge-in truncates at 25 frames, not at 49.
+    """
+    time.sleep(voicecall.FRAME_MS / 1000.0)
+    return call.frames_sent
+
+
 def test_what_we_send_is_readable_with_OUR_key_and_not_his():
     call, theirs, ours_ks, theirs_ks, _ = call_pair()
     tone = (np.sin(np.arange(1600) * 0.05) * 0.5).astype(np.float32)
@@ -325,7 +344,7 @@ def test_speaking_uninterrupted_plays_the_whole_utterance():
     before = call.frames_sent
     call.send_audio(np.zeros(8000, dtype=np.float32), rate=8000, interruptible=True)
     assert call.interrupted is False
-    assert call.frames_sent - before >= 50
+    assert drained(call) - before >= 50
 
 
 def test_he_can_talk_over_us_and_we_stop():
@@ -375,7 +394,7 @@ def test_a_non_interruptible_send_ignores_him_talking():
     before = call.frames_sent
     call.send_audio(np.zeros(8000, dtype=np.float32), rate=8000)
     assert call.interrupted is False
-    assert call.frames_sent - before >= 50
+    assert drained(call) - before >= 50
 
 
 def test_a_noisy_line_does_not_trigger_a_barge_in():
@@ -395,7 +414,7 @@ def test_a_noisy_line_does_not_trigger_a_barge_in():
     feed(theirs, their_keys, our_addr, noisy)
     call.send_audio(np.zeros(8000, dtype=np.float32), rate=8000, interruptible=True)
     assert call.interrupted is False, "line noise was mistaken for him talking"
-    assert call.frames_sent >= 50 + 30, "the utterance was cut short"
+    assert drained(call) >= 50 + 30, "the utterance was cut short"
 
 
 def test_real_speech_still_interrupts_over_that_same_noise():
@@ -416,7 +435,7 @@ def test_an_unmeasured_line_refuses_to_interrupt_rather_than_guessing():
     before = call.frames_sent
     call.send_audio(np.zeros(8000, dtype=np.float32), rate=8000, interruptible=True)
     assert call.interrupted is False
-    assert call.frames_sent - before >= 50, "the whole utterance must still go out"
+    assert drained(call) - before >= 50, "the whole utterance must still go out"
 
 
 def test_retained_audio_is_capped_so_a_long_reply_does_not_hoard_his_echo():
@@ -436,7 +455,7 @@ def test_audio_that_arrived_before_we_spoke_cannot_interrupt_us():
     time.sleep(0.1)
     call.send_audio(np.zeros(8000, dtype=np.float32), rate=8000, interruptible=True)
     assert call.interrupted is False, "stale audio cut off the reply to it"
-    assert call.frames_sent >= 50 + 25
+    assert drained(call) >= 50 + 25
 
 
 # -- voice profiling: telling him from the room ----------------------------
