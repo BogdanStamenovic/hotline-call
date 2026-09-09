@@ -600,16 +600,18 @@ class Service:
         confirmed-ring path both depend on that: a ring that holds a call it has
         nothing to say on is worse than one that does not.
         """
-        links = holds_calls(doorbell) if self.can_talk else []
-        if not links:
-            yield None
-            return
+        # Nothing between here and the yield may raise. This runs inside
+        # `place()`'s try, whose except clauses are the ring outcomes -- so an
+        # exception escaping here is not a silent call, it is a 500 and NO ring
+        # at all, which is worse than the bug this whole path fixes.
         try:
+            links = holds_calls(doorbell) if self.can_talk else []
             handlers = [self._answered_call(target, conversation, link) for link in links]
         except Exception:
-            # A doorbell that rings is worth more than one that talks. This is
-            # the ring path; nothing here may take it down.
             log.exception("could not build the answered-call handler; ringing anyway")
+            yield None
+            return
+        if not links:
             yield None
             return
         restore = [(link, link.on_answer) for link in links]
@@ -618,6 +620,9 @@ class Service:
         try:
             yield handlers[0] if len(handlers) == 1 else _the_one_that_ran(handlers)
         finally:
+            # Unconditionally, however the ring ended. A handler left installed
+            # would make the NEXT ring -- possibly hotline-page's -- hold a call
+            # it has nothing to say on and answer it with a stale question.
             for link, was in restore:
                 link.on_answer = was
 

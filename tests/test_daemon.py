@@ -782,3 +782,24 @@ async def test_his_spoken_answer_reaches_a_caller_already_waiting_for_it():
     assert body["state"] == "answered", body
     assert body["reply"] == "da, samo napred"
     assert body["waited_seconds"] < 3, "it waited for a question already answered"
+
+
+async def test_a_handler_that_cannot_be_built_still_lets_the_phone_ring():
+    """This runs inside place()'s try, whose except clauses are the ring
+    outcomes. An exception escaping it is not a silent call -- it is a 500 and
+    no ring at all, which is worse than the bug this path fixes."""
+    class Exploding:
+        def synthesize(self, text): raise AssertionError("never called")
+
+    inner = HoldsCalls()
+    service = Service(ConfirmedRing(inner, confirm_within=1.0), FakePool(),
+                      transcriber=FakeTranscriber(), speaker=Exploding())
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("no session, no context, nothing")
+
+    service._answered_call = boom
+    body = await service.place({"reason": "status", "wait": False})
+    assert body["state"] == "ringing"
+    assert inner.during_ring is None
+    assert inner.ringing.is_set(), "the phone must still have rung"
