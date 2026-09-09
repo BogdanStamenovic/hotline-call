@@ -700,3 +700,85 @@ async def test_the_hook_installer_and_the_daemon_agree_on_the_url():
     service = Service(LoopbackTransport(), FakePool())
     service.bound_to(["100.72.2.62", "127.0.0.1"], 8789)
     assert service.hook_url == local_url(hooks.HOOK_PATH, 8789)
+
+
+# -- the bug this whole media path exists to fix ---------------------------
+#
+# He answered a real call on 2026-09-09 at 15:44:57Z and heard silence, because
+# `build_transport` constructed `SipTransport()` bare and nothing ever passed
+# `on_answer`. 313 tests were green at the time. These are the ones that would
+# not have been.
+
+
+class HoldsCalls:
+    """A transport that can hold an answered call, i.e. has `on_answer`.
+
+    Deliberately not a SipTransport: this asserts that the DAEMON installs a
+    handler on whatever inside the doorbell can take one, which is a wiring
+    question and not a SIP one.
+    """
+
+    name = "holds"
+    rings_when_closed = True
+
+    def __init__(self):
+        self.on_answer = None
+        self.during_ring = "never rang"
+        self.ringing = asyncio.Event()
+
+    async def start(self): pass
+    async def stop(self): pass
+
+    async def ring(self, target, timeout=45.0):
+        self.ringing.set()
+        self.during_ring = self.on_answer
+
+
+class FakeFillers:
+    def get(self, name): return None
+
+
+async def test_the_daemon_installs_an_answered_call_handler_for_the_ring():
+    inner = HoldsCalls()
+    service = Service(ConfirmedRing(inner, confirm_within=1.0), FakePool(),
+                      transcriber=FakeTranscriber(), speaker=FakeSpeaker(),
+                      fillers=FakeFillers())
+    await service.place({"reason": "should I restart it?", "wait": False})
+    assert inner.during_ring is not None, "the ring went out with no way to answer it"
+    assert callable(inner.during_ring)
+    # And taken away again: a doorbell with a handler holds a call it may have
+    # nothing to say on, which hotline-page and the confirmed-ring path both
+    # depend on it not doing.
+    assert inner.on_answer is None
+
+
+async def test_a_daemon_with_no_voice_rings_and_says_so_rather_than_going_silent():
+    inner = HoldsCalls()
+    service = Service(ConfirmedRing(inner, confirm_within=1.0), FakePool())
+    assert not service.can_talk
+    await service.place({"reason": "status", "wait": False})
+    assert inner.during_ring is None, "it must ACK and hang up, not hold a mute call"
+
+
+async def test_his_spoken_answer_reaches_a_caller_already_waiting_for_it():
+    """The cursor race. `place()` used to read `events.latest` AFTER the ring,
+    so an answer appended DURING the call was already behind it and
+    `hotline-call` waited its full timeout for a question answered out loud."""
+    inner = HoldsCalls()
+    service = Service(ConfirmedRing(inner, confirm_within=1.0), FakePool(),
+                      transcriber=FakeTranscriber(), speaker=FakeSpeaker(),
+                      fillers=FakeFillers())
+
+    async def ring(target, timeout=45.0):
+        inner.ringing.set()
+        # What the media thread does when he speaks: append his words to the
+        # conversation, from inside the ring.
+        conversation = next(iter(service.calls))
+        service._append(conversation, "you", "da, samo napred")
+
+    inner.ring = ring
+    body = await asyncio.wait_for(
+        service.place({"reason": "should I?", "timeout": 5.0}), timeout=15)
+    assert body["state"] == "answered", body
+    assert body["reply"] == "da, samo napred"
+    assert body["waited_seconds"] < 3, "it waited for a question already answered"
