@@ -758,7 +758,7 @@ def test_recording_keeps_what_we_sent_as_well_as_what_arrived():
 
 
 def test_an_unrecorded_call_keeps_nothing():
-    call, theirs, _, their_keys, our_addr = call_pair()
+    call, theirs, _ours, their_keys, our_addr = call_pair()
     feed(theirs, their_keys, our_addr, speech(0.3))
     call.receive_audio(0.4)
     assert call.pump.wire is None

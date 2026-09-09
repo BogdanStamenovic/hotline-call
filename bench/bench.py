@@ -42,7 +42,7 @@ MODELS = {
 
 def vram() -> int:
     out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-                         capture_output=True, text=True).stdout.strip().splitlines()[0]
+                         capture_output=True, text=True, check=True).stdout.strip().splitlines()[0]
     return int(out)
 
 

@@ -85,7 +85,7 @@ def main():
     if good:
         # Prefer the one that reacts fastest, then the most conservative bar --
         # a barge-in that takes a second is not a barge-in.
-        best = sorted(good, key=lambda g: (g[3], -g[0], -g[2]))[0]
+        best = min(good, key=lambda g: (g[3], -g[0], -g[2]))
         print(f"fastest clean rule: bar {best[0]:.2f}*his_level, "
               f"{int(best[2]*best[1])}/{best[1]} frames ({best[3]} ms window)")
         with open(os.path.join(BENCH, "barge-sweep.json"), "w") as fh:
