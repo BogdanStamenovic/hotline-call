@@ -140,6 +140,9 @@ class MediaPump(threading.Thread):
         self._outbox: deque[bytes] = deque()
         self._lock = threading.Lock()
         self.inbox: queue.Queue = queue.Queue()
+        # Where his packets actually come FROM, once we have seen one. See
+        # `_latch`.
+        self.latched: tuple[str, int] | None = None
         # NOT `_stop`: threading.Thread has an internal _stop() that join()
         # calls, and shadowing it with an Event breaks join() with a
         # TypeError from deep inside the stdlib.
@@ -204,6 +207,33 @@ class MediaPump(threading.Thread):
             self._ts += FRAME_SAMPLES
             self.frames_sent += 1
 
+    def _latch(self, source) -> None:
+        """Send to where his audio is actually coming from, not where his SDP said.
+
+        Only ever called for a packet that has just AUTHENTICATED against his
+        master key, which is what makes this safe: a forged source address
+        cannot produce one. Symmetric RTP, and every SIP stack that survives NAT
+        does it.
+
+        The address in a c= line is what the far end believes about itself, and
+        behind CGNAT -- an ordinary mobile network -- that belief is a private
+        address nothing outside can route to. Without this the call is
+        one-directional in the worse direction: we hear him perfectly and he
+        hears nothing, which reads as the media leg being broken rather than as
+        one line of SDP being unroutable.
+
+        Latched once and then left alone. A stream that re-latches per packet
+        would follow anything that happens to arrive.
+        """
+        if self.latched is not None:
+            return
+        seen = (str(source[0]), int(source[1]))
+        self.latched = seen
+        if seen != self.remote:
+            log.info("latching audio to %s:%d; his SDP said %s:%d",
+                     seen[0], seen[1], self.remote[0], self.remote[1])
+            self.remote = seen
+
     def _read(self, budget: float) -> None:
         try:
             self.sock.settimeout(max(0.001, budget))
@@ -222,6 +252,7 @@ class MediaPump(threading.Thread):
         parsed = rtp.parse_packet(plain)
         if parsed is None:
             return
+        self._latch(_addr)
         self.frames_received += 1
         # Unbounded on purpose: a turn is bounded in time by the caller, and
         # dropping inbound audio to protect memory would lose his words.

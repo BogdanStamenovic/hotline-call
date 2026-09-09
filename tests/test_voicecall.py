@@ -644,3 +644,53 @@ def test_closing_a_call_stops_its_thread():
     call.close()
     call.pump.join(timeout=2.0)
     assert not call.pump.is_alive(), "the pump thread outlived the call"
+
+
+# -- symmetric RTP ---------------------------------------------------------
+
+
+def test_audio_follows_where_his_packets_actually_came_from():
+    """His SDP names an address he believes he is at. Behind CGNAT -- an
+    ordinary mobile network -- that is a private address nothing can route to,
+    and the call goes one-directional in the worse direction: we hear him and he
+    hears nothing."""
+    call, theirs, our_keys, their_keys, our_addr = call_pair()
+    wrong = ("192.0.2.1", 9)          # TEST-NET-1: reserved, unroutable
+    call.pump.remote = wrong
+    call.remote = wrong
+
+    feed(theirs, their_keys, our_addr, speech(0.4))
+    call.receive_audio(0.5)
+
+    assert call.pump.remote == theirs.getsockname()
+    assert call.pump.latched == theirs.getsockname()
+
+
+def test_it_latches_once_rather_than_following_every_packet():
+    call, theirs, our_keys, their_keys, our_addr = call_pair()
+    feed(theirs, their_keys, our_addr, speech(0.2))
+    call.receive_audio(0.3)
+    first = call.pump.remote
+
+    other = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    other.bind(("127.0.0.1", 0))
+    feed(other, their_keys, our_addr, speech(0.2))
+    call.receive_audio(0.3)
+    other.close()
+
+    assert call.pump.remote == first
+
+
+def test_a_packet_that_fails_authentication_cannot_move_the_stream():
+    """The whole safety of latching is that only his key gets to do it."""
+    call, theirs, our_keys, their_keys, our_addr = call_pair()
+    before = call.pump.remote
+    forger = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    forger.bind(("127.0.0.1", 0))
+    feed(forger, srtp.new_key_salt(), our_addr, speech(0.4))
+    call.receive_audio(0.5)
+    forger.close()
+
+    assert call.pump.remote == before
+    assert call.pump.latched is None
+    assert call.pump.auth_failures > 0
