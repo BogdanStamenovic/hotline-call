@@ -91,11 +91,17 @@ import ssl
 import string
 import time
 import uuid
+from collections.abc import Callable
 
 from ..media import srtp
 from .base import CallDeclined, CallTarget, CallUnanswered, CallUnreachable
 
 log = logging.getLogger("hotline-ios.ring.sip")
+
+AnswerHandler = Callable[[str, "socket.socket | None", bytes, bytes], None]
+"""What runs when he picks up: the whole 200 OK (SDP included), the media
+socket the offer advertised, and the master key and salt from our own offer --
+which encrypt what we send, never what he sends. See `media/voicecall.py`."""
 
 DEFAULT_REALM = "sip.linphone.org"
 RING_CODES = (180, 183)
@@ -161,7 +167,7 @@ class SipTransport:
         peer: str | None = None,
         transport: str | None = None,
         port: int | None = None,
-        on_answer: object | None = None,
+        on_answer: AnswerHandler | None = None,
     ) -> None:
         self.user = user or os.environ.get("SIP_USER", "")
         self.password = password or os.environ.get("SIP_PASSWORD", "")
@@ -196,7 +202,21 @@ class SipTransport:
         # SIP_MEDIA_HOST overrides it with an address reachable from his phone
         # wherever it is -- in practice archserver's tailnet address.
         self.media_host = os.environ.get("SIP_MEDIA_HOST", "")
+        if not self.media_host:
+            # Not fatal, and not silent either. An empty value offers the SIP
+            # socket's own LAN address as the audio endpoint, which only works
+            # if his phone is on the same wifi -- and there is no ICE here, so
+            # nothing else notices. That is precisely the shape of the call he
+            # answered on 2026-09-09 at 15:44:57Z and heard nothing on.
+            log.warning(
+                "SIP_MEDIA_HOST is unset: the SDP will offer this box's local "
+                "address, which is unroutable from his phone unless it is on the "
+                "same network. An answered call will connect and be silent."
+            )
         self._buffer = b""
+        # Set when the far end ends the dialog first, so `_finish_answered` does
+        # not send a BYE to a call that is already gone.
+        self._dialog_over = False
 
     async def start(self) -> None:
         if not (self.user and self.password and self.peer):
@@ -289,6 +309,78 @@ class SipTransport:
         message = self._buffer[:total].decode("utf-8", errors="replace")
         self._buffer = self._buffer[total:]
         return message
+
+    def far_end_hung_up(self) -> bool:
+        """True once he has ended the call from his side.
+
+        An answered call is held open by whatever `on_answer` is doing, and
+        nothing in that path reads the SIP socket -- so a BYE from his phone sits
+        unread and the conversation keeps talking to a handset that hung up
+        thirty seconds ago. This is the check that stops that, and it is polled
+        rather than waited on: the media thread owns the clock, and blocking here
+        for a message that may never come would stall the turn instead.
+
+        It reads only what has already arrived, answers a BYE with the 200 OK
+        the far end is waiting for, and remembers that the dialog is finished.
+        Anything else on the socket is left alone -- a retransmitted 200, a
+        re-INVITE -- because none of it changes whether the call is up, and
+        guessing at it here would be a second SIP state machine beside the one
+        that already works.
+        """
+        sock = self._sock
+        if self._dialog_over:
+            return True
+        if sock is None:
+            return True
+        try:
+            sock.settimeout(0.0)
+            while True:
+                chunk = sock.recv(65535)
+                if not chunk:
+                    # The far end closed the connection under us. There is no
+                    # call left either way.
+                    self._dialog_over = True
+                    return True
+                self._buffer += chunk
+        except (BlockingIOError, TimeoutError):
+            pass
+        except ssl.SSLWantReadError:
+            pass
+        except OSError:
+            self._dialog_over = True
+            return True
+
+        while True:
+            message = self._take_message()
+            if message is None:
+                break
+            if message.upper().startswith("BYE "):
+                log.info("sip: the far end hung up")
+                self._respond_200(sock, message)
+                self._dialog_over = True
+            else:
+                log.debug("sip: ignoring an in-dialog message: %s",
+                          message.split("\r\n", 1)[0])
+        return self._dialog_over
+
+    def _respond_200(self, sock: socket.socket, request: str) -> None:
+        """Answer an in-dialog request by echoing the headers it must carry.
+
+        A response is built from the request rather than from our own dialog
+        state on purpose: the far end matches it on Via, From, To, Call-ID and
+        CSeq exactly as it sent them, and reconstructing those from our side is
+        a chance to get one of them subtly wrong for no benefit.
+        """
+        echoed = [
+            line for line in request.split("\r\n")
+            if line.split(":", 1)[0].strip().lower()
+            in ("via", "from", "to", "call-id", "cseq")
+        ]
+        message = "\r\n".join(
+            ["SIP/2.0 200 OK", *echoed, "Content-Length: 0"]
+        ) + "\r\n\r\n"
+        with contextlib.suppress(OSError):
+            self._send(sock, message)
 
     # ---- messages --------------------------------------------------------
 
@@ -436,6 +528,7 @@ class SipTransport:
             raise CallUnreachable(f"cannot reach {self.domain}:{self.port}: {exc}") from exc
 
         call_id = uuid.uuid4().hex
+        self._dialog_over = False
         self._authenticate_register(sock, call_id)
         self._invite_and_watch(sock, call_id, timeout)
 
@@ -561,7 +654,11 @@ class SipTransport:
                 self.on_answer(reply, self._media, self._srtp_key, self._srtp_salt)
             except Exception:
                 log.exception("sip: the answered-call handler raised; hanging up")
-        signal("BYE", cseq + 1)
+        # Only if the dialog is still ours to end. When he hung up first,
+        # `far_end_hung_up` has already answered his BYE with a 200 and sending
+        # our own would be a BYE for a dialog that no longer exists.
+        if not self._dialog_over:
+            signal("BYE", cseq + 1)
 
     def _cancel(self, sock: socket.socket, call_id: str, from_tag: str, cseq: int) -> None:
         """Stop it ringing. He is already reading the question in the app."""
