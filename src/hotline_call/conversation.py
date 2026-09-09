@@ -216,7 +216,8 @@ class AnsweredCall:
             if self.recorder is not None:
                 self.recording = self.recorder.finish(
                     call.recorded(), self.stats, ended=self.ended,
-                    outbound=call.recorded_outbound())
+                    outbound=call.recorded_outbound(),
+                    inbound_at=call.inbound_clock())
             log.info("call ended (%s) after %d turn(s): %s",
                      self.ended, self.turns, self.stats)
 

@@ -73,13 +73,20 @@ class Recorder:
         log.info("recorded turn %d: %.1fs -> %s", index, len(wire) / WIRE_RATE, name)
 
     def finish(self, wire: bytes, stats: dict | None = None, ended: str = "",
-               outbound: bytes = b"") -> str:
+               outbound: bytes = b"", inbound_at: list[int] | None = None) -> str:
         """Both streams and a manifest. Returns where it went.
 
         `outbound.wav` is what WE sent: gapless, 50 frames a second, and the
         only way to tell his voice arriving over ours from our own voice coming
         back off his handset. Those want opposite handling and look identical
-        from the inbound side alone."""
+        from the inbound side alone.
+
+        `alignment.json` is what makes the two comparable -- one outbound frame
+        index per inbound frame. His phone suppresses silence, so inbound frame
+        *i* is not the same instant as outbound frame *i*, and the first version
+        of the analyser sliced one by the other's indices and would have compared
+        unrelated audio.
+        """
         try:
             if wire:
                 self._write(self.directory / "inbound.wav", wire)
@@ -97,6 +104,13 @@ class Recorder:
             }
             (self.directory / "manifest.json").write_text(
                 json.dumps(manifest, indent=2, ensure_ascii=False))
+            if inbound_at:
+                # Its own file, not the manifest: it is one integer per inbound
+                # frame -- thousands of them -- and a manifest nobody can read is
+                # a manifest nobody reads.
+                (self.directory / "alignment.json").write_text(json.dumps(
+                    {"outbound_frame_per_inbound_frame": inbound_at,
+                     "frame_ms": 20, "rate": WIRE_RATE}))
         except OSError as exc:
             self.failed = f"{type(exc).__name__}: {exc}"
             log.error("could not finish the recording: %s", self.failed)

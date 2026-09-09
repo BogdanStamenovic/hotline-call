@@ -381,6 +381,15 @@ class VoiceCall:
             return b""
         return b"".join(self.pump.wire_out)
 
+    def inbound_clock(self) -> list[int]:
+        """For each inbound frame, which outbound frame we were on when it arrived.
+
+        The whole alignment, not just the per-turn ends. Without it the two
+        recordings cannot be put on one timebase at all: inbound has his phone's
+        silence-suppression gaps, so inbound frame *i* is not outbound frame *i*
+        and slicing one by the other's indices is meaningless."""
+        return list(self.pump.wire_at)
+
     def outbound_at(self, cursor: int) -> int:
         """Which outbound frame we were on when inbound frame `cursor` arrived.
 
