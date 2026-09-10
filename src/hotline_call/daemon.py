@@ -662,8 +662,14 @@ class Service:
 
         agent = None
         if os.environ.get("HOTLINE_IOS_CALL_SESSION", "1") != "0":
+            # The calling agent's own briefing goes in FIRST and is labelled as
+            # the authority, because it is current and this file is not: nothing
+            # regenerates call_context.txt and it is dated in its own first line.
+            brief = target.context.strip()
             agent = CallAgent(default_context(
-                f"THIS CALL: {target.caller_id} rang him to ask -- {target.reason}\n"
+                (f"WHAT THE CALLING AGENT WANTS YOU TO KNOW -- this is current and\n"
+                 f"outranks anything above it that disagrees:\n{brief}\n\n" if brief else "")
+                + f"THIS CALL: {target.caller_id} rang him to ask -- {target.reason}\n"
                 "He has just been asked that and is answering it out loud. His first\n"
                 "answer goes back to the agent that rang; anything after it is yours."
             ))
@@ -710,6 +716,7 @@ class Service:
             agent=str(agent) if agent else None,
             reason=reason,
             caller_id=str(body.get("source", "Claude")),
+            context=str(body.get("context", "")),
         )
         ring_timeout = float(body.get("ring_timeout", 45.0))
         reply_timeout = float(body.get("timeout", 900.0))

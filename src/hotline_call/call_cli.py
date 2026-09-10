@@ -64,7 +64,12 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Ring Bogdan's iPhone and wait for him to answer, out loud.",
     )
     parser.add_argument("reason", nargs="*", help="what you need from him, in one or two sentences")
-    parser.add_argument("--context", default="", help="extra detail, shown on the call screen")
+    parser.add_argument("--context", default="",
+                        help="what the voice on the phone needs to know: what you are "
+                             "doing, what you already found, what you need from him. "
+                             "It briefs the Sonnet that talks to him AND is shown on "
+                             "the call screen. Give it everything -- it knows nothing "
+                             "about your work otherwise")
     parser.add_argument("--source", default="an agent", help="who is calling, e.g. 'the ios build'")
     parser.add_argument(
         "--agent",

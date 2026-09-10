@@ -84,6 +84,17 @@ class CallTarget:
     agent: str | None = None
     reason: str = ""
     caller_id: str = "Claude"
+    context: str = ""
+    """What the CALLING agent knows and the voice on the phone needs.
+
+    His design, 2026-09-10: *"an agent can do hotline-call --speak and then give
+    the spawned sonnet the context it needs. Everything it needs. And then sonnet
+    talks with me. And relays info back to the agent."*
+
+    Before this existed, `--context` was appended to the app conversation for him
+    to READ and never reached the model at all -- the voice that rang him knew
+    only a one-line reason, so it could ask his question and then not discuss it.
+    """
     metadata: dict[str, str] = field(default_factory=dict)
 
 
