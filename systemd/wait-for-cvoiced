@@ -1,0 +1,28 @@
+#!/bin/sh
+# Bounded wait for cvoiced to have its model on the GPU.
+#
+# Why: on a cold boot hotline-ios.service starts one second BEFORE
+# cvoiced.service (15:03:57 vs 15:03:58, 2026-09-10) and cvoiced then spends
+# ~30 s loading. build_voice() health-probes cvoiced exactly once, at
+# construction; that probe fails, `speaker` stays None, `can_talk` is False for
+# the life of the process, and the phone rings him and cannot talk. /health
+# reports it honestly and nothing retries.
+#
+# The wait is bounded and this script always exits 0. A hard dependency would
+# mean no doorbell at all whenever TTS is broken, and a silent doorbell is
+# strictly worse than a mute one -- see the Restart= note in the unit.
+# cvoiced binds ONLY the tailnet address (ss: LISTEN 100.72.2.62:8760), never loopback,
+# and Voice() targets that same base URL -- so probe it, not 127.0.0.1. At boot
+# the address may not exist yet; curl simply fails and we keep polling.
+deadline=${1:-90}
+i=0
+while [ "$i" -lt "$deadline" ]; do
+    if curl -sf --max-time 2 http://100.72.2.62:8760/status 2>/dev/null | grep -q model_loaded..true; then
+        echo "wait-for-cvoiced: ready after ${i}s"
+        exit 0
+    fi
+    i=$((i + 1))
+    sleep 1
+done
+echo "wait-for-cvoiced: not ready after ${deadline}s; starting mute" >&2
+exit 0
