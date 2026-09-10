@@ -30,6 +30,42 @@ import time
 log = logging.getLogger("hotline-ios.callagent")
 
 DEFAULT_CWD = os.environ.get("HOTLINE_CWD", "/home/bodas/data")
+# His instruction, 2026-09-10 18:48Z: "somnets either way must be read only. As
+# they should relay the answere back to the original session. Thats the whole
+# point. The big opus session acts on it not the sonnets."
+#
+# This is not only a safety rail, it is the architecture: the call agent SAYS
+# things, the session that owns the work DOES them. Before this, the call ran
+# `claude -p` with no restriction at all, cwd /home/bodas/data, and its own
+# manners told it to run commands -- so a voice on a phone line, driven by a
+# transcript that is about a third wrong, could push, delete or restart things.
+#
+# Why these three flags rather than a deny-list:
+#   --tools              an ALLOW-list from the built-in set. No Bash, no Write,
+#                        no Edit, no WebFetch. A deny-list has to stay correct
+#                        forever; this one cannot be wrong by omission.
+#   --restricted         ignores user/project/local settings, so a broad allow
+#                        rule in settings.json cannot leak in, confines the file
+#                        tools to the working directory, and refuses
+#                        bypassPermissions outright.
+#   --permission-prompts anything that would prompt is DENIED rather than
+#     none               waiting for an answer. On a live call a prompt nobody
+#                        can see is a silent phone line, which is the failure
+#                        this whole path exists to end.
+#
+# Verified on 2026-09-10 rather than assumed: asked to write a file it answered
+# "the Write tool is disabled for this session" and no file appeared; asked to
+# run `touch` it answered that it has no shell tool and no file appeared; asked
+# to read a file it returned the exact contents in 4.1 s over two turns. Reading
+# still works, which matters -- an agent that cannot look anything up cannot
+# answer a question about the build.
+# `--tools` takes a VARIADIC value, so it must be written in the `=` form and
+# never as two argv entries: `--tools Read,Grep,Glob "his sentence"` makes the
+# argument parser swallow the sentence as another tool name, and claude exits
+# with "Input must be provided either through stdin or as a prompt argument".
+# That is a silent mute call, not a crash you would notice in a test.
+READ_ONLY = ("--tools=Read,Grep,Glob", "--restricted", "--permission-prompts", "none")
+
 OPEN_TIMEOUT = 180.0
 TURN_TIMEOUT = 120.0
 
@@ -45,9 +81,13 @@ RULES, all of them about being audible rather than readable:
 character. If you must name a file, say it the way a person would.
 - Serbian, with proper diacritics (ć, č, š, ž, đ as the real characters) -- the \
 TTS mispronounces stripped ASCII.
-- If you need to run a command or check something before you can answer, your \
-FIRST words must say so: "Samo sekund, da proverim." Then check, then answer. \
-Never go silent while you work.
+- You can LOOK THINGS UP -- read files and search them -- and nothing else. You \
+cannot run commands and you cannot change anything, by design. If you need to \
+look something up before answering, your FIRST words must say so: "Samo sekund, \
+da proverim." Then look, then answer. Never go silent while you work.
+- If he asks for something to be DONE rather than answered, do not promise to do \
+it yourself and do not pretend it is done. Say it is being passed on -- "Vazi, \
+prosledjujem" -- and answer anything you can answer from reading.
 - Numbers and technical terms: say them as a person would speak them.
 - If you did not understand him, say so and ask him to repeat.
 - If he says goodbye, say a short goodbye back and nothing else.
@@ -73,13 +113,22 @@ class CallAgent:
         self.failed = ""
 
     def _run(self, prompt: str, timeout: float) -> str:
-        command = ["claude", "-p", "--model", self.model, "--output-format", "json"]
+        command = ["claude", "-p", "--model", self.model, "--output-format", "json",
+                   *READ_ONLY]
         if self.session:
             command += ["--resume", self.session]
         command.append(prompt)
         # check=False: a non-zero exit is reported with its stderr below, which
         # is what the caller can actually say out loud.
+        # stdin=DEVNULL is not tidiness. `claude -p` READS STDIN as extra input
+        # when there is any, and subprocess inherits the parent's. On
+        # 2026-09-10 a test harness ran this from a shell heredoc and the call
+        # agent silently answered the leftover heredoc text instead of his
+        # sentence -- in English, about source code, mid-"phone call". Under
+        # systemd stdin is already null, so the daemon never showed it; anything
+        # else driving a call would.
         proc = subprocess.run(command, capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL,
                               timeout=timeout, cwd=self.cwd, check=False)
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.strip()[:200] or "claude exited nonzero")
