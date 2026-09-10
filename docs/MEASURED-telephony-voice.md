@@ -69,6 +69,42 @@ difference either way** and neither did the original claim.
   from 100.0% to 49.4% once its script is folded, and it is the best of the
   small models on content. Judged on the raw column it looks like a failure.
 
+## Both calls together: 166 words, and the top two are indistinguishable
+
+Every model re-run on the 01:41 call and scored against its own reference, then
+summed with the 22:59 call. Same tool, same three columns; `translit` shown.
+
+| model | 22:59 | 01:41 | **combined** | errors / words | VRAM | median/turn |
+|---|---|---|---|---|---|---|
+| `large-v3` | 37.3% | 38.6% | **38.0%** | 63/166 | 2005 MiB | 0.35 s |
+| `large-v3` live, chunked | 38.6% | 37.3% | **38.0%** | 63/166 | 2005 MiB | — |
+| `sam8000-turbo-serbian` | 42.2% | 38.6% | **40.4%** | 67/166 | **1173 MiB** | **0.22 s** |
+| `drishtisharma-medium-serbian` | 49.4% | 51.8% | 50.6% | 84/166 | 1077 MiB | 0.23 s |
+| `samil24-small-serbian` | 57.8% | 47.0% | 52.4% | 87/166 | 469 MiB | 0.11 s |
+| `medium` | 51.8% | 62.7% | 57.2% | 95/166 | 1109 MiB | 0.22 s |
+| `small` | 77.1% | 57.8% | 67.5% | 112/166 | 469 MiB | 0.11 s |
+
+**Doubling the reference did not separate the top two; it brought them closer.**
+`large-v3` leads `sam8000-turbo-serbian` by 2.4 points, which is **four word
+errors out of 166**, and on the second call they tie exactly at 38.6%. The
+earlier "four to five points, consistent in direction across six runs" reading
+does not survive the extra data: the direction is no longer consistent.
+
+The honest recommendation is therefore not "large-v3 wins":
+
+- **They are indistinguishable at this sample size.** `large-v3` is the incumbent
+  and there is no evidence for changing, which is a different statement from
+  evidence that it is better.
+- **`sam8000-turbo-serbian` costs four word errors on 166 and frees 832 MiB and
+  0.13 s a turn.** If the GPU is ever needed for something else, that is a cheap
+  trade and this table is the reason to reach for it rather than for `medium`.
+- **Chunking as he talks is free**, now confirmed on double the data: the live
+  chunked path and the whole-file path both score exactly 63/166. It costs no
+  accuracy and moves nearly all the recognition time under his own speech.
+
+Settling the top two would need a reference where four errors is not the margin —
+on the order of a thousand words, which is roughly ten more calls of this length.
+
 ## Two thirds of those errors are not the model's fault
 
 **Six of his nine turns begin mid-word.** Measured on the recorded audio: the
@@ -218,9 +254,10 @@ is how that rule was finally shown to be impossible rather than merely untuned.
 
 ## What these numbers cannot tell you
 
-- **83 reference words.** The gap between the top two models is about four word
-  errors, and swapping one defensible scoring rule for another already reversed
-  their order once. It is not significant, and neither is any other gap under
+- **166 reference words across two calls**, and the top two are still four word
+  errors apart. Swapping one defensible scoring rule for another reversed their
+  order once already, and doubling the sample moved them closer together rather
+  than further apart. Treat any gap under about ten points here as unmeasured. It is not significant, and neither is any other gap under
   roughly 10 points here. Ranking the top two would need on the order of a
   thousand reference words — about ten more calls of this length.
 - **One call, one handset, one network path, one speaker.** Nothing here
