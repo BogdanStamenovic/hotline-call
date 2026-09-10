@@ -208,6 +208,51 @@ down while it runs. On-demand loading above makes that a scheduling question
 rather than a conflict. Profiled on this exact GPU with Qwen2.5-1.5B: 500 tok/s,
 628 with a paged optimiser.
 
+### MEASURED, 2026-09-11: the finetune is WORSE than the base model
+
+Trained and evaluated. Qwen2.5-1.5B-Instruct, LoRA r=16 on 977 pairs, 3 epochs,
+316 s on the 4060 alongside a resident cvoice. Eval loss fell 1.153 -> 0.797 ->
+0.737, so it learned *something*. What it learned was the corpus, not the task.
+
+| model | set | token F1 | first-3-words | median latency |
+|---|---|---|---|---|
+| base | val (109, in-distribution) | 0.074 | 0/109 | 152 ms |
+| **LoRA** | val (109, in-distribution) | **0.300** | **18/109** | 363 ms |
+| base | **real spoken (4)** | **0.332** | 0/4 | 232 ms |
+| **LoRA** | **real spoken (4)** | **0.041** | 0/4 | 442 ms |
+
+**On its own val set the finetune is four times better than the base. On the
+only real data, it is eight times worse.** It has memorised his topics and
+recites them regardless of what was said:
+
+    partial : "Now all the"
+    truth   : "commands are working properly."
+    LoRA    : "agents are dead except hotline-ac. So i join the channel and
+               say spawn agent hotline-b..."
+
+The base model, given *"I'm very scared right now."*, answered *"because I don't
+know what to do."* against a truth of *"I don't know what to do."* That is why it
+scores 0.33 and the finetune does not.
+
+**Do not deploy this adapter.** The base model is better at the actual job.
+
+**Two honest caveats on that verdict.** n=4 is a smoke test, not an evaluation —
+the direction is supported by the qualitative failure (jargon regurgitation),
+not by the sample size. And three of those four utterances are *off-topic*
+relative to a corpus that is entirely work talk, so some of the gap is topic
+mismatch rather than pure overfitting. That mismatch is itself the finding: his
+real speech is not all shop talk, and the corpus is.
+
+**Latency also fails.** The spec budgets < 200 ms for the predictor. The LoRA
+runs at 363-442 ms and even the base at 152-232 ms, on a card shared with
+cvoice. A 1.5B generating 40 tokens is not a 200 ms component.
+
+**What this changes.** The corpus, not the method, is the blocker — 362 distinct
+utterances, half of them written by a model, none of them actually him speaking.
+So: build the no-model prototype first (fire generation early on the partial,
+cancel on contradiction — it needs no predictor at all), and log every real call
+transcript from now on so a corpus accumulates that is actually his speech.
+
 **The eval does not exist.** Four held-out utterances are a smoke test. A real
 eval needs accumulated real calls, which means logging every call transcript
 starting now so the set builds itself.
