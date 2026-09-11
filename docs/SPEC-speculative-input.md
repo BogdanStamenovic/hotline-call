@@ -133,10 +133,23 @@ Both already load lazily; **neither unloads**. Measured 2026-09-10:
 together are under ten. `CallAgent.start()` already seeds during the ring for
 exactly this reason. Unload at call end.
 
-**A live bug this fixes:** because `Ears.load()` is called from `transcribe()`,
-that 4.78 s is currently paid **in the middle of his first sentence** on the
-first call after any restart. Every call so far has had a warm daemon, so nobody
-has heard it.
+**CORRECTION, 2026-09-11.** An earlier version of this section claimed the
+4.78 s was paid in the middle of his first sentence, because `Ears.load()` is
+called from `transcribe()`. **That was wrong.** `daemon.py:3058` warms the
+transcriber at startup on purpose -- *"Paid now rather than in the first three
+seconds of a call he has just answered"* -- so the load has always happened
+before the phone ever rings. The mistake was reading one call site and not
+grepping for the others.
+
+What is actually true is the thing he objected to: **both models are resident
+from boot whether or not a call ever happens.** Verified by the numbers rather
+than by reading: a freshly restarted daemon holds **1,918 MiB** with no call in
+progress, and cvoiced holds **2,716 MiB** beside it. That 4.6 GB sat idle for six
+hours after the 17:45 call and then **OOMed a training run** at 02:24.
+
+So on-demand loading is a smaller change than it looked: the warm-up already
+exists and is already asynchronous. Move it from process start to ring, and add
+the unload at call end that has never existed.
 
 For inbound calls there is no ring to hide behind, but we choose when to send
 the 200 OK — it rings two or three seconds longer while loading.
