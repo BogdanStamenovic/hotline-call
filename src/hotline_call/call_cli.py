@@ -210,7 +210,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     log(f"{outcome.state} after {outcome.waited_seconds:.0f}s via {outcome.transport}")
 
     if outcome.state == "answered":
-        print(outcome.reply)
+        # One turn prints bare, so `answer=$(hotline-call ...)` is unchanged for
+        # every caller that only asked a question. A real conversation prints
+        # labelled, because handing an agent an unattributed wall of both sides
+        # is how it ends up answering its own words back to him.
+        turns = outcome.transcript or []
+        if len(turns) > 1:
+            for turn in turns:
+                who = "him" if turn.get("who") == "you" else "voice"
+                print(f"{who}: {turn.get('text', '')}")
+        else:
+            print(outcome.reply)
         return EXIT_ANSWERED
     if outcome.state == "declined":
         # Not a fallback case. He saw it and said not now; ringing him again

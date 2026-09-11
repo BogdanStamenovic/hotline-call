@@ -803,3 +803,68 @@ async def test_a_handler_that_cannot_be_built_still_lets_the_phone_ring():
     assert body["state"] == "ringing"
     assert inner.during_ring is None
     assert inner.ringing.is_set(), "the phone must still have rung"
+
+
+def test_await_transcript_returns_both_sides_and_stops_when_the_call_ends() -> None:
+    """His instruction, 2026-09-11: "It should get the whole convo."
+
+    The daemon used to hand back only the first thing he said. Everything after
+    it was written into the conversation and never returned, so an agent that
+    rang to have a conversation got one sentence of it.
+    """
+    import asyncio
+
+    from hotline_ios.daemon import Service
+    from hotline_ios.events import EventLog
+    from hotline_ios.ring.loopback import LoopbackTransport
+
+    class Spoken:
+        turns = 2
+        ended = "not started"
+
+    service = Service(LoopbackTransport(), pool=None)
+    events = EventLog()
+    spoken = Spoken()
+
+    async def drive() -> list[dict[str, str]]:
+        async def talk() -> None:
+            await asyncio.sleep(0.05)
+            events.append("you", "da, radi")
+            events.append("claude", "vazi, prosledjujem")
+            events.append("state", "ignored")     # not a side of the conversation
+            await asyncio.sleep(0.05)
+            events.append("you", "to je sve")
+            # Terminal path sets `ended`; until then the sentinel means live.
+            spoken.ended = "he said goodbye"
+
+        task = asyncio.ensure_future(talk())
+        got = await service._await_transcript(events, 5.0, 0, spoken)
+        await task
+        return got
+
+    turns = asyncio.run(drive())
+    assert [t["text"] for t in turns] == ["da, radi", "vazi, prosledjujem", "to je sve"]
+    assert [t["who"] for t in turns] == ["you", "claude", "you"]
+
+
+def test_await_transcript_gives_up_at_the_deadline_if_the_call_never_ends() -> None:
+    """A call that never reports an end must not hold the caller past its timeout."""
+    import asyncio
+    import time
+
+    from hotline_ios.daemon import Service
+    from hotline_ios.events import EventLog
+    from hotline_ios.ring.loopback import LoopbackTransport
+
+    class Spoken:
+        turns = 1
+        ended = "not started"
+
+    service = Service(LoopbackTransport(), pool=None)
+    events = EventLog()
+    events.append("you", "samo jedna rec")
+
+    began = time.monotonic()
+    turns = asyncio.run(service._await_transcript(events, 0.4, 0, Spoken()))
+    assert [t["text"] for t in turns] == ["samo jedna rec"]
+    assert time.monotonic() - began < 3.0

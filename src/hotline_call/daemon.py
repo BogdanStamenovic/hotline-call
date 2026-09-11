@@ -784,7 +784,17 @@ class Service:
             return self._outcome(conversation, "unanswered", began,
                                  f"rang, but nothing came back within {reply_timeout:.0f}s",
                                  transport=doorbell)
-        return self._outcome(conversation, "answered", began, "", reply, transport=doorbell)
+        transcript: list[dict[str, str]] = [{"who": "you", "text": reply}]
+        turns_spoken = int(getattr(spoken, "turns", 0) or 0)
+        if spoken is not None and turns_spoken:
+            # He is on the line. Wait out the call and hand back all of it; the
+            # first turn is already in `reply` for anything that only wants that.
+            left = max(0.0, reply_timeout - (time.monotonic() - began))
+            whole = await self._await_transcript(events, left, cursor, spoken)
+            if whole:
+                transcript = whole
+        return self._outcome(conversation, "answered", began, "", reply,
+                             transport=doorbell, transcript=transcript)
 
     async def _await_reply(self, events: EventLog, timeout: float,
                            cursor: int | None = None) -> str:
@@ -806,6 +816,37 @@ class Service:
             if events.closed:
                 break
         return ""
+
+    async def _await_transcript(self, events: EventLog, timeout: float, cursor: int,
+                                spoken: Any) -> list[dict[str, str]]:
+        """Everything he said on the call, not only the answer to the question.
+
+        His instruction, 2026-09-11: *"It should get the whole convo."* The
+        calling agent rang to have a conversation; returning only the first turn
+        threw the rest away -- it was written into the conversation log and never
+        handed back.
+
+        Two things keep this from blocking a caller that is not on a voice call.
+        It only runs once a spoken turn has actually happened (`spoken.turns`),
+        so a typed answer in the app still returns the instant it lands; and
+        `ended` is the sentinel `"not started"` until a terminal path sets it, so
+        the moment the call finishes -- goodbye, hangup, dead line, length cap --
+        this stops. The caller's own deadline caps it either way.
+        """
+        said: list[dict[str, str]] = []
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            found = await events.wait(cursor, min(5.0, max(0.1, deadline - time.monotonic())))
+            for entry in found:
+                cursor = max(cursor, entry.seq)
+                # Both sides. `client.CallOutcome.transcript` has always been
+                # typed for this and the daemon never filled it, so an agent
+                # asking for the conversation got None.
+                if entry.kind in ("you", "claude"):
+                    said.append({"who": entry.kind, "text": entry.text})
+            if events.closed or getattr(spoken, "ended", "not started") != "not started":
+                break
+        return said
 
     def _registry_record(self, agent: str) -> Any:
         """hotline's registry entry for a name, or None. The one lookup.
@@ -874,6 +915,7 @@ class Service:
         detail: str = "",
         reply: str = "",
         transport: Any = None,
+        transcript: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         used = transport if transport is not None else self.transport
         out: dict[str, Any] = {
@@ -881,6 +923,8 @@ class Service:
             "conversation": call_id,
             "state": state,
             "reply": reply,
+            "transcript": (transcript if transcript is not None
+                           else ([{"who": "you", "text": reply}] if reply else [])),
             "detail": detail,
             "waited_seconds": round(time.monotonic() - began, 1),
             "transport": getattr(used, "name", "?"),
