@@ -1,28 +1,43 @@
 #!/bin/sh
-# Bounded wait for cvoiced to have its model on the GPU.
+# Bounded wait for cvoiced to be REACHABLE before hotline-ios builds its voice.
 #
 # Why: on a cold boot hotline-ios.service starts one second BEFORE
-# cvoiced.service (15:03:57 vs 15:03:58, 2026-09-10) and cvoiced then spends
-# ~30 s loading. build_voice() health-probes cvoiced exactly once, at
-# construction; that probe fails, `speaker` stays None, `can_talk` is False for
-# the life of the process, and the phone rings him and cannot talk. /health
-# reports it honestly and nothing retries.
+# cvoiced.service (15:03:57 vs 15:03:58, 2026-09-10) and cvoiced is not
+# listening yet. build_voice() (daemon.py:2781) constructs Voice() and calls
+# .health() exactly once; if that raises, `speaker` stays None, `can_talk` is
+# False for the life of the process, and the phone rings him and cannot talk.
+# Nothing retries. /health reports it honestly and nobody reads it.
+#
+# WHAT THIS WAITS FOR, and why not model_loaded: build_voice only needs the
+# health call not to raise. It LOGS model_loaded and does nothing with it.
+# cvoiced loads its model lazily -- at idle /status is
+# {"phase":"idle","model_loaded":false} and stays that way until someone asks
+# it to speak. Waiting for model_loaded therefore never returns. The first
+# version of this script did exactly that, and on 2026-09-11 it burned the full
+# 90 s in ExecStartPre every time; systemd's default TimeoutStartSec is also
+# 90 s, so the start job was killed before ExecStart ever ran and hotline-ios
+# restart-looped from 08:00 with no doorbell at all. Its own comment below had
+# the rule right and the condition wrong.
 #
 # The wait is bounded and this script always exits 0. A hard dependency would
 # mean no doorbell at all whenever TTS is broken, and a silent doorbell is
 # strictly worse than a mute one -- see the Restart= note in the unit.
-# cvoiced binds ONLY the tailnet address (ss: LISTEN 100.72.2.62:8760), never loopback,
-# and Voice() targets that same base URL -- so probe it, not 127.0.0.1. At boot
-# the address may not exist yet; curl simply fails and we keep polling.
-deadline=${1:-90}
+# cvoiced binds ONLY the tailnet address (ss: LISTEN 100.72.2.62:8760), never
+# loopback, and Voice() targets that same base URL -- so probe it, not
+# 127.0.0.1. At boot the address may not exist yet; curl simply fails and we
+# keep polling.
+#
+# Keep the default well under the unit's TimeoutStartSec or the timeout kills
+# the start job instead of letting the daemon come up mute.
+deadline=${1:-60}
 i=0
 while [ "$i" -lt "$deadline" ]; do
-    if curl -sf --max-time 2 http://100.72.2.62:8760/status 2>/dev/null | grep -q model_loaded..true; then
-        echo "wait-for-cvoiced: ready after ${i}s"
+    if curl -sf --max-time 2 http://100.72.2.62:8760/status >/dev/null 2>&1; then
+        echo "wait-for-cvoiced: reachable after ${i}s"
         exit 0
     fi
     i=$((i + 1))
     sleep 1
 done
-echo "wait-for-cvoiced: not ready after ${deadline}s; starting mute" >&2
+echo "wait-for-cvoiced: unreachable after ${deadline}s; starting mute" >&2
 exit 0
