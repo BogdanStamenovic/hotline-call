@@ -304,6 +304,47 @@ So: build the no-model prototype first (fire generation early on the partial,
 cancel on contradiction — it needs no predictor at all), and log every real call
 transcript from now on so a corpus accumulates that is actually his speech.
 
+### MEASURED, three corpora, 2026-09-11
+
+Same base model, same LoRA recipe, same scoring. The only thing that changes is
+what the model is given alongside the words.
+
+| corpus | what it conditions on | val F1 base / LoRA | val first-3 LoRA | **real-spoken F1 base / LoRA** | **real first-3** |
+|---|---|---|---|---|---|
+| v1 | nothing | 0.074 / **0.300** | 18/109 | **0.332 / 0.041** | 0/4 |
+| v2 | prose brief | 0.110 / 0.215 | 11/122 | 0.123 / 0.113 | 0/4 |
+| v3 | tags + affected + last exchange | 0.098 / 0.214 | 9/118 | 0.079 / 0.090 | 0/4 |
+
+**What context fixed.** v1's finetune was **eight times worse than the model it
+started from** on real speech, because with nothing to condition on the only
+learnable signal was his vocabulary. v2 and v3 are level with their base
+(0.113 vs 0.123; 0.090 vs 0.079). **The collapse is gone.** That is a real
+result and it is his diagnosis being right.
+
+**What context did not fix.** Nothing improved in absolute terms, and **v3 is
+indistinguishable from v2** — tags, affected things and the previous exchange did
+not beat five lines of prose at this corpus size. If the tags help, 393 distinct
+utterances is not enough to show it.
+
+**The number that decides the feature is zero, everywhere.** `first-3` is whether
+the model got the opening three words right, which is the only thing that lets an
+answer start early. On real speech it is **0/4 in every configuration**, trained
+or untrained, with context or without.
+
+**Do not read v1's 0.332 as a win.** Base-without-context answers generically,
+and three of the four real utterances are generic sentences — *"I don't know what
+to do"*. The smoke set rewards genericity, so it systematically flatters the
+configuration that has the least information. **n=4.** It is a smoke test whose
+bias now has a name.
+
+**Latency still misses.** v3 runs 421-531 ms against a 200 ms budget.
+
+**Conclusion: the corpus is the blocker, and it is not a tuning problem.** Three
+architectures on 393 distinct utterances, 4 of which are really him speaking.
+Build the no-model prototype -- fire the real turn early on the partial and
+cancel on contradiction, needing no predictor -- and log every real call
+transcript from now on so an eval set exists to beat.
+
 **The eval does not exist.** Four held-out utterances are a smoke test. A real
 eval needs accumulated real calls, which means logging every call transcript
 starting now so the set builds itself.
