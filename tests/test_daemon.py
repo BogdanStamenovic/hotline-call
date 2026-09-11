@@ -7,6 +7,7 @@ would assert nothing. The skip is loud.
 
 import asyncio
 import json
+import time
 import urllib.error
 import urllib.request
 
@@ -868,3 +869,111 @@ def test_await_transcript_gives_up_at_the_deadline_if_the_call_never_ends() -> N
     turns = asyncio.run(service._await_transcript(events, 0.4, 0, Spoken()))
     assert [t["text"] for t in turns] == ["samo jedna rec"]
     assert time.monotonic() - began < 3.0
+
+
+# -- on-demand models -----------------------------------------------------
+# His rule, 2026-09-11: "nothing should be loaded prematurely. Everything
+# should be loaded on demand. If an agent does hotline call then everything
+# needed gets loaded and then the call made. After the call is done then
+# everything unloaded."
+
+
+class CountingModel:
+    """A transcriber/speaker that records its own load/unload calls."""
+
+    def __init__(self) -> None:
+        self.loads = 0
+        self.unloads = 0
+
+    def load(self) -> None:
+        self.loads += 1
+
+    def unload(self) -> bool:
+        self.unloads += 1
+        return True
+
+    def synthesize(self, text):
+        import numpy as np
+
+        return np.zeros(8, dtype="float32")
+
+    def transcribe(self, audio) -> str:
+        return ""
+
+
+def _settle(service, want: int, field: str) -> None:
+    """Wait for the warm/cool threads, which are deliberately off the loop."""
+    for _ in range(200):
+        if getattr(service.transcriber, field) >= want:
+            return
+        time.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_a_ring_loads_the_models_and_the_end_of_the_call_unloads_them():
+    """The whole of his instruction in one pass: nothing is loaded until a call
+    needs it, and it is dropped when the call is over."""
+    ears, voice = CountingModel(), CountingModel()
+    service = Service(ConfirmedRing(HoldsCalls(), confirm_within=1.0), FakePool(),
+                      transcriber=ears, speaker=voice)
+
+    assert ears.loads == 0 and voice.loads == 0, "constructing a Service must load nothing"
+
+    await service.place({"reason": "status", "wait": False})
+
+    _settle(service, 1, "loads")
+    assert ears.loads == 1 and voice.loads == 1, "the ring must warm both halves"
+    _settle(service, 1, "unloads")
+    assert ears.unloads == 1 and voice.unloads == 1, "the end of the call must drop both"
+
+
+@pytest.mark.asyncio
+async def test_a_second_call_does_not_unload_the_models_under_the_first():
+    """Two agents can ring him in the same minute. Unloading when the first one
+    finishes would pull `large-v3` out from under the second mid-sentence, so
+    the hold is refcounted rather than a bool."""
+    ears, voice = CountingModel(), CountingModel()
+    service = Service(ConfirmedRing(HoldsCalls(), confirm_within=1.0), FakePool(),
+                      transcriber=ears, speaker=voice)
+
+    service._warm_models()
+    service._warm_models()
+    assert service._calls_holding_models == 2
+
+    service._cool_models()
+    assert ears.unloads == 0, "the first call to end must not unload for the second"
+
+    service._cool_models()
+    _settle(service, 1, "unloads")
+    assert ears.unloads == 1 and voice.unloads == 1, "the last one out unloads"
+
+
+@pytest.mark.asyncio
+async def test_a_model_that_will_not_load_costs_the_voice_and_never_the_ring():
+    """Same rule `build_voice` follows: a missing model must cost the voice leg,
+    not the doorbell. A mute call still beats a silent one."""
+    class WillNotLoad(CountingModel):
+        def load(self) -> None:
+            self.loads += 1
+            raise RuntimeError("no cuda today")
+
+    inner = HoldsCalls()
+    ears = WillNotLoad()
+    service = Service(ConfirmedRing(inner, confirm_within=1.0), FakePool(),
+                      transcriber=ears, speaker=CountingModel())
+
+    body = await service.place({"reason": "status", "wait": False})
+    _settle(service, 1, "loads")
+    assert body["state"] == "ringing"
+    assert inner.ringing.is_set(), "the phone must still have rung"
+
+
+@pytest.mark.asyncio
+async def test_a_daemon_with_no_voice_leg_loads_nothing_at_all():
+    """`can_talk` is False, so no call can carry audio and no model is wanted.
+    Warming here would hold 1.9 GB for a doorbell that only ever rings."""
+    ears = CountingModel()
+    service = Service(LoopbackTransport(), FakePool(), transcriber=ears, speaker=None)
+    await service.place({"reason": "status", "wait": False})
+    time.sleep(0.1)
+    assert ears.loads == 0, "a daemon that cannot talk must not load a transcriber"

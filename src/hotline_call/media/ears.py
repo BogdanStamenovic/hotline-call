@@ -36,6 +36,7 @@ phone call is the worse failure.
 from __future__ import annotations
 
 import ctypes
+import gc
 import glob
 import logging
 import os
@@ -143,6 +144,27 @@ class Ears:
             self.model_name = os.environ.get("HOTLINE_IOS_ASR_CPU_MODEL", "small")
             self._model = WhisperModel(self.model_name, device="cpu", compute_type="int8")
         log.info("%r ready in %.1fs", self, time.monotonic() - began)
+
+    def unload(self) -> bool:
+        """Drop the model and hand the VRAM back. Idempotent.
+
+        His rule, 2026-09-11: *"nothing should be loaded prematurely ... after
+        the call is done then everything unloaded."* `large-v3` int8_float16
+        holds 1,918 MiB, and it used to hold it from boot to shutdown whether a
+        call ever happened or not.
+
+        ctranslate2 frees the device memory when the `WhisperModel` is
+        collected, so the drop has to be a real drop -- hence the explicit
+        `gc.collect()` rather than trusting refcounting through faster-whisper's
+        own wrapper objects. Returns whether there was anything to unload, so a
+        caller tearing down after a call need not track who loaded it.
+        """
+        if self._model is None:
+            return False
+        self._model = None
+        gc.collect()
+        log.info("%r unloaded", self)
+        return True
 
     def transcribe(self, audio: np.ndarray) -> str:
         """What he said, or an empty string. Never a guess at silence."""

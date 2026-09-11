@@ -28,6 +28,7 @@ import logging
 import os
 import pathlib
 import sys
+import threading
 import time
 import uuid
 from collections.abc import Sequence
@@ -186,6 +187,11 @@ class Service:
         self.pool = pool
         self.transcriber = transcriber
         self.speaker = speaker
+        # How many calls currently want the models up. Not a bool: two agents
+        # can ring him in the same minute, and the first to hang up must not
+        # unload `large-v3` out from under the second one mid-sentence.
+        self._calls_holding_models = 0
+        self._models_lock = threading.Lock()
         self.allow_ips = allow_ips or set()
         self.api_key = api_key
         self.page_fallback = page_fallback
@@ -584,6 +590,78 @@ class Service:
 
     # ---- giving an answered ring a voice ---------------------------------
 
+    def _warm_models(self) -> None:
+        """Load what an answered call needs, in the background, once.
+
+        Called as the phone starts ringing rather than at startup. His rule,
+        2026-09-11: nothing is loaded until a call needs it, and everything is
+        dropped when the call ends.
+
+        **Why this runs beside the ring instead of before it.** His words were
+        "everything needed gets loaded and then the call made", and taken
+        literally that delays the INVITE by the load. Measured on this box the
+        same day: `large-v3` is 3.5 s and cvoiced is ~7.6 s, so a literal
+        reading makes an urgent call ring about eight seconds late -- against a
+        project whose whole speculative-input effort exists to save three to
+        five. The SIP ring is dead time that already absorbs a 4.7 s CallAgent
+        seed for exactly this reason, so the load hides there instead. If he
+        picks up before it finishes, the first `synthesize` waits rather than
+        the doorbell.
+
+        Failures are logged and swallowed: a model that will not load must cost
+        the voice leg, never the ring. That is the same rule `build_voice`
+        follows and the reason a mute call beats a silent one.
+        """
+        def work() -> None:
+            for name, thing in (("ears", self.transcriber), ("voice", self.speaker)):
+                loader = getattr(thing, "load", None)
+                if loader is None:
+                    continue
+                try:
+                    began = time.monotonic()
+                    loader()
+                    log.info("warmed %s in %.1fs", name, time.monotonic() - began)
+                except Exception:
+                    log.exception("could not warm %s; the call may be mute", name)
+
+        with self._models_lock:
+            self._calls_holding_models += 1
+            if self._calls_holding_models > 1:
+                # Another call already has them up. Loading is idempotent, but
+                # a second thread would serialise behind the first one's lock
+                # for no gain.
+                return
+        threading.Thread(target=work, name="warm-models", daemon=True).start()
+
+    def _cool_models(self) -> None:
+        """Drop the models once the LAST call using them has ended.
+
+        Refcounted because two agents can ring him in the same minute -- the
+        case `_voice_leg` already exists to handle. Unloading on the first call
+        to finish would pull `large-v3` out from under the second one mid-
+        sentence.
+
+        Runs on a thread: `Voice.unload` is an HTTP round trip to cvoiced and
+        this is called from the event loop's `finally`, where blocking would
+        stall every other conversation the daemon is holding.
+        """
+        with self._models_lock:
+            self._calls_holding_models = max(0, self._calls_holding_models - 1)
+            if self._calls_holding_models:
+                return
+
+        def work() -> None:
+            for name, thing in (("ears", self.transcriber), ("voice", self.speaker)):
+                unloader = getattr(thing, "unload", None)
+                if unloader is None:
+                    continue
+                try:
+                    unloader()
+                except Exception:
+                    log.exception("could not unload %s; its memory stays held", name)
+
+        threading.Thread(target=work, name="cool-models", daemon=True).start()
+
     @contextlib.contextmanager
     def _voice_leg(self, doorbell: Any, target: CallTarget, conversation: str) -> Any:
         """Give this one ring a voice, and take it away again afterwards.
@@ -612,8 +690,12 @@ class Service:
             yield None
             return
         if not links:
+            # Nothing can hold an answered call, so nothing will need a model.
             yield None
             return
+        # From here there IS a voice leg, so the models are wanted. Started now,
+        # while it rings; released in the `finally` below, however it ends.
+        self._warm_models()
         restore = [(link, link.on_answer) for link in links]
         for link, handler in zip(links, handlers, strict=True):
             link.on_answer = handler
@@ -625,6 +707,10 @@ class Service:
             # it has nothing to say on and answer it with a stale question.
             for link, was in restore:
                 link.on_answer = was
+            # Same scope, same rule. `on_answer` runs inside `doorbell.ring()`,
+            # so by the time this block runs the call is over -- declined,
+            # unanswered, or hung up -- and nothing needs the GPU any more.
+            self._cool_models()
 
     @property
     def can_talk(self) -> bool:
@@ -3051,12 +3137,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         # the suite.
         poll = asyncio.ensure_future(service.safety_poll())
         poll.add_done_callback(lambda task: task.cancelled() or task.exception())
-        if service.transcriber is not None:
-            # Paid now rather than in the first three seconds of a call he has
-            # just answered. Measured at 0.7 s for `small` on CPU, which is
-            # cheap here and expensive there.
-            warm = asyncio.ensure_future(asyncio.to_thread(service.transcriber.load))
-            warm.add_done_callback(lambda task: task.cancelled() or task.exception())
+        # NOT warmed here. His rule, 2026-09-11: "nothing should be loaded
+        # prematurely ... after the call is done then everything unloaded."
+        # The warm now happens in `_voice_leg`, while the phone is ringing, and
+        # the models are dropped when the call ends. The comment this replaces
+        # justified the startup load with "0.7 s for `small` on CPU" -- true
+        # when written, but the default has since become `large-v3` on CUDA,
+        # which is 1,918 MiB held from boot to shutdown for calls that mostly
+        # never come.
         log.info(
             "hotline-iosd on %s:%d, ring=%s, rings_when_closed=%s",
             args.host, args.port, getattr(transport, "name", "?"),

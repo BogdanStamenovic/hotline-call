@@ -119,6 +119,55 @@ class Voice:
         self.rate = rate
         return audio
 
+    def load(self) -> bool:
+        """Ask cvoiced to warm its model. Never raises.
+
+        The model is in another process, so warming it means asking. Called
+        while the phone is ringing so the ~7.6 s load is not sitting in front of
+        the first word; `synthesize` would otherwise trigger it lazily at
+        exactly the wrong moment.
+
+        A cvoiced without `/load` (404) or one that is down is logged and
+        shrugged off -- `synthesize` still loads it lazily, so the cost is
+        latency on the first sentence, not a mute call. Failing here would turn
+        a warm-up into a dropped ring.
+        """
+        try:
+            payload = self._post("/load", {})
+        except Exception as exc:  # noqa: BLE001 - a cold model still speaks
+            log.info("cvoiced did not pre-load (%s); the first sentence pays for it", exc)
+            return False
+        log.info("cvoiced warm: loaded=%s took=%ss", payload.get("model_loaded"),
+                 payload.get("took_seconds"))
+        return bool(payload.get("model_loaded"))
+
+    def unload(self) -> bool:
+        """Ask cvoiced to hand its VRAM back. Never raises.
+
+        The model lives in another process, so this is the only lever this side
+        has. A cvoiced too old to have `/unload` answers 404 and a stopped one
+        does not answer at all -- both mean "no VRAM was freed", which is worth
+        a log line and never worth failing a call teardown over. The call is
+        already finished by the time anything calls this; raising here would
+        turn a successful call into an error.
+
+        Measured 2026-09-11: this returns 1,464 MiB of the 2,396 cvoiced holds.
+        The remaining ~932 MiB is `omnivoice`'s audio tokenizer, which stays
+        referenced inside the vendor package after a generation, plus the CUDA
+        context (108 MiB measured) and allocator fragmentation. Only a process
+        exit returns that, so do not read a non-zero cvoiced after this as a bug
+        in the unload.
+        """
+        try:
+            payload = self._post("/unload", {})
+        except Exception as exc:  # noqa: BLE001 - teardown must not fail a call
+            log.info("cvoiced did not unload (%s); its VRAM stays held", exc)
+            return False
+        freed = bool(payload.get("unloaded"))
+        log.info("cvoiced unload: freed=%s allocated=%sMiB", freed,
+                 payload.get("allocated_mib"))
+        return freed
+
     # -- the wire ---------------------------------------------------------
 
     def _headers(self) -> dict[str, str]:
