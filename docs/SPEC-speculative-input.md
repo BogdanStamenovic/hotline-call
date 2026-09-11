@@ -185,6 +185,44 @@ For Serbian and for small models there is **no published generation-quality
 benchmark below ~8B on anything resembling this task**. Base-model choice has to
 be settled by our own eval, not by paper credentials nobody has.
 
+## What the predictor is given — the architecture he specified
+
+The v1 finetune failed because it was asked to predict a completion from the
+words alone. His diagnosis, 2026-09-11: *"Of course it was, you tried to make a
+3.5b param model guess intent from thin air."* Then, on the first fix: *"You're
+asking a 3.5b model to do horizontal thinking to say 'hmm yeah this is trained
+on the gpu so he could be asking about the gpu' [...] The point is for the model
+to get tags also [...] That way we give the least possible entropy for the
+model. The less thinking it needs to do the better."* And: *"As well as the
+previous question/answer from the agent from the call."*
+
+So the predictor's prompt is the partial **plus** this block, and the calling
+agent produces it:
+
+    TAGS: cli, voice-cloning, server, client, tailscale, daemon, systemctl, gpu, one-shot
+    AFFECTED: cvoice, cvoiced.service, /home/bodas/data/cvoice, bogdan-stamenovic
+    GOAL:    what is being achieved
+    DONE:    what has been completed
+    WORKED:  what succeeded
+    FAILED:  what did not
+    NOW:     the thing immediately at hand
+    LAST EXCHANGE:
+      voice: what the assistant just said
+      him:   what he said before that
+
+**Why `TAGS` and `AFFECTED` are not sentences.** They are the entity space. A
+prose brief still makes the model infer the subject; a keyword list hands it over
+at zero reasoning cost. His example for cvoice is the one above, verbatim.
+
+**Why `LAST EXCHANGE` is separate from the brief.** The brief is the standing
+situation; the last exchange is the local question. "Yeah so about that--" is
+unpredictable without knowing what *that* was.
+
+**This is the same object at training and inference time**, which is the point:
+`CallTarget.context` already carries exactly this block from the calling agent to
+the voice (`001b4e2`), so the predictor is conditioned on something that really
+exists when the phone rings.
+
 ## The finetune
 
 Corpus built 2026-09-10 at `~/data/si-corpus`, **deliberately outside both git
