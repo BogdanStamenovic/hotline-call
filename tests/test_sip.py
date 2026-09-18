@@ -87,6 +87,7 @@ class FakeRegistrar(threading.Thread):
         self.stop_flag = threading.Event()
         self.saw_authenticated_register = False
         self.saw_invite = False
+        self.invites = []
         self.saw_cancel = False
         self.seen: list[str] = []
 
@@ -125,6 +126,7 @@ class FakeRegistrar(threading.Thread):
                     self._reply(request, addr, "401 Unauthorized", [challenge])
             elif method == "INVITE":
                 self.saw_invite = True
+                self.invites.append(request)
                 for status in self.invite_script:
                     text = {180: "180 Ringing", 183: "183 Session Progress",
                             200: "200 OK", 486: "486 Busy Here",
@@ -513,3 +515,81 @@ class _Retransmitting:
 
     def sendall(self, data):
         pass
+
+
+# ---- ringing somebody who is not him -------------------------------------
+#
+# hotline-registry rings a registry person's own Linphone account with OUR
+# credentials, so the callee became a property of the call rather than of the
+# transport. These pin the three things that have to stay true for that, because
+# getting any of them wrong rings the wrong person's phone and reports success.
+
+
+def _invite_uri(request: str) -> str:
+    return request.split(" ", 2)[1]
+
+
+def _to_header(request: str) -> str:
+    for line in request.splitlines():
+        if line.lower().startswith("to:"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+async def test_an_address_on_the_target_is_the_one_invited(registrar):
+    registrar.invite_script = [180, 200]
+    doorbell = transport_for(registrar)
+    await doorbell.ring(
+        CallTarget(device="phone", address="sip:milos@127.0.0.1"), timeout=3.0
+    )
+    assert registrar.invites, "nothing was INVITEd"
+    request = registrar.invites[0]
+    assert _invite_uri(request) == "sip:milos@127.0.0.1"
+    assert "<sip:milos@127.0.0.1>" in _to_header(request)
+    # The configured peer -- him -- must appear nowhere in it.
+    assert "him@" not in request
+
+
+async def test_a_bare_username_is_given_a_scheme(registrar):
+    """People type what Linphone shows them, which has no `sip:` on the front."""
+    registrar.invite_script = [180, 200]
+    doorbell = transport_for(registrar)
+    await doorbell.ring(CallTarget(device="phone", address="milos@127.0.0.1"), timeout=3.0)
+    assert _invite_uri(registrar.invites[0]) == "sip:milos@127.0.0.1"
+
+
+async def test_no_address_still_rings_him(registrar):
+    """The regression that matters most: every caller that predates the registry
+    passes no address at all, and must still reach his handset."""
+    registrar.invite_script = [180, 200]
+    doorbell = transport_for(registrar)
+    await doorbell.ring(CallTarget(device="phone"), timeout=3.0)
+    assert _invite_uri(registrar.invites[0]) == "sip:him@127.0.0.1"
+
+
+async def test_the_dialed_address_does_not_leak_into_the_next_call(registrar):
+    """`_dialing` is per-call state on a long-lived transport. If it survived a
+    ring, the NEXT call to him -- a page, an escalation -- would go to whoever
+    was rung last."""
+    registrar.invite_script = [180, 200]
+    doorbell = transport_for(registrar)
+    await doorbell.ring(CallTarget(device="phone", address="sip:milos@127.0.0.1"), timeout=3.0)
+    await doorbell.ring(CallTarget(device="phone"), timeout=3.0)
+    assert _invite_uri(registrar.invites[1]) == "sip:him@127.0.0.1"
+
+
+async def test_an_address_works_even_with_no_peer_configured(registrar):
+    """A box that only ever rings registry people should not have to name him."""
+    registrar.invite_script = [180, 200]
+    doorbell = SipTransport(user="bogdan", password="hotline", domain="127.0.0.1",
+                            peer="", port=registrar.port, transport="udp")
+    await doorbell.ring(CallTarget(device="phone", address="sip:milos@127.0.0.1"), timeout=3.0)
+    assert _invite_uri(registrar.invites[0]) == "sip:milos@127.0.0.1"
+
+
+async def test_no_peer_and_no_address_is_unreachable_not_a_call_to_nobody(registrar):
+    doorbell = SipTransport(user="bogdan", password="hotline", domain="127.0.0.1",
+                            peer="", port=registrar.port, transport="udp")
+    with pytest.raises(CallUnreachable):
+        await doorbell.ring(CallTarget(device="phone"), timeout=3.0)
+    assert not registrar.invites

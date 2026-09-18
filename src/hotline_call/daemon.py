@@ -728,7 +728,7 @@ class Service:
         needs neither this daemon nor hotline to be tested -- and so `talk.py`
         can build the same object out of different parts.
         """
-        from .callagent import CallAgent, default_context
+        from .callagent import CallAgent, default_context, guest_agent
         from .conversation import AnsweredCall
         from .media.record import from_environment
 
@@ -747,7 +747,21 @@ class Service:
             loop.call_soon_threadsafe(self._append, conversation, kind, text)
 
         agent = None
-        if os.environ.get("HOTLINE_IOS_CALL_SESSION", "1") != "0":
+        if os.environ.get("HOTLINE_IOS_CALL_SESSION", "1") != "0" and target.address:
+            # Ringing somebody who is not him. Different manners, different
+            # language, and no `call_context.txt` -- see `guest_agent`. The
+            # calling agent's brief is the ONLY thing this voice knows.
+            agent = guest_agent(
+                target.callee,
+                (f"{target.caller_id} is calling {target.callee} on Bogdan's behalf.\n"
+                 f"WHY: {target.reason}\n\n"
+                 f"WHAT THE CALLING AGENT WANTS YOU TO KNOW:\n{target.context.strip()}"
+                 if target.context.strip() else
+                 f"{target.caller_id} is calling {target.callee} on Bogdan's behalf.\n"
+                 f"WHY: {target.reason}"),
+            )
+            agent.start()
+        elif os.environ.get("HOTLINE_IOS_CALL_SESSION", "1") != "0":
             # The calling agent's own briefing goes in FIRST and is labelled as
             # the authority, because it is current and this file is not: nothing
             # regenerates call_context.txt and it is dated in its own first line.
@@ -768,7 +782,10 @@ class Service:
             speak=speak,
             transcribe=lambda audio: str(transcriber.transcribe(audio)),
             fillers=self.fillers,
-            greeting=str(speakable(f"{target.caller_id}: {target.reason}")),
+            greeting=str(speakable(
+                f"Hello {target.callee}, this is Bogdan's assistant calling. {target.reason}"
+                if target.address else f"{target.caller_id}: {target.reason}"
+            )),
             deliver=lambda text: append("you", text),
             ask=agent.reply if agent is not None else None,
             hung_up=getattr(link, "far_end_hung_up", None),
@@ -797,18 +814,44 @@ class Service:
             raise HttpError(400, "reason is required")
 
         agent = body.get("agent") or None
+        # `to` rings somebody who is not him: a registry person's own Linphone
+        # account, dialed with our credentials. Absent, everything below behaves
+        # exactly as it did before hotline-registry existed.
+        to = str(body.get("to", "")).strip()
         target = CallTarget(
             device=str(body.get("device", "phone")),
             agent=str(agent) if agent else None,
             reason=reason,
             caller_id=str(body.get("source", "Claude")),
             context=str(body.get("context", "")),
+            address=to,
+            callee=str(body.get("callee", "")).strip() or ("someone" if to else "Bogdan"),
         )
         ring_timeout = float(body.get("ring_timeout", 45.0))
         reply_timeout = float(body.get("timeout", 900.0))
         wait = bool(body.get("wait", True))
 
         doorbell = self._resolve_transport(str(body.get("transport", "")))
+        if to:
+            # SIP is the only transport that can dial an arbitrary address. Every
+            # other one -- Telegram, the local app socket, loopback -- reaches
+            # exactly one person, and that person is HIM. Falling through to one
+            # of those on a registry call would ring Bogdan with a question meant
+            # for somebody else and report it as delivered, which is the worst
+            # failure this endpoint has available to it. So: resolve to the bare
+            # SIP link, or refuse out loud.
+            from hotline.httpd import HttpError
+
+            sip_link = self.links.get("sip")
+            if sip_link is None:
+                raise HttpError(
+                    503,
+                    "calling someone other than Bogdan needs the sip transport, "
+                    f"and this daemon has: {', '.join(sorted(self.links)) or 'none'}",
+                )
+            if str(body.get("transport", "")).strip().lower() not in ("", "auto", "sip"):
+                raise HttpError(400, "'to' can only be rung over the sip transport")
+            doorbell = sip_link
 
         conversation, events = self._open_conversation(agent, "ring")
         # Put the question in the conversation before ringing, so that whenever

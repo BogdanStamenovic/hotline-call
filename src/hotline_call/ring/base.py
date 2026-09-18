@@ -84,6 +84,26 @@ class CallTarget:
     agent: str | None = None
     reason: str = ""
     caller_id: str = "Claude"
+    address: str = ""
+    """Who to ring, when it is not the transport's configured peer.
+
+    Empty means him, which is every call this project placed before
+    hotline-registry existed. A SIP URI (`sip:name@sip.linphone.org`, or the
+    bare user part) rings that account instead, using the SAME credentials --
+    the account we register with is ours, the address we INVITE is theirs.
+
+    Only `SipRing` honours it. A transport that can physically only reach one
+    person -- Telegram, the loopback doorbell -- ignores it, so a chain must not
+    be allowed to fall through to one of those on a registry call. `daemon.place`
+    is where that is enforced.
+    """
+    callee: str = "Bogdan"
+    """The human whose phone this is, for the voice on the line to address.
+
+    The call agent's manners were written for him and say so out loud, in
+    Serbian. Ringing someone else with those manners would have a stranger
+    greeted by name as somebody they are not.
+    """
     context: str = ""
     """What the CALLING agent knows and the voice on the phone needs.
 

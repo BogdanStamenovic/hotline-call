@@ -94,15 +94,90 @@ prosledjujem" -- and answer anything you can answer from reading.
 - Do not mention that you are an AI, and do not narrate your own tooling."""
 
 
+GUEST_MANNERS = """You are on a LIVE PHONE CALL with {callee}, speaking English out \
+loud. Your words go straight to a text-to-speech engine and into their ear.
+
+WHO YOU ARE: you are calling on behalf of Bogdan's automation. {callee} signed up \
+for this -- they joined his contacts server and filled in the registry form, which \
+is the permission you are calling on. Say who is calling in your first sentence.
+
+RULES, all of them about being audible rather than readable:
+- ONE short sentence. Two only if the second is genuinely necessary. Nobody can \
+skim a phone call, and anything past about six seconds of speech is too long to \
+follow by ear.
+- NO markdown, NO lists, NO code, NO URLs, NO file paths spelled out.
+- You have NOTHING to look up. You know what is in your briefing and nothing \
+else. If they ask something outside it, say plainly that you do not know and \
+that you will pass the question on. Never guess, and never invent a detail \
+about Bogdan, his work, or his systems.
+- You are a guest on someone else's phone. If they say it is a bad time, say \
+sorry, say you will pass it on, and end the call.
+- If they ask for something to be DONE, do not promise to do it yourself. Say it \
+is being passed on.
+- If you did not understand them, say so and ask them to repeat.
+- If they say goodbye, say a short goodbye back and nothing else.
+- Do not narrate your own tooling."""
+"""Manners for a call to somebody who is NOT Bogdan.
+
+Three differences from `MANNERS`, each of them load-bearing:
+
+- **English, not Serbian.** `MANNERS` speaks Serbian because he does. A registry
+  person is whoever joined the server, and greeting a stranger in a language
+  they may not speak is a worse default than the one that is merely less warm.
+- **It says who is calling.** He knows why his own automation is ringing him.
+  Somebody else does not, and a voice that opens without identifying itself is
+  indistinguishable from a scam call.
+- **It is told it can look nothing up.** `MANNERS` grants Read/Grep/Glob and
+  says so. On a guest call the same tools point at HIS filesystem, and the model
+  is talking to a third party -- so the tools are confined to an empty directory
+  (see `GUEST_CWD`) and the manners are told not to try. Belt and braces, because
+  either one alone fails quietly: a prompt rule can be talked around, and a
+  confinement nobody mentions produces a voice that goes silent trying to read.
+"""
+
+GUEST_CWD = os.environ.get(
+    "HOTLINE_IOS_GUEST_CWD", os.path.expanduser("~/.local/state/hotline-registry/callagent")
+)
+"""Working directory for a guest call agent, deliberately empty.
+
+`--restricted` confines the file tools to the working directory, so pointing the
+session at an empty directory is what actually stops a voice on a stranger's
+phone from reading his home directory -- rather than the prompt rule above, which
+is only the second line of defence. Created on demand by `guest_agent`."""
+
+
+def guest_agent(callee: str, brief: str, *, model: str = "sonnet") -> "CallAgent":
+    """A call agent for somebody in the registry, rather than for him.
+
+    Deliberately does NOT go through `default_context`: that prepends
+    `call_context.txt`, the standing briefing about his projects, which is his
+    and not a third party's. A guest agent knows exactly what the calling agent
+    chose to tell it and nothing more.
+    """
+    pathlib.Path(GUEST_CWD).mkdir(parents=True, exist_ok=True)
+    return CallAgent(
+        brief.strip() or "No briefing was given for this call.",
+        model=model,
+        cwd=GUEST_CWD,
+        manners=GUEST_MANNERS.format(callee=callee or "them"),
+        speaker=callee or "They",
+    )
+
+
 class CallAgent:
     """A Sonnet session, opened before the ring and resumed each turn."""
 
     def __init__(self, context: str = "", *, model: str = "sonnet",
-                 cwd: str = DEFAULT_CWD, manners: str = MANNERS) -> None:
+                 cwd: str = DEFAULT_CWD, manners: str = MANNERS,
+                 speaker: str = "Bogdan") -> None:
         self.context = context or "Nema posebnog konteksta."
         self.model = model
         self.cwd = cwd
         self.manners = manners
+        # Whose sentence `reply` is relaying. The turn prompt used to name him
+        # unconditionally, in Serbian, which on a guest call told the model the
+        # stranger on the line was Bogdan.
+        self.speaker = speaker
         self.session: str | None = None
         # Seeding costs ~4.7 s. On a ring that is paid WHILE the phone is
         # ringing rather than after he answers, so `reply` has to wait for it
@@ -167,7 +242,11 @@ class CallAgent:
             raise RuntimeError("the call agent never finished opening")
         if self.failed:
             raise RuntimeError(self.failed)
-        return self._run(f'Bogdan je upravo rekao, preko telefona: "{heard}"', TURN_TIMEOUT)
+        if self.speaker == "Bogdan":
+            prompt = f'Bogdan je upravo rekao, preko telefona: "{heard}"'
+        else:
+            prompt = f'{self.speaker} just said, on the phone: "{heard}"'
+        return self._run(prompt, TURN_TIMEOUT)
 
 
 def default_context(extra: str = "") -> str:

@@ -120,8 +120,17 @@ def place_call(
     ring_timeout: float = 45.0,
     wait: bool = True,
     transport: str = "auto",
+    to: str = "",
+    callee: str = "",
     url: str = DEFAULT_URL,
 ) -> CallOutcome:
+    """Ring a phone and, unless `wait` is false, come back with what was said.
+
+    `to` is the one argument that changes who is rung. Empty -- the default, and
+    every caller that existed before hotline-registry -- rings Bogdan. A SIP
+    address rings that account instead, over the SIP transport only; the daemon
+    refuses rather than falling through to a doorbell that can only reach him.
+    """
     payload = {
         "reason": reason,
         "agent": agent,
@@ -131,6 +140,9 @@ def place_call(
         "wait": wait,
         "transport": transport,
     }
+    if to:
+        payload["to"] = to
+        payload["callee"] = callee or "them"
     # The HTTP timeout has to outlive the call itself, or a long conversation
     # looks to the caller exactly like a dead daemon.
     data = _post("/api/v1/call", payload, url=url, timeout=timeout + 30.0)

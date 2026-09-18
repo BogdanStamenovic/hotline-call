@@ -977,3 +977,89 @@ async def test_a_daemon_with_no_voice_leg_loads_nothing_at_all():
     await service.place({"reason": "status", "wait": False})
     time.sleep(0.1)
     assert ears.loads == 0, "a daemon that cannot talk must not load a transcriber"
+
+
+# ---- ringing a registry person rather than him ---------------------------
+
+
+async def test_a_registry_call_refuses_rather_than_ringing_him_by_fallback():
+    """The failure this guard exists to make impossible.
+
+    Every doorbell but SIP reaches exactly one person, and that person is
+    Bogdan. If `to` were allowed to fall through to one of them, a question
+    meant for somebody in the registry would ring HIM, he would answer it, and
+    the caller would be told it was delivered. Refusing out loud is the only
+    honest option.
+    """
+    from hotline_ios.ring.loopback import LoopbackTransport
+
+    inner = LoopbackTransport()
+    service = Service(inner, FakePool())
+    service.set_links({"loopback": inner})
+    import urllib.error
+
+    import pytest
+
+    server = await run_server(service, 18811)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            await asyncio.to_thread(
+                post, 18811, "/api/v1/call",
+                {"reason": "can you review it?", "to": "sip:milos@sip.linphone.org",
+                 "callee": "Milos"},
+            )
+        # 503, not a 200 carrying a cheerful "answered" from the loopback.
+        assert exc.value.code == 503
+        assert not service.degradations
+    finally:
+        await server.close()
+
+
+async def test_a_registry_call_goes_to_the_sip_link_not_the_configured_chain():
+    from hotline_ios.ring.loopback import LoopbackTransport
+
+    rung: list[object] = []
+
+    class FakeSip(LoopbackTransport):
+        name = "sip"
+
+        async def ring(self, target, *, timeout: float = 45.0) -> None:
+            rung.append(target)
+
+    default = LoopbackTransport()
+    sip = FakeSip()
+    service = Service(default, FakePool())
+    service.set_links({"loopback": default, "sip": sip})
+    server = await run_server(service, 18812)
+    try:
+        await asyncio.to_thread(
+            post, 18812, "/api/v1/call",
+            {"reason": "can you review it?", "to": "sip:milos@sip.linphone.org",
+             "callee": "Milos", "wait": False},
+        )
+        assert len(rung) == 1, "the sip link was not the one rung"
+        assert rung[0].address == "sip:milos@sip.linphone.org"
+        assert rung[0].callee == "Milos"
+    finally:
+        await server.close()
+
+
+async def test_a_call_with_no_address_is_still_addressed_to_him():
+    from hotline_ios.ring.loopback import LoopbackTransport
+
+    rung: list[object] = []
+
+    class Recording(LoopbackTransport):
+        async def ring(self, target, *, timeout: float = 45.0) -> None:
+            rung.append(target)
+
+    inner = Recording()
+    service = Service(inner, FakePool())
+    server = await run_server(service, 18813)
+    try:
+        await asyncio.to_thread(
+            post, 18813, "/api/v1/call", {"reason": "ping", "wait": False})
+        assert rung[0].address == ""
+        assert rung[0].callee == "Bogdan"
+    finally:
+        await server.close()

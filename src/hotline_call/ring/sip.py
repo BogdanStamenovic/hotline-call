@@ -268,6 +268,16 @@ class SipTransport:
         # Re-sends the ACK for the call in progress, or None outside one.
         self._ack: Callable[[], None] | None = None
         self._answered_at = 0.0
+        # The address THIS ring is dialing, when it is not `self.peer`.
+        # hotline-registry rings other people's Linphone accounts with the same
+        # credentials, so the callee is a property of the call and not of the
+        # transport. Empty means "the configured peer", which is him.
+        #
+        # Held on the instance rather than threaded through six signatures
+        # because everything else about a call in progress already is
+        # (`_srtp_key`, `_dialog_over`, `_ack`): one SipRing rings one address at
+        # a time, and `ring()` is the only entry point.
+        self._dialing = ""
 
     async def start(self) -> None:
         if not (self.user and self.password and self.peer):
@@ -447,6 +457,16 @@ class SipTransport:
 
     # ---- messages --------------------------------------------------------
 
+    def _them(self) -> str:
+        """The callee's SIP URI for this ring, normalised.
+
+        `sip:` is optional in configuration and in a registry entry, because
+        people write their Linphone address both ways and being strict about it
+        only produces a 404 nobody can read.
+        """
+        who = self._dialing or self.peer
+        return who if who.startswith("sip:") else f"sip:{who}"
+
     def _via(self, branch: str) -> str:
         host, port = self._local
         proto = "TLS" if self.transport == "tls" else self.transport.upper()
@@ -493,7 +513,7 @@ class SipTransport:
 
     def _invite(self, call_id: str, cseq: int, from_tag: str, auth: str = "") -> str:
         me = f"sip:{self.user}@{self.domain}"
-        them = self.peer if self.peer.startswith("sip:") else f"sip:{self.peer}"
+        them = self._them()
         host, port = self._local
         media_host = self.media_host or host
         media_port = self._open_media()
@@ -569,12 +589,19 @@ class SipTransport:
 
     async def ring(self, target: CallTarget, *, timeout: float = 45.0) -> None:
         self.ringing.clear()
-        if not (self.user and self.password and self.peer):
+        # The account is ours either way; only the callee varies. `target.address`
+        # is how hotline-registry rings someone other than him, and the guard
+        # below is why it does not also require SIP_PEER to be set -- a box that
+        # only ever rings registry people should not have to name him to do it.
+        self._dialing = (target.address or "").strip()
+        if not (self.user and self.password) or not (self._dialing or self.peer):
+            self._dialing = ""
             raise CallUnreachable("sip is not configured")
         loop = asyncio.get_running_loop()
         try:
             await loop.run_in_executor(None, self._ring_blocking, timeout)
         finally:
+            self._dialing = ""
             self._close()
             self._close_media()
 
@@ -620,7 +647,7 @@ class SipTransport:
     def _invite_and_watch(self, sock: socket.socket, call_id: str, timeout: float) -> None:
         from_tag = _tag()
         invite_id = uuid.uuid4().hex
-        them = self.peer if self.peer.startswith("sip:") else f"sip:{self.peer}"
+        them = self._them()
         self._send(sock, self._invite(invite_id, 1, from_tag))
 
         # A real deadline, not a counter decremented by the poll interval --
@@ -650,7 +677,7 @@ class SipTransport:
             if code in RING_CODES:
                 # The far end saying, in the protocol's own words, that it is
                 # ringing. The strongest confirmation any transport here has.
-                log.info("sip: %s is ringing (%d)", self.peer, code)
+                log.info("sip: %s is ringing (%d)", self._them(), code)
                 self.ringing.set()
                 continue
             if code == 200:
@@ -668,7 +695,7 @@ class SipTransport:
                 self._cancel(sock, invite_id, from_tag, cseq)
                 raise CallDeclined(f"he declined the sip call ({code})")
             if code == 404:
-                raise CallUnreachable(f"sip: {self.peer} not found (404)")
+                raise CallUnreachable(f"sip: {self._them()} not found (404)")
             if code >= 400:
                 raise CallUnreachable(f"sip call failed with {code}")
 
@@ -696,7 +723,7 @@ class SipTransport:
         phone until the far end times it out.
         """
         me = f"sip:{self.user}@{self.domain}"
-        them = self.peer if self.peer.startswith("sip:") else f"sip:{self.peer}"
+        them = self._them()
         to_value = to_header or f"<{them}>"
         host, port = self._local
 
@@ -774,7 +801,7 @@ class SipTransport:
     def _cancel(self, sock: socket.socket, call_id: str, from_tag: str, cseq: int) -> None:
         """Stop it ringing. He is already reading the question in the app."""
         me = f"sip:{self.user}@{self.domain}"
-        them = self.peer if self.peer.startswith("sip:") else f"sip:{self.peer}"
+        them = self._them()
         message = "\r\n".join([
             f"CANCEL {them} SIP/2.0",
             self._via(_tag()),
