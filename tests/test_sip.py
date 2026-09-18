@@ -593,3 +593,53 @@ async def test_no_peer_and_no_address_is_unreachable_not_a_call_to_nobody(regist
     with pytest.raises(CallUnreachable):
         await doorbell.ring(CallTarget(device="phone"), timeout=3.0)
     assert not registrar.invites
+
+
+# ---- what the guest on the line actually sounds like ----------------------
+
+
+def test_a_guest_call_speaks_serbian_not_english():
+    """His instruction, 2026-09-19: *"Just one thing speak serbian on the call
+    not english"*. It is also the only thing that works: the TTS is a Serbian
+    piper voice, which mangles English, and the ASR runs with a Serbian hint,
+    which mis-transcribes English replies. The first guest call went out in
+    English and fought both ends of the stack."""
+    from hotline_ios.callagent import GUEST_MANNERS
+
+    manners = GUEST_MANNERS.format(callee="Milos")
+    assert "SRPSKI" in manners
+    # Real diacritics, not stripped ASCII -- the TTS mispronounces the latter,
+    # which is why MANNERS says so out loud and why this is asserted.
+    assert any(ch in manners for ch in "ćčšžđ")
+    assert "English" not in manners and "PHONE CALL" not in manners
+
+
+def test_a_guest_is_told_it_can_look_nothing_up():
+    """The prompt half of the confinement. The other half is an empty working
+    directory; either alone fails quietly."""
+    from hotline_ios.callagent import GUEST_MANNERS
+
+    manners = GUEST_MANNERS.format(callee="Milos")
+    assert "NEMAS" in manners or "NEMAŠ" in manners
+    assert "ne izmišljaj" in manners or "ne izmisljaj" in manners
+
+
+def test_a_guest_agent_gets_the_brief_and_nothing_else():
+    """`call_context.txt` is the standing briefing about HIS projects, and
+    `default_context` prepends it. A third party gets what the calling agent
+    chose to tell them and nothing more -- asserted on what the agent actually
+    holds, not on what the docstring says it does."""
+    from hotline_ios.callagent import GUEST_CWD, guest_agent
+
+    agent = guest_agent("Milos", "  only this  ")
+    assert agent.context == "only this"
+    # The empty working directory is what actually confines the file tools;
+    # the prompt rule beside it is only the second line of defence.
+    assert agent.cwd == GUEST_CWD
+    assert agent.speaker == "Milos"
+
+
+def test_a_guest_call_with_no_brief_still_says_so_in_serbian():
+    from hotline_ios.callagent import guest_agent
+
+    assert guest_agent("Milos", "   ").context == "Nema posebnog konteksta za ovaj poziv."

@@ -751,14 +751,12 @@ class Service:
             # Ringing somebody who is not him. Different manners, different
             # language, and no `call_context.txt` -- see `guest_agent`. The
             # calling agent's brief is the ONLY thing this voice knows.
+            who = (f"{target.caller_id} zove osobu {target.callee} u Bogdanovo ime.\n"
+                   f"RAZLOG: {target.reason}")
+            brief = target.context.strip()
             agent = guest_agent(
                 target.callee,
-                (f"{target.caller_id} is calling {target.callee} on Bogdan's behalf.\n"
-                 f"WHY: {target.reason}\n\n"
-                 f"WHAT THE CALLING AGENT WANTS YOU TO KNOW:\n{target.context.strip()}"
-                 if target.context.strip() else
-                 f"{target.caller_id} is calling {target.callee} on Bogdan's behalf.\n"
-                 f"WHY: {target.reason}"),
+                f"{who}\n\nSTA AGENT KOJI ZOVE ZELI DA ZNAS:\n{brief}" if brief else who,
             )
             agent.start()
         elif os.environ.get("HOTLINE_IOS_CALL_SESSION", "1") != "0":
@@ -783,7 +781,11 @@ class Service:
             transcribe=lambda audio: str(transcriber.transcribe(audio)),
             fillers=self.fillers,
             greeting=str(speakable(
-                f"Hello {target.callee}, this is Bogdan's assistant calling. {target.reason}"
+                # Serbian, like the guest manners themselves. The TTS voice is a
+                # Serbian one and the ASR runs with a Serbian hint, so an English
+                # greeting is mispronounced on the way out and mis-heard on the
+                # way back.
+                f"Zdravo {target.callee}, ovde Bogdanov asistent. {target.reason}"
                 if target.address else f"{target.caller_id}: {target.reason}"
             )),
             deliver=lambda text: append("you", text),

@@ -94,36 +94,42 @@ prosledjujem" -- and answer anything you can answer from reading.
 - Do not mention that you are an AI, and do not narrate your own tooling."""
 
 
-GUEST_MANNERS = """You are on a LIVE PHONE CALL with {callee}, speaking English out \
-loud. Your words go straight to a text-to-speech engine and into their ear.
+GUEST_MANNERS = """Na ŽIVOM SI TELEFONSKOM RAZGOVORU sa osobom koja se zove \
+{callee}. Govoriš SRPSKI, naglas. Tvoje reči idu pravo u sintetizator govora i \
+toj osobi u uho.
 
-WHO YOU ARE: you are calling on behalf of Bogdan's automation. {callee} signed up \
-for this -- they joined his contacts server and filled in the registry form, which \
-is the permission you are calling on. Say who is calling in your first sentence.
+KO SI: zoveš u ime Bogdanove automatizacije. {callee} se sam prijavio -- ušao je \
+na njegov server za kontakte i popunio formular, i to je dozvola na osnovu koje \
+zoveš. U prvoj rečenici reci ko zove.
 
-RULES, all of them about being audible rather than readable:
-- ONE short sentence. Two only if the second is genuinely necessary. Nobody can \
-skim a phone call, and anything past about six seconds of speech is too long to \
-follow by ear.
-- NO markdown, NO lists, NO code, NO URLs, NO file paths spelled out.
-- You have NOTHING to look up. You know what is in your briefing and nothing \
-else. If they ask something outside it, say plainly that you do not know and \
-that you will pass the question on. Never guess, and never invent a detail \
-about Bogdan, his work, or his systems.
-- You are a guest on someone else's phone. If they say it is a bad time, say \
-sorry, say you will pass it on, and end the call.
-- If they ask for something to be DONE, do not promise to do it yourself. Say it \
-is being passed on.
-- If you did not understand them, say so and ask them to repeat.
-- If they say goodbye, say a short goodbye back and nothing else.
-- Do not narrate your own tooling."""
+PRAVILA, sva su o tome da se TEBE ČUJE, a ne da te neko čita:
+- JEDNA kratka rečenica. Dve samo ako je druga zaista neophodna. Telefonski \
+razgovor se ne može preleteti pogledom, a sve preko šest sekundi govora je \
+predugo da se isprati sluhom.
+- BEZ markdowna, BEZ lista, BEZ koda, BEZ URL-ova, BEZ putanja koje se slovkaju.
+- Srpski, sa pravim dijakritičkim znacima (ć, č, š, ž, đ kao prava slova) -- \
+sintetizator pogrešno izgovara ogoljeni ASCII.
+- NEMAŠ šta da proveriš. Znaš ono što ti piše u zadatku i ništa više. Ako te \
+pitaju nešto van toga, reci otvoreno da ne znaš i da ćeš preneti pitanje. Nikada \
+ne pogađaj i nikada ne izmišljaj detalj o Bogdanu, njegovom poslu ili njegovim \
+sistemima.
+- Gost si na tuđem telefonu. Ako kažu da im nije zgodno, izvini se, reci da ćeš \
+preneti, i završi razgovor.
+- Ako traže da se nešto URADI, ne obećavaj da ćeš ti to uraditi. Reci da \
+prosleđuješ.
+- Ako ih nisi razumeo, reci to i zamoli ih da ponove.
+- Ako se pozdrave, kratko se pozdravi nazad i ništa više.
+- Ne pričaj o sopstvenim alatima."""
 """Manners for a call to somebody who is NOT Bogdan.
 
-Three differences from `MANNERS`, each of them load-bearing:
+Serbian, like `MANNERS`, and that is not only his preference (2026-09-19: *"Just
+one thing speak serbian on the call not english"*). The stack is Serbian at both
+ends: the TTS is a Serbian piper voice, which mangles English text, and the ASR
+runs with a Serbian language hint, which transcribes English replies badly. The
+first guest call went out in English and fought both.
 
-- **English, not Serbian.** `MANNERS` speaks Serbian because he does. A registry
-  person is whoever joined the server, and greeting a stranger in a language
-  they may not speak is a worse default than the one that is merely less warm.
+What still differs from `MANNERS`, and each difference is load-bearing:
+
 - **It says who is calling.** He knows why his own automation is ringing him.
   Somebody else does not, and a voice that opens without identifying itself is
   indistinguishable from a scam call.
@@ -133,6 +139,8 @@ Three differences from `MANNERS`, each of them load-bearing:
   (see `GUEST_CWD`) and the manners are told not to try. Belt and braces, because
   either one alone fails quietly: a prompt rule can be talked around, and a
   confinement nobody mentions produces a voice that goes silent trying to read.
+- **It is told it is a guest.** A bad moment on somebody else's phone ends the
+  call; his own rules about when to reach him do not transfer to a colleague.
 """
 
 GUEST_CWD = os.environ.get(
@@ -156,7 +164,7 @@ def guest_agent(callee: str, brief: str, *, model: str = "sonnet") -> "CallAgent
     """
     pathlib.Path(GUEST_CWD).mkdir(parents=True, exist_ok=True)
     return CallAgent(
-        brief.strip() or "No briefing was given for this call.",
+        brief.strip() or "Nema posebnog konteksta za ovaj poziv.",
         model=model,
         cwd=GUEST_CWD,
         manners=GUEST_MANNERS.format(callee=callee or "them"),
@@ -242,11 +250,11 @@ class CallAgent:
             raise RuntimeError("the call agent never finished opening")
         if self.failed:
             raise RuntimeError(self.failed)
-        if self.speaker == "Bogdan":
-            prompt = f'Bogdan je upravo rekao, preko telefona: "{heard}"'
-        else:
-            prompt = f'{self.speaker} just said, on the phone: "{heard}"'
-        return self._run(prompt, TURN_TIMEOUT)
+        # Serbian for everybody: the guest manners are Serbian too, and a turn
+        # prompt in a different language than the manners is how a model ends up
+        # answering a Serbian speaker in English.
+        return self._run(
+            f'{self.speaker} je upravo rekao, preko telefona: "{heard}"', TURN_TIMEOUT)
 
 
 def default_context(extra: str = "") -> str:
