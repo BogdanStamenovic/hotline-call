@@ -83,7 +83,10 @@ DEFAULT_PROMPT = (
     "to test you. Answer his questions helpfully, keep answers short and conversational."
 )
 MAX_SECONDS = float(os.environ.get("HOTLINE_IOS_DUPLEX_MAX_S", "600"))
-NEMOTRON_MAX_S = 150.0
+# The 160 s session counts system-prompt frames too (~250 with the tool list), and
+# the step drifts to ~73 ms avg / 89 max by 130 s (fake phone, his voice, 2026-10-15
+# 20:51; 5 underruns). 125 s ends before both.
+NEMOTRON_MAX_S = 125.0
 # The outbound queue the pump drains. Two frames is enough to ride out a late
 # tick; more is added latency he hears on every reply.
 OUT_QUEUE_FRAMES = 2
@@ -102,10 +105,16 @@ def brief_prompt(reason: str, context: str = "", source: str = "", engine: str =
     if context.strip():
         parts.append(f"Background: {context.strip()}")
     if engine == "nemotron":
-        # Nemotron reads instructions in its system prompt out loud ("Greet him.
-        # Deliver the message accurately...", fake-phone run 2026-10-15 20:10), so
-        # it gets the facts and the role and nothing that sounds like a script.
-        return " ".join(parts)
+        # Nemotron reads its system prompt out loud: "Your message for him: ..." came
+        # back as a 17-word verbatim run on his real voice (retry runs a/c0). Framed as
+        # background it must not read out, the longest shared run fell to 4 words and
+        # 0% of the prompt's 5-grams were spoken (runs b/d, 2026-10-15). Measured with
+        # duplex-lab/retry/score.py.
+        bg = reason.strip() + (f" {context.strip()}" if context.strip() else "")
+        return (f"You are Ada, Bogdan's voice assistant, on a phone call with him{who}. "
+                f"Background you know but do not read out, say what matters in your own words: {bg} "
+                "Talk with him naturally and briefly. When he asks about his projects, files or "
+                "computers, use the ask_claude tool.")
     parts.append("Greet him, deliver the message accurately and early, ask your question, "
                  "then listen and reply briefly and conversationally.")
     return " ".join(parts)
@@ -130,6 +139,7 @@ class DuplexCall:
         # The sentinel daemon._await_transcript waits on; anything else means done.
         self.ended = "not started"
         self.kind = engine
+        self._tool_cache: dict[str, tuple[float, str]] = {}
         self.prompt = prompt or DEFAULT_PROMPT
         quiet = lambda line: None if line.startswith("TXT") else log.debug("%s: %s", engine, line)  # noqa: E731
         if engine == "nemotron":
@@ -192,6 +202,14 @@ class DuplexCall:
             pass
         # The call brief is NOT included: with it, haiku answered as the voice
         # assistant and recited the brief instead of answering (2026-10-15 20:11).
+        # Dedupe: on his real voice Nemotron sent the same misheard question 9 times in
+        # 90 s (fake-phone run 2026-10-15 20:46), each one 8 s of deaf model plus a
+        # claude -p. A repeat inside 90 s gets the cached answer, marked as such.
+        now = time.monotonic()
+        cached = self._tool_cache.get(question)
+        if cached and now - cached[0] < 90:
+            log.info("ask_claude repeat of %r, answering from cache", question)
+            return json.dumps({"answer": cached[1], "note": "already asked; tell Bogdan this answer"})
         prompt = ("You are Claude, the coding agent on Bogdan's workstation. A voice assistant that "
                   "is on a phone call with Bogdan used a tool to ask you one question. Reply with "
                   "only the answer: at most two short spoken sentences, plain words, no greeting, "
@@ -205,6 +223,7 @@ class DuplexCall:
         except subprocess.TimeoutExpired:
             answer = "Claude did not answer in time."
         log.info("ask_claude %r -> %r", question, answer[:200])
+        self._tool_cache[question] = (time.monotonic(), answer[:600])
         return json.dumps({"answer": answer[:600]})
 
     def wait_ready(self, timeout: float = 60.0) -> bool:
