@@ -109,6 +109,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="fail rather than falling back to hotline-page when the call "
         "cannot be delivered",
     )
+    parser.add_argument(
+        "--engine",
+        default="",
+        choices=["", "personaplex"],
+        help="who talks on the call. Default: the usual Serbian ASR + Claude + TTS "
+        "loop. 'personaplex': an English full-duplex speech model (PersonaPlex-7B "
+        "on the local GPU) holds the whole call; the reason and --context become its persona prompt; the result is a Whisper transcript of both sides",
+    )
     parser.add_argument("-q", "--quiet", action="store_true", help="suppress non-error output")
     return parser
 
@@ -157,6 +165,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ring_timeout=args.ring_timeout,
             wait=not args.no_wait,
             transport=args.transport,
+            engine=args.engine,
         )
     except CallTimeout as exc:
         # The request outlived its deadline. If the daemon answered a fresh
