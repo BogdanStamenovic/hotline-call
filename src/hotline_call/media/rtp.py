@@ -50,9 +50,10 @@ path: enough to absorb the common case, short enough that a conversation does
 not feel like a satellite link."""
 
 
-def build_packet(seq: int, timestamp: int, ssrc: int, payload: bytes) -> bytes:
+def build_packet(seq: int, timestamp: int, ssrc: int, payload: bytes,
+                 payload_type: int = PT_PCMU) -> bytes:
     # V=2, no padding, no extension, no CSRC, no marker.
-    return struct.pack("!BBHII", 0x80, PT_PCMU, seq & 0xFFFF, timestamp & 0xFFFFFFFF, ssrc) + payload
+    return struct.pack("!BBHII", 0x80, payload_type & 0x7F, seq & 0xFFFF, timestamp & 0xFFFFFFFF, ssrc) + payload
 
 
 def parse_packet(data: bytes) -> tuple[int, int, int, bytes] | None:

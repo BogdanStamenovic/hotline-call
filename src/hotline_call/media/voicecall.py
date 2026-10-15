@@ -45,6 +45,7 @@ WIRE_RATE = 8000        # G.711 is 8 kHz, always
 FRAME_MS = 20
 FRAME_SAMPLES = WIRE_RATE * FRAME_MS // 1000   # 160
 PT_PCMU = 0             # payload type 0 is mu-law and is never negotiated away
+PT_PCMA = 8             # A-law: offered, so it can be what he answers with
 QUIET_FRAME = b"\xff" * FRAME_SAMPLES   # mu-law silence is 0xFF, not 0x00
 
 
@@ -61,6 +62,9 @@ class SdpAnswer:
     srtp_key: bytes
     srtp_salt: bytes
     payload_types: list[int]
+    # The G.711 law we send. His answer's first G.711 entry, because the
+    # answerer's first format is the one it means to use (RFC 3264 6.1).
+    pt: int = PT_PCMU
 
     @property
     def address(self) -> tuple[str, int]:
@@ -104,9 +108,10 @@ def parse_sdp_answer(message: str) -> SdpAnswer:
         raise SdpError("no m=audio port: the far end declined media")
     if not key:
         raise SdpError("no usable a=crypto line: cannot key SRTP for this call")
-    if PT_PCMU not in payload_types:
-        raise SdpError(f"far end did not offer PCMU; payload types were {payload_types}")
-    return SdpAnswer(host, port, key, salt, payload_types)
+    g711 = [pt for pt in payload_types if pt in (PT_PCMU, PT_PCMA)]
+    if not g711:
+        raise SdpError(f"far end offered neither PCMU nor PCMA; payload types were {payload_types}")
+    return SdpAnswer(host, port, key, salt, payload_types, g711[0])
 
 
 
@@ -130,8 +135,15 @@ class MediaPump(threading.Thread):
     stops is not a quiet stream, it is a dead one.
     """
 
-    def __init__(self, sock, tx, rx, remote, ssrc):
+    def __init__(self, sock, tx, rx, remote, ssrc, pt=PT_PCMU):
         super().__init__(daemon=True, name="rtp-pump")
+        # Everything above the pump speaks mu-law. When the line is A-law the
+        # pump translates at the wire, both ways, so nothing else has to know.
+        self.pt = pt
+        # Authenticated packets of a payload type we do not carry: a DTMF
+        # telephone-event, comfort noise. They used to be decoded as mu-law and
+        # handed to the endpointer as if they were his voice.
+        self.foreign_frames = 0
         self.sock = sock
         self.tx = tx
         self.rx = rx
@@ -218,8 +230,10 @@ class MediaPump(threading.Thread):
     def _send(self, payload: bytes) -> None:
         if self.wire_out is not None:
             self.wire_out.append(payload)
+        if self.pt == PT_PCMA:
+            payload = pcm.alaw_encode(pcm.ulaw_decode(payload))
         packet = rtp.build_packet(self._seq & 0xFFFF, self._ts & 0xFFFFFFFF,
-                                  self.ssrc, payload)
+                                  self.ssrc, payload, self.pt)
         try:
             self.sock.sendto(self.tx.protect(packet), self.remote)
         except OSError:
@@ -275,6 +289,14 @@ class MediaPump(threading.Thread):
         if parsed is None:
             return
         self._latch(_addr)
+        payload_type, payload = parsed[0], parsed[3]
+        if payload_type == PT_PCMA:
+            # mu-law and A-law are both 8-bit logarithmic and translate through
+            # 16-bit linear with at most one quantisation step of error.
+            payload = pcm.ulaw_encode(pcm.alaw_decode(payload))
+        elif payload_type != PT_PCMU:
+            self.foreign_frames += 1
+            return
         self.frames_received += 1
         if self.wire is not None:
             self.wire_at.append(self.frames_sent)
@@ -282,10 +304,10 @@ class MediaPump(threading.Thread):
             # or resamples it. A recording of what Whisper was given is not the
             # same artefact as a recording of what the line carried, and only
             # the second one can score a different model fairly.
-            self.wire.append(parsed[3])
+            self.wire.append(payload)
         # Unbounded on purpose: a turn is bounded in time by the caller, and
         # dropping inbound audio to protect memory would lose his words.
-        self.inbox.put(parsed[3])
+        self.inbox.put(payload)
 
 
 class VoiceCall:
@@ -327,7 +349,8 @@ class VoiceCall:
         self.his_voice: np.ndarray | None = None
         # The pump owns the socket and the 20 ms clock from here on. Nothing
         # else in this class touches the wire.
-        self.pump = MediaPump(media_sock, self.tx, self.rx, self.remote, self.ssrc)
+        self.pump = MediaPump(media_sock, self.tx, self.rx, self.remote, self.ssrc,
+                              answer.pt)
         self.pump.start()
 
     # Counters live on the pump, which is the only thing that sees a packet.
@@ -894,4 +917,5 @@ class VoiceCall:
             "frames_received": self.frames_received,
             "auth_failures": self.auth_failures,
             "late_frames": self.late_frames,
+            "foreign_frames": self.pump.foreign_frames,
         }

@@ -13,6 +13,18 @@ def test_ulaw_roundtrip_is_exact_on_codec_levels():
     assert pcm.ulaw_decode(pcm.ulaw_encode(levels)) == levels
 
 
+def test_alaw_roundtrip_is_exact_on_codec_levels():
+    levels = pcm._ALAW_DECODE.tobytes()
+    assert pcm.alaw_decode(pcm.alaw_encode(levels)) == levels
+
+
+def test_alaw_matches_the_reference_tables():
+    # Values from ITU-T G.191's reference g711.c (alaw2linear).
+    codes = bytes([0xD5, 0x55, 0x80, 0x00, 0xAA, 0x2A])
+    got = np.frombuffer(pcm.alaw_decode(codes), dtype="<i2").tolist()
+    assert got == [8, -8, 5504, -5504, 32256, -32256]
+
+
 def test_ulaw_encode_is_nearest_level():
     quiet = np.array([0, 1, -1, 100, -100], dtype="<i2").tobytes()
     back = np.frombuffer(pcm.ulaw_decode(pcm.ulaw_encode(quiet)), dtype="<i2")
