@@ -667,6 +667,9 @@ class SipTransport:
             if not reply:
                 continue
             code = status_of(reply)
+            # every reply, provisional ones included: "never confirmed ringing" is
+            # undiagnosable without knowing whether a 100 or 110 Push sent came first
+            log.info("sip: INVITE reply %d after %.1fs", code, timeout - remaining)
             if code in (401, 407):
                 cseq += 1
                 auth = self._authorisation(
