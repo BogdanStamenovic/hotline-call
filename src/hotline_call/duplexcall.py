@@ -1,7 +1,12 @@
 """An answered call carried by a full-duplex speech model instead of the ASR -> LLM -> TTS loop.
 
-Opt-in only (`hotline-call --engine personaplex`). The default call path never
-imports this module.
+Opt-in only (`hotline-call --engine personaplex|nemotron`). The default call path
+never imports this module.
+
+nemotron (NemotronLabs VoiceChat 11B Q4_0 via llama-voicechat --stream, duplex-lab's
+fork) also gets one tool, ask_claude, answered by `claude -p` mid-call, with a spoken
+"let me check" filler while the model is deaf (it cannot hear during a tool call:
+measured 6.9 s of frozen timeline for one call plus the tool's own latency).
 
 The model process (pp-stream, PersonaPlex-7B q4_k on moshi.cpp) is started when
 the phone starts ringing, because its voice + persona prefill takes ~5 s and the
@@ -29,7 +34,7 @@ from typing import Callable
 
 import numpy as np
 
-from .media.duplex import DuplexEngine
+from .media.duplex import NEMOTRON, PERSONAPLEX, DuplexEngine
 from .media.pcm import ulaw_decode, ulaw_encode
 from .media.voicecall import FRAME_MS, FRAME_SAMPLES, SdpError, VoiceCall, parse_sdp_answer
 
@@ -37,7 +42,43 @@ log = logging.getLogger(__name__)
 
 LAB = Path(os.environ.get("HOTLINE_IOS_DUPLEX_LAB", str(Path.home() / "data/duplex-lab")))
 DEFAULT_CMD = str(LAB / "pp-stream/run-pp-stream")
+NEMOTRON_CMD = str(LAB / "nemo-stream/run-nemotron-stream")
+FREE_GPU = LAB / "pp-stream/free-gpu"
 FAIL_CLIP = LAB / "pp-stream/engine-failed.wav"
+NEMO_FAIL_CLIP = LAB / "nemo-stream/engine-failed.wav"
+NEMO_FILLER = LAB / "nemo-stream/filler-check.wav"
+TOOL_TIMEOUT_S = float(os.environ.get("HOTLINE_IOS_DUPLEX_TOOL_TIMEOUT", "25"))
+TOOLS_PROMPT = """
+
+You can use the following tools to assist the user if required:
+<AVAILABLE_TOOLS>[{"name": "ask_claude", "description": "Ask Claude, the coding agent on Bogdan's workstation, anything about his projects, builds, servers, files or this call. Returns Claude's answer.", "parameters": {"type": "object", "properties": {"question": {"type": "string", "description": "the question"}}, "required": ["question"]}}]</AVAILABLE_TOOLS>
+
+If you decide to call any tool(s), use the following format:
+<TOOLCALL>[{"name": "tool_name1", "arguments": "tool_args1"}]</TOOLCALL>
+
+The user will execute tool-calls and return responses from tool(s) in this format:
+<TOOL_RESPONSE>[{"tool_response1"}]</TOOL_RESPONSE>
+
+Based on the tool responses, you can call additional tools if needed, correct tool calls if any errors are found, or just respond to the user."""
+
+
+def _load8k(path: Path) -> np.ndarray:
+    import soxr
+
+    with wave.open(str(path)) as w:
+        x = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
+        return soxr.resample(x, w.getframerate(), 8000).astype(np.float32)
+
+
+def free_gpu() -> None:
+    """Unload ollama's models (keep_alive 0, reversible). hotline-ios's own test
+    suite leaves bge-m3 on the card, and that OOM-killed the first live ring."""
+    import subprocess
+
+    try:
+        subprocess.run([str(FREE_GPU)], timeout=20, capture_output=True)
+    except Exception:  # noqa: BLE001 -- best effort; the READY gate catches the rest
+        log.exception("free-gpu failed")
 DEFAULT_PROMPT = (
     "You are Ada, a friendly assistant. Bogdan, your developer, is calling you on the phone "
     "to test you. Answer his questions helpfully, keep answers short and conversational."
@@ -48,7 +89,7 @@ MAX_SECONDS = float(os.environ.get("HOTLINE_IOS_DUPLEX_MAX_S", "600"))
 OUT_QUEUE_FRAMES = 2
 
 
-def brief_prompt(reason: str, context: str = "", source: str = "") -> str:
+def brief_prompt(reason: str, context: str = "", source: str = "", engine: str = "personaplex") -> str:
     """The persona prompt for a call placed by an agent: what to tell him and ask him.
 
     PersonaPlex has no tool loop and no way to look anything up mid-call, so the
@@ -60,6 +101,11 @@ def brief_prompt(reason: str, context: str = "", source: str = "") -> str:
              f"Your message for him: {reason.strip()}"]
     if context.strip():
         parts.append(f"Background: {context.strip()}")
+    if engine == "nemotron":
+        # Nemotron reads instructions in its system prompt out loud ("Greet him.
+        # Deliver the message accurately...", fake-phone run 2026-10-15 20:10), so
+        # it gets the facts and the role and nothing that sounds like a script.
+        return " ".join(parts)
     parts.append("Greet him, deliver the message accurately and early, ask your question, "
                  "then listen and reply briefly and conversationally.")
     return " ".join(parts)
@@ -70,7 +116,8 @@ class DuplexCall:
 
     def __init__(self, *, prompt: str = "", voice: str = "", note: Callable[[str, str], None],
                  deliver: Callable[[str], None], hung_up: Callable[[], bool] | None,
-                 record_dir: Path | None = None, label: str = "") -> None:
+                 record_dir: Path | None = None, label: str = "",
+                 engine: str = "personaplex") -> None:
         self.note = note
         self.deliver = deliver
         self.hung_up = hung_up
@@ -81,9 +128,26 @@ class DuplexCall:
         self.stats: dict[str, object] = {}
         # The sentinel daemon._await_transcript waits on; anything else means done.
         self.ended = "not started"
-        cmd = [os.environ.get("HOTLINE_IOS_DUPLEX_CMD", DEFAULT_CMD),
-               "-p", prompt or DEFAULT_PROMPT, "-v", voice or "NATF2"]
-        self.engine = DuplexEngine(cmd, log=lambda line: None if line.startswith("TXT") else log.debug("pp: %s", line))
+        self.kind = engine
+        self.prompt = prompt or DEFAULT_PROMPT
+        quiet = lambda line: None if line.startswith("TXT") else log.debug("%s: %s", engine, line)  # noqa: E731
+        if engine == "nemotron":
+            import tempfile
+
+            sysf = tempfile.NamedTemporaryFile("w", suffix=".txt", prefix="nemotron-sys-", delete=False)
+            sysf.write(self.prompt + TOOLS_PROMPT)
+            sysf.close()
+            self._sys_file = sysf.name
+            cmd = [os.environ.get("HOTLINE_IOS_NEMOTRON_CMD", NEMOTRON_CMD), "--system-file", sysf.name]
+            self.fail_clip = NEMO_FAIL_CLIP
+            self.engine = DuplexEngine(cmd, log=quiet, spec=NEMOTRON,
+                                       on_tool=self._ask_claude, on_tool_start=self._filler)
+        else:
+            self._sys_file = None
+            cmd = [os.environ.get("HOTLINE_IOS_DUPLEX_CMD", DEFAULT_CMD),
+                   "-p", self.prompt, "-v", voice or "NATF2"]
+            self.fail_clip = FAIL_CLIP
+            self.engine = DuplexEngine(cmd, log=quiet, spec=PERSONAPLEX)
         self.setup_error: str | None = None
         self.setup_seconds: float | None = None
         self._ready = threading.Thread(target=self._start, daemon=True, name="pp-start")
@@ -91,11 +155,56 @@ class DuplexCall:
 
     def _start(self) -> None:
         try:
-            self.setup_seconds = self.engine.start()
-            log.info("personaplex ready in %.1fs", self.setup_seconds)
+            free_gpu()
+            # Nemotron's system prompt is prefilled at ~41 ms per token before READY.
+            self.setup_seconds = self.engine.start(timeout=180.0)
+            log.info("%s ready in %.1fs", self.kind, self.setup_seconds)
         except Exception as exc:  # noqa: BLE001 -- surfaced on the call, not raised into the ring
             self.setup_error = str(exc)
-            log.exception("personaplex failed to start")
+            log.exception("%s failed to start", self.kind)
+
+    def _filler(self) -> None:
+        try:
+            self.engine.say(_load8k(NEMO_FILLER) * 0.9)
+        except Exception:
+            log.exception("could not play the filler")
+
+    def _ask_claude(self, call: str) -> str:
+        """Answer the model's ask_claude call with `claude -p`, read-only.
+
+        The question comes from a speech model that mishears, so the agent behind it
+        gets Read/Grep/Glob and nothing that runs commands. The prompt goes on stdin
+        and --tools uses the `=` form: a variadic flag in front of a positional prompt
+        swallows it (seen on this box)."""
+        import json
+        import shutil
+        import subprocess
+
+        question = call
+        try:
+            parsed = json.loads(call[call.index("["): call.rindex("]") + 1])
+            args = parsed[0].get("arguments", {})
+            if isinstance(args, str):
+                args = json.loads(args)
+            question = str(args.get("question", call))
+        except Exception:  # noqa: BLE001 -- pass the raw call text through instead
+            pass
+        # The call brief is NOT included: with it, haiku answered as the voice
+        # assistant and recited the brief instead of answering (2026-10-15 20:11).
+        prompt = ("You are Claude, the coding agent on Bogdan's workstation. A voice assistant that "
+                  "is on a phone call with Bogdan used a tool to ask you one question. Reply with "
+                  "only the answer: at most two short spoken sentences, plain words, no greeting, "
+                  "no markdown. If you cannot know it, say so in one sentence.\n\n"
+                  f"Question: {question}")
+        exe = shutil.which("claude") or "/opt/claude-code/bin/claude"
+        try:
+            out = subprocess.run([exe, "-p", "--model", "haiku", "--tools=Read,Grep,Glob"], input=prompt,
+                                 capture_output=True, text=True, timeout=TOOL_TIMEOUT_S)
+            answer = out.stdout.strip() or "Claude returned nothing."
+        except subprocess.TimeoutExpired:
+            answer = "Claude did not answer in time."
+        log.info("ask_claude %r -> %r", question, answer[:200])
+        return json.dumps({"answer": answer[:600]})
 
     def wait_ready(self, timeout: float = 60.0) -> bool:
         """Block until the model has prefilled. Called BEFORE the phone rings, so a
@@ -106,11 +215,16 @@ class DuplexCall:
 
     def close(self) -> None:
         self.engine.close()
+        if self._sys_file:
+            try:
+                os.unlink(self._sys_file)
+            except OSError:
+                pass
 
     def _say_failure(self, call: VoiceCall) -> None:
         """Audible failure: a short spoken notice, then the call ends. Never silence."""
         try:
-            with wave.open(str(FAIL_CLIP)) as w:
+            with wave.open(str(self.fail_clip)) as w:
                 pcm = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2")
                 rate = w.getframerate()
             call.send_audio(pcm.astype(np.float32) / 32768.0, rate)
@@ -153,7 +267,7 @@ class DuplexCall:
         self._ready.join(timeout=90)
         if self.setup_error or not self.engine.ready.is_set() or self.engine.dead.is_set():
             self.ended = f"model not ready: {self.setup_error or 'timeout'}"
-            self.note("error", f"personaplex did not start: {self.ended}")
+            self.note("error", f"{self.kind} did not start: {self.ended}")
             self._say_failure(call)
             return
         # Discard what queued up while he waited for the model; the model must
@@ -202,18 +316,20 @@ class DuplexCall:
             "setup_seconds": self.setup_seconds,
             "underruns": self.engine.underruns,
             "frame_ms": self.engine.stats[-1][1:] if self.engine.stats else None,
+            "stat": self.engine.stat_lines[-1] if self.engine.stat_lines else None,
+            "tool_calls": self.engine.tool_calls,
             "late_frames": pump.late_frames,
             "ended": self.ended,
         }
         log.info("duplex call ended (%s): %s", self.ended, self.stats)
         if self.ended == "model process exited":
-            self.note("error", "personaplex died mid-call")
+            self.note("error", f"{self.kind} died mid-call")
             self._say_failure(call)
 
     def _save(self, call: VoiceCall) -> None:
         text = "".join(p for _, p in self.engine.text).strip()
         st = None
-        summary = (f"[personaplex duplex call, {self.stats.get('seconds', 0)}s, ended: {self.ended}] model text stream: {text or '(nothing)'}")
+        summary = (f"[{self.kind} duplex call, {self.stats.get('seconds', 0)}s, ended: {self.ended}] model text stream: {text or '(nothing)'}")
         try:
             self.record_dir.mkdir(parents=True, exist_ok=True)
             stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -237,7 +353,7 @@ class DuplexCall:
                 w.writeframes(st.astype("<i2").tobytes())
             import json
             (self.record_dir / f"{stamp}-duplex.json").write_text(json.dumps({
-                "label": self.label, "stats": self.stats,
+                "label": self.label, "engine": self.kind, "stats": self.stats,
                 "answer_offset_frames": getattr(self, "answer_offset", 0),
                 "text_timed": [(round(i * 0.08, 2), p) for i, p in self.engine.text],
             }, indent=1))
