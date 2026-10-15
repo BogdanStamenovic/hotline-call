@@ -1,12 +1,7 @@
 """An answered call carried by a full-duplex speech model instead of the ASR -> LLM -> TTS loop.
 
-Opt-in only (`hotline-call --engine personaplex|nemotron`). The default call path
-never imports this module.
-
-nemotron (NemotronLabs VoiceChat 11B Q4_0 via llama-voicechat --stream, duplex-lab's
-fork) also gets one tool, ask_claude, answered by `claude -p` mid-call, with a spoken
-"let me check" filler while the model is deaf (it cannot hear during a tool call:
-measured 6.9 s of frozen timeline for one call plus the tool's own latency).
+Opt-in only (`hotline-call --engine personaplex`). The default call path never
+imports this module.
 
 The model process (pp-stream, PersonaPlex-7B q4_k on moshi.cpp) is started when
 the phone starts ringing, because its voice + persona prefill takes ~5 s and the
@@ -34,41 +29,15 @@ from typing import Callable
 
 import numpy as np
 
-from .media.duplex import NEMOTRON, PERSONAPLEX, DuplexEngine
+from .media.duplex import PERSONAPLEX, DuplexEngine
 from .media.voicecall import FRAME_MS, SdpError, VoiceCall, parse_sdp_answer
 
 log = logging.getLogger(__name__)
 
 LAB = Path(os.environ.get("HOTLINE_IOS_DUPLEX_LAB", str(Path.home() / "data/duplex-lab")))
 DEFAULT_CMD = str(LAB / "pp-stream/run-pp-stream")
-NEMOTRON_CMD = str(LAB / "nemo-stream/run-nemotron-stream")
 FREE_GPU = LAB / "pp-stream/free-gpu"
 FAIL_CLIP = LAB / "pp-stream/engine-failed.wav"
-NEMO_FAIL_CLIP = LAB / "nemo-stream/engine-failed.wav"
-NEMO_FILLER = LAB / "nemo-stream/filler-check.wav"
-TOOL_TIMEOUT_S = float(os.environ.get("HOTLINE_IOS_DUPLEX_TOOL_TIMEOUT", "25"))
-TOOLS_PROMPT = """
-
-You can use the following tools to assist the user if required:
-<AVAILABLE_TOOLS>[{"name": "ask_claude", "description": "Ask Claude, the coding agent on Bogdan's workstation, anything about his projects, builds, servers, files or this call. Returns Claude's answer.", "parameters": {"type": "object", "properties": {"question": {"type": "string", "description": "the question"}}, "required": ["question"]}}]</AVAILABLE_TOOLS>
-
-If you decide to call any tool(s), use the following format:
-<TOOLCALL>[{"name": "tool_name1", "arguments": "tool_args1"}]</TOOLCALL>
-
-The user will execute tool-calls and return responses from tool(s) in this format:
-<TOOL_RESPONSE>[{"tool_response1"}]</TOOL_RESPONSE>
-
-Based on the tool responses, you can call additional tools if needed, correct tool calls if any errors are found, or just respond to the user."""
-
-
-def _load_at(path: Path, rate: int) -> np.ndarray:
-    import soxr
-
-    with wave.open(str(path)) as w:
-        x = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
-        return soxr.resample(x, w.getframerate(), rate).astype(np.float32)
-
-
 def free_gpu() -> None:
     """Unload ollama's models (keep_alive 0, reversible). hotline-ios's own test
     suite leaves bge-m3 on the card, and that OOM-killed the first live ring."""
@@ -78,22 +47,20 @@ def free_gpu() -> None:
         subprocess.run([str(FREE_GPU)], timeout=20, capture_output=True)
     except Exception:  # noqa: BLE001 -- best effort; the READY gate catches the rest
         log.exception("free-gpu failed")
+
+
 DEFAULT_PROMPT = (
     "You are Ada, a friendly assistant. Bogdan, your developer, is calling you on the phone "
     "to test you. Answer his questions helpfully, keep answers short and conversational."
 )
 MAX_SECONDS = float(os.environ.get("HOTLINE_IOS_DUPLEX_MAX_S", "600"))
-# The 160 s session counts system-prompt frames too (~250 with the tool list), and
-# the step drifts to ~73 ms avg / 89 max by 130 s (fake phone, his voice, 2026-10-15
-# 20:51; 5 underruns). 125 s ends before both.
-NEMOTRON_MAX_S = 125.0
 ANSWER_HOLD_S = float(os.environ.get("HOTLINE_IOS_DUPLEX_HOLD_S", "1.5"))
 # The outbound queue the pump drains. Two frames is enough to ride out a late
 # tick; more is added latency he hears on every reply.
 OUT_QUEUE_FRAMES = 2
 
 
-def brief_prompt(reason: str, context: str = "", source: str = "", engine: str = "personaplex") -> str:
+def brief_prompt(reason: str, context: str = "", source: str = "") -> str:
     """The persona prompt for a call placed by an agent: what to tell him and ask him.
 
     PersonaPlex has no tool loop and no way to look anything up mid-call, so the
@@ -105,17 +72,6 @@ def brief_prompt(reason: str, context: str = "", source: str = "", engine: str =
              f"Your message for him: {reason.strip()}"]
     if context.strip():
         parts.append(f"Background: {context.strip()}")
-    if engine == "nemotron":
-        # Nemotron reads its system prompt out loud: "Your message for him: ..." came
-        # back as a 17-word verbatim run on his real voice (retry runs a/c0). Framed as
-        # background it must not read out, the longest shared run fell to 4 words and
-        # 0% of the prompt's 5-grams were spoken (runs b/d, 2026-10-15). Measured with
-        # duplex-lab/retry/score.py.
-        bg = reason.strip() + (f" {context.strip()}" if context.strip() else "")
-        return (f"You are Ada, Bogdan's voice assistant, on a phone call with him{who}. "
-                f"Background you know but do not read out, say what matters in your own words: {bg} "
-                "Talk with him naturally and briefly. When he asks about his projects, files or "
-                "computers, use the ask_claude tool.")
     parts.append("Greet him, deliver the message accurately and early, ask your question, "
                  "then listen and reply briefly and conversationally.")
     return " ".join(parts)
@@ -126,8 +82,7 @@ class DuplexCall:
 
     def __init__(self, *, prompt: str = "", voice: str = "", note: Callable[[str, str], None],
                  deliver: Callable[[str], None], hung_up: Callable[[], bool] | None,
-                 record_dir: Path | None = None, label: str = "",
-                 engine: str = "personaplex") -> None:
+                 record_dir: Path | None = None, label: str = "") -> None:
         self.note = note
         self.deliver = deliver
         self.hung_up = hung_up
@@ -139,31 +94,17 @@ class DuplexCall:
         self.codec = ""   # what the answer settled on; set when he picks up
         # The sentinel daemon._await_transcript waits on; anything else means done.
         self.ended = "not started"
-        self.kind = engine
-        self._tool_cache: dict[str, tuple[float, str]] = {}
+        self.kind = "personaplex"
         self.prompt = prompt or DEFAULT_PROMPT
-        def quiet(line: str) -> None:
-            if line.startswith(("LOOP", "TOOLABANDON", "TOOL ")):
-                log.info("%s: %s", engine, line)
-            elif not line.startswith("TXT"):
-                log.debug("%s: %s", engine, line)
-        if engine == "nemotron":
-            import tempfile
 
-            sysf = tempfile.NamedTemporaryFile("w", suffix=".txt", prefix="nemotron-sys-", delete=False)
-            sysf.write(self.prompt + TOOLS_PROMPT)
-            sysf.close()
-            self._sys_file = sysf.name
-            cmd = [os.environ.get("HOTLINE_IOS_NEMOTRON_CMD", NEMOTRON_CMD), "--system-file", sysf.name]
-            self.fail_clip = NEMO_FAIL_CLIP
-            self.engine = DuplexEngine(cmd, log=quiet, spec=NEMOTRON,
-                                       on_tool=self._ask_claude, on_tool_start=self._filler)
-        else:
-            self._sys_file = None
-            cmd = [os.environ.get("HOTLINE_IOS_DUPLEX_CMD", DEFAULT_CMD),
-                   "-p", self.prompt, "-v", voice or "NATF2"]
-            self.fail_clip = FAIL_CLIP
-            self.engine = DuplexEngine(cmd, log=quiet, spec=PERSONAPLEX)
+        def quiet(line: str) -> None:
+            if not line.startswith("TXT"):
+                log.debug("personaplex: %s", line)
+
+        cmd = [os.environ.get("HOTLINE_IOS_DUPLEX_CMD", DEFAULT_CMD),
+               "-p", self.prompt, "-v", voice or "NATF2"]
+        self.fail_clip = FAIL_CLIP
+        self.engine = DuplexEngine(cmd, log=quiet, spec=PERSONAPLEX)
         self.setup_error: str | None = None
         self.setup_seconds: float | None = None
         self._ready = threading.Thread(target=self._start, daemon=True, name="pp-start")
@@ -172,64 +113,11 @@ class DuplexCall:
     def _start(self) -> None:
         try:
             free_gpu()
-            # Nemotron's system prompt is prefilled at ~41 ms per token before READY.
-            self.setup_seconds = self.engine.start(timeout=180.0)
+            self.setup_seconds = self.engine.start(timeout=120.0)
             log.info("%s ready in %.1fs", self.kind, self.setup_seconds)
         except Exception as exc:  # noqa: BLE001 -- surfaced on the call, not raised into the ring
             self.setup_error = str(exc)
             log.exception("%s failed to start", self.kind)
-
-    def _filler(self) -> None:
-        try:
-            self.engine.say(_load_at(NEMO_FILLER, self.engine.wire_rate) * 0.9)
-        except Exception:
-            log.exception("could not play the filler")
-
-    def _ask_claude(self, call: str) -> str:
-        """Answer the model's ask_claude call with `claude -p`, read-only.
-
-        The question comes from a speech model that mishears, so the agent behind it
-        gets Read/Grep/Glob and nothing that runs commands. The prompt goes on stdin
-        and --tools uses the `=` form: a variadic flag in front of a positional prompt
-        swallows it (seen on this box)."""
-        import json
-        import shutil
-        import subprocess
-
-        question = call
-        try:
-            parsed = json.loads(call[call.index("["): call.rindex("]") + 1])
-            args = parsed[0].get("arguments", {})
-            if isinstance(args, str):
-                args = json.loads(args)
-            question = str(args.get("question", call))
-        except Exception:  # noqa: BLE001 -- pass the raw call text through instead
-            pass
-        # The call brief is NOT included: with it, haiku answered as the voice
-        # assistant and recited the brief instead of answering (2026-10-15 20:11).
-        # Dedupe: on his real voice Nemotron sent the same misheard question 9 times in
-        # 90 s (fake-phone run 2026-10-15 20:46), each one 8 s of deaf model plus a
-        # claude -p. A repeat inside 90 s gets the cached answer, marked as such.
-        now = time.monotonic()
-        cached = self._tool_cache.get(question)
-        if cached and now - cached[0] < 90:
-            log.info("ask_claude repeat of %r, answering from cache", question)
-            return json.dumps({"answer": cached[1], "note": "already asked; tell Bogdan this answer"})
-        prompt = ("You are Claude, the coding agent on Bogdan's workstation. A voice assistant that "
-                  "is on a phone call with Bogdan used a tool to ask you one question. Reply with "
-                  "only the answer: at most two short spoken sentences, plain words, no greeting, "
-                  "no markdown. If you cannot know it, say so in one sentence.\n\n"
-                  f"Question: {question}")
-        exe = shutil.which("claude") or "/opt/claude-code/bin/claude"
-        try:
-            out = subprocess.run([exe, "-p", "--model", "haiku", "--tools=Read,Grep,Glob"], input=prompt,
-                                 capture_output=True, text=True, timeout=TOOL_TIMEOUT_S)
-            answer = out.stdout.strip() or "Claude returned nothing."
-        except subprocess.TimeoutExpired:
-            answer = "Claude did not answer in time."
-        log.info("ask_claude %r -> %r", question, answer[:200])
-        self._tool_cache[question] = (time.monotonic(), answer[:600])
-        return json.dumps({"answer": answer[:600]})
 
     def wait_ready(self, timeout: float = 60.0) -> bool:
         """Block until the model has prefilled. Called BEFORE the phone rings, so a
@@ -240,11 +128,6 @@ class DuplexCall:
 
     def close(self) -> None:
         self.engine.close()
-        if self._sys_file:
-            try:
-                os.unlink(self._sys_file)
-            except OSError:
-                pass
 
     def _say_failure(self, call: VoiceCall) -> None:
         """Audible failure: a short spoken notice, then the call ends. Never silence."""
@@ -342,11 +225,8 @@ class DuplexCall:
                 if self.engine.dead.is_set():
                     self.ended = "model process exited"
                     break
-                # Nemotron's session is 160 s (what fits in VRAM); end on our side
-                # first, so a planned limit does not play the "model failed" notice.
-                cap = min(MAX_SECONDS, NEMOTRON_MAX_S) if self.kind == "nemotron" else MAX_SECONDS
-                if time.monotonic() - began > cap:
-                    self.ended = f"max duration {cap:.0f}s"
+                if time.monotonic() - began > MAX_SECONDS:
+                    self.ended = f"max duration {MAX_SECONDS:.0f}s"
                     break
         self.stats = {
             "seconds": round(time.monotonic() - began, 1),
@@ -354,7 +234,6 @@ class DuplexCall:
             "underruns": self.engine.underruns,
             "frame_ms": self.engine.stats[-1][1:] if self.engine.stats else None,
             "stat": self.engine.stat_lines[-1] if self.engine.stat_lines else None,
-            "tool_calls": self.engine.tool_calls,
             "late_frames": pump.late_frames,
             "codec": self.codec,
             "ended": self.ended,

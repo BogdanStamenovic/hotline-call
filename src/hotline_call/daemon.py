@@ -679,7 +679,7 @@ class Service:
         confirmed-ring path both depend on that: a ring that holds a call it has
         nothing to say on is worse than one that does not.
         """
-        if engine in ("personaplex", "nemotron"):
+        if engine == "personaplex":
             yield from self._duplex_leg(doorbell, prepared)
             return
         # Nothing between here and the yield may raise. This runs inside
@@ -717,7 +717,7 @@ class Service:
             self._cool_models()
 
     def _prepare_duplex(self, doorbell: Any, target: CallTarget, conversation: str,
-                        loop: Any, engine: str = "personaplex") -> tuple[list[Any], list[Any], str]:
+                        loop: Any) -> tuple[list[Any], list[Any], str]:
         """Start PersonaPlex for every link that can hold the call and wait until it
         is READY. Runs in an executor, BEFORE the ring: if the model cannot start,
         the call fails without his phone ever ringing.
@@ -734,18 +734,18 @@ class Service:
         links = holds_calls(doorbell)
         if not links:
             return [], [], "no transport here can hold an answered call"
-        prompt = brief_prompt(target.reason, target.context, target.caller_id, engine)
+        prompt = brief_prompt(target.reason, target.context, target.caller_id)
         handlers = [DuplexCall(prompt=prompt, note=append,
                                deliver=lambda text: append("you", text),
                                hung_up=getattr(link, "far_end_hung_up", None),
-                               label=f"{target.caller_id}: {target.reason}", engine=engine)
+                               label=f"{target.caller_id}: {target.reason}")
                     for link in links]
         for handler in handlers:
-            if not handler.wait_ready(180.0):
+            if not handler.wait_ready(90.0):
                 why = handler.setup_error or "timed out waiting for the model"
                 for h in handlers:
                     h.close()
-                return [], [], f"{engine} did not start: {why}"
+                return [], [], f"personaplex did not start: {why}"
         return links, handlers, ""
 
     def _duplex_leg(self, doorbell: Any, prepared: Any) -> Any:
@@ -927,10 +927,10 @@ class Service:
 
         engine = str(body.get("engine", "") or "")
         prepared = None
-        if engine in ("personaplex", "nemotron"):
+        if engine == "personaplex":
             loop = asyncio.get_running_loop()
             links, handlers, why = await loop.run_in_executor(
-                None, self._prepare_duplex, doorbell, target, conversation, loop, engine)
+                None, self._prepare_duplex, doorbell, target, conversation, loop)
             if why:
                 # Not rung at all. A model that is not up must cost a failed call,
                 # not him answering to silence.

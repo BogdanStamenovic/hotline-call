@@ -112,11 +112,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--engine",
         default="",
-        choices=["", "personaplex", "nemotron"],
+        choices=["", "personaplex"],
         help="who talks on the call. Default: the usual Serbian ASR + Claude + TTS "
-        "loop. 'personaplex' / 'nemotron': an English full-duplex speech model "
-        "(PersonaPlex-7B, or Nemotron VoiceChat 11B with an ask_claude tool) on the "
-        "local GPU holds the whole call; the reason and --context become its persona prompt; the result is a Whisper transcript of both sides",
+        "loop. 'personaplex': an English full-duplex speech model (PersonaPlex-7B "
+        "on the local GPU) holds the whole call; the reason and --context become its persona prompt; the result is a Whisper transcript of both sides",
     )
     parser.add_argument("-q", "--quiet", action="store_true", help="suppress non-error output")
     return parser

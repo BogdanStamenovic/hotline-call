@@ -1,9 +1,9 @@
-"""Both duplex engines at the line's real rate, with a fake model process.
+"""The duplex engine at the line's real rate, with a fake model process.
 
 The fake speaks the engines' pipe protocol (READY on stderr, float32 frames in on
 stdin, float32 audio out on stdout) for a given EngineSpec: it records every
 input frame and echoes it back resampled to the engine's output rate, in uneven
-chunks the way Nemotron writes codec blocks. That measures, without a GPU, what
+chunks so the bridge cannot rely on frame-sized reads. That measures, without a GPU, what
 the MODEL is fed and what reaches his phone. `_transcribe` and `free_gpu` are
 stubbed: the real ones load Whisper and talk to ollama.
 """
@@ -77,7 +77,7 @@ def run_call(tmp_path, monkeypatch, choice: codec.Choice, engine: str):
     began = time.monotonic()
     dc = duplexcall.DuplexCall(note=lambda *a: None, deliver=lambda s: None,
                                hung_up=lambda: time.monotonic() - began > 4.5,
-                               record_dir=tmp_path, engine=engine)
+                               record_dir=tmp_path)
     assert dc.wait_ready(20)
 
     phone = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -128,7 +128,7 @@ def srtp_unprotect(session, data):
         return b""
 
 
-ENGINES = [("personaplex", duplex.PERSONAPLEX), ("nemotron", duplex.NEMOTRON)]
+ENGINES = [("personaplex", duplex.PERSONAPLEX)]
 
 
 @needs_opus
@@ -143,7 +143,7 @@ def test_on_opus_the_model_hears_above_4khz(tmp_path, monkeypatch, engine, spec)
     assert band_db(tail, spec.in_rate, 6000) > -6
     # And the echo comes back to his phone with its top end. The fake echoes its
     # INPUT, so the highest tone it can return is set by the lower of the two
-    # rates -- Nemotron's 16 kHz input caps it at 8 kHz, not its 22.05 kHz output.
+    # rates.
     top = 10000 if min(spec.in_rate, spec.out_rate) > 20000 else 6000
     echoed = back[rate:]
     assert echoed.size > rate // 2
