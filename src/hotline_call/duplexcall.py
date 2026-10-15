@@ -37,6 +37,7 @@ log = logging.getLogger(__name__)
 
 LAB = Path(os.environ.get("HOTLINE_IOS_DUPLEX_LAB", str(Path.home() / "data/duplex-lab")))
 DEFAULT_CMD = str(LAB / "pp-stream/run-pp-stream")
+FAIL_CLIP = LAB / "pp-stream/engine-failed.wav"
 DEFAULT_PROMPT = (
     "You are Ada, a friendly assistant. Bogdan, your developer, is calling you on the phone "
     "to test you. Answer his questions helpfully, keep answers short and conversational."
@@ -96,8 +97,25 @@ class DuplexCall:
             self.setup_error = str(exc)
             log.exception("personaplex failed to start")
 
+    def wait_ready(self, timeout: float = 60.0) -> bool:
+        """Block until the model has prefilled. Called BEFORE the phone rings, so a
+        model that cannot start costs a failed call, never him answering to silence
+        (2026-10-15 19:16: it did exactly that, an OOM abort during prefill)."""
+        self._ready.join(timeout)
+        return self.engine.ready.is_set() and not self.engine.dead.is_set() and not self.setup_error
+
     def close(self) -> None:
         self.engine.close()
+
+    def _say_failure(self, call: VoiceCall) -> None:
+        """Audible failure: a short spoken notice, then the call ends. Never silence."""
+        try:
+            with wave.open(str(FAIL_CLIP)) as w:
+                pcm = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2")
+                rate = w.getframerate()
+            call.send_audio(pcm.astype(np.float32) / 32768.0, rate)
+        except Exception:
+            log.exception("could not play the failure notice")
 
     def _gone(self) -> bool:
         if self.hung_up is None:
@@ -136,6 +154,7 @@ class DuplexCall:
         if self.setup_error or not self.engine.ready.is_set() or self.engine.dead.is_set():
             self.ended = f"model not ready: {self.setup_error or 'timeout'}"
             self.note("error", f"personaplex did not start: {self.ended}")
+            self._say_failure(call)
             return
         # Discard what queued up while he waited for the model; the model must
         # start from "now", not from a backlog it would answer seconds late.
@@ -187,6 +206,9 @@ class DuplexCall:
             "ended": self.ended,
         }
         log.info("duplex call ended (%s): %s", self.ended, self.stats)
+        if self.ended == "model process exited":
+            self.note("error", "personaplex died mid-call")
+            self._say_failure(call)
 
     def _save(self, call: VoiceCall) -> None:
         text = "".join(p for _, p in self.engine.text).strip()
