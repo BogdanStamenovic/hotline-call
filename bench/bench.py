@@ -50,12 +50,13 @@ def turns(call_dir):
     found = []
     for path in sorted(glob.glob(os.path.join(call_dir, "turn-*.wav"))):
         with wave.open(path) as w:
-            assert w.getframerate() == 8000, f"{path} is not 8 kHz"
+            rate = w.getframerate()
             pcm = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2")
-        # 8 kHz -> 16 kHz is what every Whisper build wants; the BAND is still
-        # telephony, which is the point of the measurement.
+        # Whatever the line carried -> 16 kHz, which is what every Whisper build
+        # wants. 8 kHz for a G.711 call, 48 kHz for Opus; the BAND is still
+        # whatever the line let through, which is the point of the measurement.
         import soxr
-        audio = soxr.resample(pcm.astype(np.float32) / 32768.0, 8000, 16000).astype(np.float32)
+        audio = soxr.resample(pcm.astype(np.float32) / 32768.0, rate, 16000).astype(np.float32)
         found.append((int(os.path.basename(path)[5:7]), audio))
     return found
 

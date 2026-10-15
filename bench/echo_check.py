@@ -47,8 +47,16 @@ MIN_DELAY_MS = 20
 MAX_DELAY_MS = 500
 
 
+_RATE_FIXED = False
+
+
 def read(path):
+    # The line's rate comes from the recording: 8 kHz for a G.711 call, 48 kHz
+    # for Opus. Both files of one call must agree; frames are always 20 ms.
+    global WIRE_RATE, FRAME, _RATE_FIXED
     with wave.open(path) as handle:
+        if not _RATE_FIXED:
+            WIRE_RATE, FRAME, _RATE_FIXED = handle.getframerate(), handle.getframerate() // 50, True
         assert handle.getframerate() == WIRE_RATE, path
         return np.frombuffer(handle.readframes(handle.getnframes()),
                              dtype="<i2").astype(np.float64) / 32768.0

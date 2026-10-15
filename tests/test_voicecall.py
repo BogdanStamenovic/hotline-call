@@ -84,6 +84,18 @@ def test_a_far_end_without_pcmu_is_refused():
         voicecall.parse_sdp_answer(message)
 
 
+def test_an_answer_that_leads_with_pcma_is_carried_as_pcma():
+    """The answerer's first format is the one it sends. Taking PCMU because we
+    happen to prefer it would have us decode his A-law as mu-law: noise."""
+    message, _, _ = sdp_200(pts="8 0 101")
+    assert voicecall.parse_sdp_answer(message).pt == voicecall.PT_PCMA
+
+
+def test_a_pcma_only_answer_is_accepted_rather_than_hung_up_on():
+    message, _, _ = sdp_200(pts="8 101")
+    assert voicecall.parse_sdp_answer(message).pt == voicecall.PT_PCMA
+
+
 # -- the media path over real sockets --------------------------------------
 
 
@@ -194,6 +206,71 @@ def test_a_packet_encrypted_with_the_wrong_key_is_counted_not_decoded():
     assert call.auth_failures == 1
     assert call.frames_received == 0
     assert got.size == 0
+
+
+def call_pair_pcma():
+    ours = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); ours.bind(("127.0.0.1", 0))
+    theirs = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); theirs.bind(("127.0.0.1", 0))
+    our_key, our_salt = srtp.new_key_salt()
+    their_key, their_salt = srtp.new_key_salt()
+    answer = voicecall.SdpAnswer(*theirs.getsockname(), their_key, their_salt, [8, 0],
+                                 voicecall.PT_PCMA)
+    call = voicecall.VoiceCall(ours, answer, our_key, our_salt)
+    _LIVE_CALLS.append(call)
+    return call, theirs, (our_key, our_salt), (their_key, their_salt), ours.getsockname()
+
+
+def _peak_hz(audio, rate):
+    spectrum = np.abs(np.fft.rfft(audio))
+    return np.fft.rfftfreq(audio.size, 1 / rate)[int(np.argmax(spectrum))]
+
+
+def test_his_a_law_is_decoded_as_a_law_not_as_mu_law_noise():
+    """Regression: every inbound payload used to be decoded as mu-law,
+    whatever its payload type, so an A-law line came out as noise."""
+    call, theirs, _, theirs_ks, our_addr = call_pair_pcma()
+    his = srtp.SrtpSession(*theirs_ks)
+    rate, n = 8000, voicecall.FRAME_SAMPLES
+    tone = (np.sin(2 * np.pi * 440 * np.arange(rate) / rate) * 0.5 * 32767).astype("<i2")
+    alaw = pcm.alaw_encode(tone.tobytes())
+    for i in range(0, len(alaw), n):
+        packet = rtp.build_packet(i // n, i, 0xCAFE, alaw[i:i + n], voicecall.PT_PCMA)
+        theirs.sendto(his.protect(packet), our_addr)
+    got = call.receive_audio(1.4)
+    assert call.frames_received == rate // n
+    assert abs(_peak_hz(got, 16000) - 440) < 15
+    # Measured on the old code: the level is about right (RMS 0.335 against
+    # 0.354) and the content is not -- peak at 1320 Hz, 17% of the energy at
+    # 440. So the check is on what the energy is made of, not how much there is.
+    spectrum = np.abs(np.fft.rfft(got)) ** 2
+    freqs = np.fft.rfftfreq(got.size, 1 / 16000)
+    assert spectrum[(freqs > 420) & (freqs < 460)].sum() / spectrum.sum() > 0.9
+
+
+def test_we_send_a_law_when_that_is_what_he_answered_with():
+    call, theirs, ours_ks, _, _ = call_pair_pcma()
+    rate = 8000
+    call.send_audio((np.sin(2 * np.pi * 440 * np.arange(rate) / rate) * 0.6)
+                    .astype(np.float32), rate=rate)
+    frames = read_frames(theirs, srtp.SrtpSession(*ours_ks),
+                         limit=rate // voicecall.FRAME_SAMPLES)
+    assert frames and all(f[0] == voicecall.PT_PCMA for f in frames)
+    back = pcm.to_model(pcm.alaw_decode(b"".join(f[3] for f in frames)), rate=rate)
+    assert abs(_peak_hz(back, 16000) - 440) < 15
+
+
+def test_a_telephone_event_is_not_heard_as_his_voice():
+    """RFC 4733 DTMF arrives authenticated, on the same stream, as payload type
+    101. Decoding it as mu-law fed the endpointer a burst of noise."""
+    call, theirs, _, theirs_ks, our_addr = call_pair()
+    his = srtp.SrtpSession(*theirs_ks)
+    for seq in range(5):
+        theirs.sendto(his.protect(rtp.build_packet(seq, 0, 0xCAFE, b"\x05\x0a\x00\xa0", 101)),
+                      our_addr)
+    got = call.receive_audio(0.4)
+    assert got.size == 0
+    assert call.frames_received == 0
+    assert call.stats()["foreign_frames"] == 5
 
 
 def test_audio_survives_the_round_trip_recognisably():

@@ -93,7 +93,7 @@ import time
 import uuid
 from collections.abc import Callable
 
-from ..media import srtp
+from ..media import codec, srtp
 from .base import CallDeclined, CallTarget, CallUnanswered, CallUnreachable
 
 log = logging.getLogger("hotline-ios.ring.sip")
@@ -528,18 +528,20 @@ class SipTransport:
         # was fine while this only rang and hung up. It is now real SRTP master
         # material (16-byte key || 14-byte salt) and `media/srtp.py` can build a
         # working session from it, so an answered call has somewhere to go.
+        #
+        # Opus first, then G.711 (see `media/codec.py`). The order is our
+        # preference; the answer's order is the decision.
+        payload_types, codec_lines = codec.offer_lines()
         sdp = (
             "v=0\r\n"
             f"o=- {random.randint(1, 2**31)} 1 IN IP4 {media_host}\r\n"
             "s=hotline\r\n"
             f"c=IN IP4 {media_host}\r\n"
             "t=0 0\r\n"
-            f"m=audio {media_port} RTP/SAVP 0 8 101\r\n"
+            f"m=audio {media_port} RTP/SAVP {payload_types}\r\n"
             f"{srtp.crypto_line(self._srtp_key, self._srtp_salt)}\r\n"
-            "a=rtpmap:0 PCMU/8000\r\n"
-            "a=rtpmap:8 PCMA/8000\r\n"
-            "a=rtpmap:101 telephone-event/8000\r\n"
-            "a=sendrecv\r\n"
+            + "".join(f"{line}\r\n" for line in codec_lines)
+            + "a=sendrecv\r\n"
         )
         lines = [
             f"INVITE {them} SIP/2.0",

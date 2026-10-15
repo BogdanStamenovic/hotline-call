@@ -118,6 +118,50 @@ def _build_ulaw_encode() -> np.ndarray:
     return order[pick].astype(np.uint8)
 
 
+def _build_alaw_decode() -> np.ndarray:
+    codes = np.arange(256, dtype=np.int32) ^ 0x55
+    sign = codes & 0x80
+    exponent = (codes >> 4) & 0x07
+    mantissa = codes & 0x0F
+    magnitude = np.where(exponent == 0, (mantissa << 4) + 8,
+                         ((mantissa << 4) + 0x108) << np.maximum(exponent - 1, 0))
+    # A-law's sign bit is the other way round from mu-law's: set means positive.
+    return np.where(sign != 0, magnitude, -magnitude).astype("<i2")
+
+
+def _inverse(decode: np.ndarray) -> np.ndarray:
+    """Nearest-level encoder for a decode table; see `_build_ulaw_encode`."""
+    levels = np.sort(decode.astype(np.int32))
+    order = np.argsort(decode.astype(np.int32))
+    everything = np.arange(-32768, 32768, dtype=np.int32)
+    index = np.clip(np.searchsorted(levels, everything), 1, len(levels) - 1)
+    lower, upper = levels[index - 1], levels[index]
+    pick = np.where(everything - lower <= upper - everything, index - 1, index)
+    return order[pick].astype(np.uint8)
+
+
+_ALAW_DECODE = _build_alaw_decode()
+_ALAW_ENCODE = np.zeros(0, dtype=np.uint8)
+
+
+def alaw_decode(payload: bytes) -> bytes:
+    """G.711 A-law to 16-bit LE PCM."""
+    if not payload:
+        return b""
+    return _ALAW_DECODE[np.frombuffer(payload, dtype=np.uint8)].tobytes()
+
+
+def alaw_encode(pcm: bytes) -> bytes:
+    """16-bit LE PCM to G.711 A-law."""
+    global _ALAW_ENCODE
+    if not pcm:
+        return b""
+    if _ALAW_ENCODE.size == 0:
+        _ALAW_ENCODE = _inverse(_ALAW_DECODE)
+    samples = np.frombuffer(pcm, dtype="<i2").astype(np.int32)
+    return _ALAW_ENCODE[samples + 32768].tobytes()
+
+
 def ulaw_decode(payload: bytes) -> bytes:
     """G.711 µ-law to 16-bit LE PCM."""
     if not payload:
