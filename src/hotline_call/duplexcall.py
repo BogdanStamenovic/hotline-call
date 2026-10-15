@@ -84,6 +84,7 @@ DEFAULT_PROMPT = (
     "to test you. Answer his questions helpfully, keep answers short and conversational."
 )
 MAX_SECONDS = float(os.environ.get("HOTLINE_IOS_DUPLEX_MAX_S", "600"))
+NEMOTRON_MAX_S = 150.0
 # The outbound queue the pump drains. Two frames is enough to ride out a late
 # tick; more is added latency he hears on every reply.
 OUT_QUEUE_FRAMES = 2
@@ -308,8 +309,11 @@ class DuplexCall:
                 if self.engine.dead.is_set():
                     self.ended = "model process exited"
                     break
-                if time.monotonic() - began > MAX_SECONDS:
-                    self.ended = f"max duration {MAX_SECONDS:.0f}s"
+                # Nemotron's session is 160 s (what fits in VRAM); end on our side
+                # first, so a planned limit does not play the "model failed" notice.
+                cap = min(MAX_SECONDS, NEMOTRON_MAX_S) if self.kind == "nemotron" else MAX_SECONDS
+                if time.monotonic() - began > cap:
+                    self.ended = f"max duration {cap:.0f}s"
                     break
         self.stats = {
             "seconds": round(time.monotonic() - began, 1),
