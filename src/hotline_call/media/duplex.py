@@ -1,4 +1,8 @@
-"""Full-duplex bridge between an 8 kHz telephone leg and a streaming speech model process.
+"""Full-duplex bridge between a telephone leg and a streaming speech model process.
+
+The leg's rate is the negotiated codec's: 48 kHz on Opus, 8 kHz on G.711, set by
+`use_wire_rate` once the call is answered. On G.711 the model hears nothing above
+4 kHz -- which is how both engines' first test calls went.
 
 No VAD, no turn gate: caller audio is pushed continuously and the model's audio is
 pulled continuously. Two engines speak the same pipe protocol (float32 frames in on
@@ -26,7 +30,7 @@ from typing import Callable
 import numpy as np
 import soxr
 
-WIRE_RATE = 8_000
+WIRE_RATE = 8_000   # until use_wire_rate() says otherwise
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,7 @@ class DuplexEngine:
         self.tool_calls: list[dict[str, object]] = []
         self.ready = threading.Event()
         self.dead = threading.Event()
+        self.wire_rate = WIRE_RATE
         self._up = soxr.ResampleStream(WIRE_RATE, spec.in_rate, 1, dtype="float32")
         self._down = soxr.ResampleStream(spec.out_rate, WIRE_RATE, 1, dtype="float32")
         self._in = np.zeros(0, dtype=np.float32)
@@ -75,6 +80,25 @@ class DuplexEngine:
         self.prime = int(WIRE_RATE * spec.prime_s)
         self.proc: subprocess.Popen | None = None
         self._ctl_w: int | None = None
+
+    def use_wire_rate(self, rate: int) -> None:
+        """Set the telephone leg's rate once the call is answered.
+
+        The engine is built when the phone starts ringing, before the answer
+        says which codec won, so the resamplers are rebuilt here, before the
+        first push. Anything the model already produced at the old rate is
+        dropped: it was never going to be played to anyone.
+        """
+        if rate == self.wire_rate:
+            return
+        with self._lock:
+            self.wire_rate = rate
+            self._up = soxr.ResampleStream(rate, self.spec.in_rate, 1, dtype="float32")
+            self._down = soxr.ResampleStream(self.spec.out_rate, rate, 1, dtype="float32")
+            self.prime = int(rate * self.spec.prime_s)
+            self._in = np.zeros(0, dtype=np.float32)
+            self._out8.clear()
+            self._out8_len = 0
 
     def start(self, timeout: float = 120.0) -> float:
         t0 = time.monotonic()
@@ -153,14 +177,14 @@ class DuplexEngine:
             if not usable:
                 continue
             block, pending = pending[:usable], pending[usable:]
-            out = self._down.resample_chunk(np.frombuffer(block, dtype="<f4"))
             with self._lock:
+                out = self._down.resample_chunk(np.frombuffer(block, dtype="<f4"))
                 self._out8.append(out)
                 self._out8_len += out.size
                 self.frames_out += 1
 
     def push(self, pcm16: bytes) -> None:
-        """Caller audio, 8 kHz mono LE int16, any chunk size."""
+        """Caller audio at `wire_rate`, mono LE int16, any chunk size."""
         if self.dead.is_set() or not self.proc or not self.proc.stdin:
             return
         x = np.frombuffer(pcm16, dtype="<i2").astype(np.float32) / 32768.0
@@ -174,10 +198,10 @@ class DuplexEngine:
                 self.dead.set()
                 return
 
-    def say(self, audio8k: np.ndarray) -> None:
-        """Mix our own audio (float, 8 kHz) over whatever the model sends next."""
+    def say(self, audio: np.ndarray) -> None:
+        """Mix our own audio (float, at `wire_rate`) over whatever the model sends next."""
         with self._lock:
-            self._overlay.append(audio8k.astype(np.float32))
+            self._overlay.append(audio.astype(np.float32))
 
     def _take(self, q: deque, samples: int) -> tuple[np.ndarray, int]:
         got: list[np.ndarray] = []
@@ -196,7 +220,7 @@ class DuplexEngine:
         return np.concatenate(got), n
 
     def pull(self, samples: int) -> bytes:
-        """Model audio, 8 kHz mono LE int16; zero-padded when the model is behind."""
+        """Model audio at `wire_rate`, mono LE int16; zero-padded when the model is behind."""
         with self._lock:
             over, _ = self._take(self._overlay, samples) if self._overlay else (None, 0)
             if not self._primed and self._out8_len >= self.prime:

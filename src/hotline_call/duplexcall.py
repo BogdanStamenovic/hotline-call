@@ -35,8 +35,7 @@ from typing import Callable
 import numpy as np
 
 from .media.duplex import NEMOTRON, PERSONAPLEX, DuplexEngine
-from .media.pcm import ulaw_decode, ulaw_encode
-from .media.voicecall import FRAME_MS, FRAME_SAMPLES, SdpError, VoiceCall, parse_sdp_answer
+from .media.voicecall import FRAME_MS, SdpError, VoiceCall, parse_sdp_answer
 
 log = logging.getLogger(__name__)
 
@@ -62,12 +61,12 @@ The user will execute tool-calls and return responses from tool(s) in this forma
 Based on the tool responses, you can call additional tools if needed, correct tool calls if any errors are found, or just respond to the user."""
 
 
-def _load8k(path: Path) -> np.ndarray:
+def _load_at(path: Path, rate: int) -> np.ndarray:
     import soxr
 
     with wave.open(str(path)) as w:
         x = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
-        return soxr.resample(x, w.getframerate(), 8000).astype(np.float32)
+        return soxr.resample(x, w.getframerate(), rate).astype(np.float32)
 
 
 def free_gpu() -> None:
@@ -127,6 +126,7 @@ class DuplexCall:
         self.answered = False
         self.turns = 0
         self.stats: dict[str, object] = {}
+        self.codec = ""   # what the answer settled on; set when he picks up
         # The sentinel daemon._await_transcript waits on; anything else means done.
         self.ended = "not started"
         self.kind = engine
@@ -166,7 +166,7 @@ class DuplexCall:
 
     def _filler(self) -> None:
         try:
-            self.engine.say(_load8k(NEMO_FILLER) * 0.9)
+            self.engine.say(_load_at(NEMO_FILLER, self.engine.wire_rate) * 0.9)
         except Exception:
             log.exception("could not play the filler")
 
@@ -253,6 +253,9 @@ class DuplexCall:
             return
         self.answered = True
         call = VoiceCall(media_sock, answer, srtp_key, srtp_salt)
+        # 48 kHz when the phone took Opus, 8 kHz when it fell back to G.711.
+        self.engine.use_wire_rate(call.rate)
+        self.codec = call.codec.describe()
         call.record()
         try:
             self._converse(call)
@@ -279,7 +282,7 @@ class DuplexCall:
         self.answer_offset = len(pump.wire_out or [])
         tick = FRAME_MS / 1000.0
         next_tick = time.monotonic()
-        silence = bytes(FRAME_SAMPLES * 2)
+        silence = bytes(call.frame_samples * 2)
         n = 0
         while True:
             now = time.monotonic()
@@ -295,12 +298,12 @@ class DuplexCall:
                 for _ in range(backlog - 2):
                     pump.inbox.get_nowait()
             try:
-                frame = ulaw_decode(pump.inbox.get_nowait())
+                frame = pump.inbox.get_nowait()
             except Exception:  # queue.Empty
                 frame = silence
             self.engine.push(frame)
             if pump.queued() < OUT_QUEUE_FRAMES:
-                pump.enqueue([ulaw_encode(self.engine.pull(FRAME_SAMPLES))])
+                pump.enqueue([self.engine.pull(call.frame_samples)])
             n += 1
             if n % 25 == 0:
                 if self._gone():
@@ -323,6 +326,7 @@ class DuplexCall:
             "stat": self.engine.stat_lines[-1] if self.engine.stat_lines else None,
             "tool_calls": self.engine.tool_calls,
             "late_frames": pump.late_frames,
+            "codec": self.codec,
             "ended": self.ended,
         }
         log.info("duplex call ended (%s): %s", self.ended, self.stats)
@@ -342,18 +346,20 @@ class DuplexCall:
             # Stereo on the outbound clock: L = him (placed at the frame index it
             # arrived on), R = what we sent. Exact to 20 ms; see MediaPump.wire_at.
             n = len(wire_out)
-            left = np.zeros(n * FRAME_SAMPLES, dtype="<i2")
+            # Both lists hold decoded PCM at the call's rate, one 20 ms frame each.
+            size = call.frame_samples
+            left = np.zeros(n * size, dtype="<i2")
             for payload, idx in zip(wire_in, at, strict=False):
                 if idx < n:
-                    pcm = np.frombuffer(ulaw_decode(payload), dtype="<i2")
-                    left[idx * FRAME_SAMPLES: idx * FRAME_SAMPLES + pcm.size] = pcm
-            right = np.frombuffer(ulaw_decode(b"".join(wire_out)), dtype="<i2")
+                    pcm = np.frombuffer(payload, dtype="<i2")
+                    left[idx * size: idx * size + pcm.size] = pcm
+            right = np.frombuffer(b"".join(wire_out), dtype="<i2")
             st = np.stack([left[: right.size], right[: left.size]], 1)
             path = self.record_dir / f"{stamp}-duplex.wav"
             with wave.open(str(path), "wb") as w:
                 w.setnchannels(2)
                 w.setsampwidth(2)
-                w.setframerate(8000)
+                w.setframerate(call.rate)
                 w.writeframes(st.astype("<i2").tobytes())
             import json
             (self.record_dir / f"{stamp}-duplex.json").write_text(json.dumps({
@@ -365,7 +371,7 @@ class DuplexCall:
             log.info("duplex call recorded to %s", path)
         except Exception:
             log.exception("could not save the duplex recording")
-        turns = self._transcribe(st)
+        turns = self._transcribe(st, call.rate)
         if not any(who == "you" for _, who, _ in turns):
             # place() blocks until a "you" entry arrives, so there must be one.
             turns.append((float("inf"), "you", "(nothing transcribed from his side)"))
@@ -386,7 +392,8 @@ class DuplexCall:
             self.ended = "done"
         log.info("%s", summary)
 
-    def _transcribe(self, stereo: np.ndarray | None) -> list[tuple[float, str, str]]:
+    def _transcribe(self, stereo: np.ndarray | None,
+                    rate: int = 8000) -> list[tuple[float, str, str]]:
         """Both sides of the recording, as time-ordered turns. After the model has
         exited, so Whisper gets the GPU PersonaPlex was holding.
 
@@ -412,7 +419,7 @@ class DuplexCall:
                 whisper = WhisperModel("small", device="cpu", compute_type="int8")
             turns: list[tuple[float, str, str]] = []
             for channel, who in ((0, "you"), (1, "claude")):
-                audio = soxr.resample(stereo[:, channel].astype(np.float32) / 32768.0, 8000, 16000)
+                audio = soxr.resample(stereo[:, channel].astype(np.float32) / 32768.0, rate, 16000)
                 segments, _ = whisper.transcribe(audio, language="en", beam_size=1, vad_filter=True,
                                                  condition_on_previous_text=False)
                 for seg in segments:
