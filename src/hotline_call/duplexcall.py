@@ -87,6 +87,7 @@ MAX_SECONDS = float(os.environ.get("HOTLINE_IOS_DUPLEX_MAX_S", "600"))
 # the step drifts to ~73 ms avg / 89 max by 130 s (fake phone, his voice, 2026-10-15
 # 20:51; 5 underruns). 125 s ends before both.
 NEMOTRON_MAX_S = 125.0
+ANSWER_HOLD_S = float(os.environ.get("HOTLINE_IOS_DUPLEX_HOLD_S", "1.5"))
 # The outbound queue the pump drains. Two frames is enough to ride out a late
 # tick; more is added latency he hears on every reply.
 OUT_QUEUE_FRAMES = 2
@@ -141,7 +142,11 @@ class DuplexCall:
         self.kind = engine
         self._tool_cache: dict[str, tuple[float, str]] = {}
         self.prompt = prompt or DEFAULT_PROMPT
-        quiet = lambda line: None if line.startswith("TXT") else log.debug("%s: %s", engine, line)  # noqa: E731
+        def quiet(line: str) -> None:
+            if line.startswith(("LOOP", "TOOLABANDON", "TOOL ")):
+                log.info("%s: %s", engine, line)
+            elif not line.startswith("TXT"):
+                log.debug("%s: %s", engine, line)
         if engine == "nemotron":
             import tempfile
 
@@ -295,6 +300,12 @@ class DuplexCall:
             return
         # Discard what queued up while he waited for the model; the model must
         # start from "now", not from a backlog it would answer seconds late.
+        while not pump.inbox.empty():
+            pump.inbox.get_nowait()
+        # His phone is not live for ~1-2 s after the 200 OK (opus-wideband, ring at
+        # 20:14). The model is not fed during the hold, so its timeline does not move
+        # and its opening is not spoken into a dead line; the pump sends silence.
+        time.sleep(ANSWER_HOLD_S)
         while not pump.inbox.empty():
             pump.inbox.get_nowait()
         began = time.monotonic()
