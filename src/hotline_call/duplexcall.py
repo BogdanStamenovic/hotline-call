@@ -377,7 +377,9 @@ class DuplexCall:
         self.turns = len(turns)
         try:
             (self.record_dir / f"{stamp}-duplex.txt").write_text(
-                "".join(f"{who}: {said}\n" for _, who, said in turns))
+                # "claude" is only the daemon's event kind for the far side; on disk it
+                # names the model that actually spoke, so nobody reads it as Claude.
+                "".join(f"{'him' if who == 'you' else self.kind}: {said}\n" for _, who, said in turns))
         except Exception:  # noqa: BLE001 -- stamp unset when the recording itself failed
             pass
         if self.ended == "not started":
