@@ -10,12 +10,13 @@ what HE sends. Two SrtpSessions, not one, and using the offer's key for both
 directions produces a call that authenticates its own packets perfectly and
 cannot read a single one of his.
 
-**Why 8 kHz G.711 and not Opus.** Measured on this box on 2026-09-08: Whisper
-large-v3 scores 12.5% WER on Serbian over a real G.711 mu-law roundtrip and
-12.5% on the 16 kHz original -- the narrowband penalty is nil at that model
-size. G.711 is also the one codec that cannot be negotiated away. Opus would
-save bandwidth on a relay path that has bandwidth to spare, in exchange for a
-binding we would have to carry.
+**Opus first, G.711 as the floor** (since 2026-10-15; see `codec.py`). The
+earlier argument for G.711 only was measured and still holds for what it
+measured: Whisper large-v3 scores 12.5% WER on Serbian over a real G.711 mu-law
+roundtrip and 12.5% on the 16 kHz original. It did not hold for the duplex
+engine, which was trained on 24 kHz audio and misheard a lot of an 8 kHz line
+with nothing left above 4 kHz. The call's rate is now the codec's rate --
+`VoiceCall.rate`, 48 kHz on Opus -- and everything here is written against it.
 
 **Pacing is not optional.** Audio must leave at wall-clock speed: a 20 ms frame
 every 20 ms. Writing a whole utterance into the socket as fast as the loop can
@@ -37,16 +38,20 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from . import codec as codecs
 from . import pcm, rtp, srtp
 
 log = logging.getLogger(__name__)
 
-WIRE_RATE = 8000        # G.711 is 8 kHz, always
+# The G.711 floor. A call's real rate is `VoiceCall.rate`, which is whatever
+# the negotiated codec decodes to -- 48 kHz for Opus. These stay because the
+# bench scripts read 8 kHz recordings made before Opus existed.
+WIRE_RATE = 8000
 FRAME_MS = 20
 FRAME_SAMPLES = WIRE_RATE * FRAME_MS // 1000   # 160
 PT_PCMU = 0             # payload type 0 is mu-law and is never negotiated away
 PT_PCMA = 8             # A-law: offered, so it can be what he answers with
-QUIET_FRAME = b"\xff" * FRAME_SAMPLES   # mu-law silence is 0xFF, not 0x00
+QUIET_FRAME = b"\xff" * FRAME_SAMPLES   # what an idle PCMU frame looks like on the wire
 
 
 class SdpError(Exception):
@@ -65,6 +70,14 @@ class SdpAnswer:
     # The G.711 law we send. His answer's first G.711 entry, because the
     # answerer's first format is the one it means to use (RFC 3264 6.1).
     pt: int = PT_PCMU
+    # What the answer settled on, Opus included. None for an answer built by
+    # hand from a payload type, which then means the G.711 law in `pt`.
+    codec: codecs.Choice | None = None
+
+    def choice(self) -> codecs.Choice:
+        if self.codec is not None:
+            return self.codec
+        return codecs.Choice("PCMA" if self.pt == PT_PCMA else "PCMU", self.pt, 8000)
 
     @property
     def address(self) -> tuple[str, int]:
@@ -108,10 +121,13 @@ def parse_sdp_answer(message: str) -> SdpAnswer:
         raise SdpError("no m=audio port: the far end declined media")
     if not key:
         raise SdpError("no usable a=crypto line: cannot key SRTP for this call")
+    chosen = codecs.negotiate(message)
+    if chosen is None:
+        raise SdpError("far end shares no codec with us (not even PCMU); "
+                       f"payload types were {payload_types}")
     g711 = [pt for pt in payload_types if pt in (PT_PCMU, PT_PCMA)]
-    if not g711:
-        raise SdpError(f"far end offered neither PCMU nor PCMA; payload types were {payload_types}")
-    return SdpAnswer(host, port, key, salt, payload_types, g711[0])
+    return SdpAnswer(host, port, key, salt, payload_types,
+                     g711[0] if g711 else PT_PCMU, chosen)
 
 
 
@@ -127,19 +143,32 @@ class MediaPump(threading.Thread):
     falling and as audio he described as "glitchy and segmented". No frame was
     ever missing; they were simply late.
 
-    The thread does the minimum that has to be timely -- encrypt, send, receive,
-    decrypt -- and hands everything else off through queues. It never decodes
-    mu-law, never touches numpy, and never calls out to a model.
+    The thread does the minimum that has to be timely -- encode, encrypt, send,
+    receive, decrypt, decode -- and hands everything else off through queues. It
+    never calls out to a model.
+
+    **Both queues carry 16-bit linear PCM at `codec.rate`, one 20 ms frame per
+    item**, and the pump is the only thing that sees a payload. That is new with
+    Opus and it is not a matter of taste: an Opus decoder carries state from one
+    packet to the next, so every payload has to be decoded exactly once and in
+    order, by one owner. The G.711 code decoded payloads wherever it happened to
+    look at them, sometimes twice; for a lookup table that is harmless.
 
     It ALWAYS sends. With nothing queued it sends silence, because a stream that
     stops is not a quiet stream, it is a dead one.
     """
 
-    def __init__(self, sock, tx, rx, remote, ssrc, pt=PT_PCMU):
+    def __init__(self, sock, tx, rx, remote, ssrc, codec=None):
         super().__init__(daemon=True, name="rtp-pump")
-        # Everything above the pump speaks mu-law. When the line is A-law the
-        # pump translates at the wire, both ways, so nothing else has to know.
-        self.pt = pt
+        self.codec = codec if codec is not None else codecs.open_codec(codecs.PCMU)
+        self.pt = self.codec.pt
+        self.frame_bytes = self.codec.frame_samples * 2
+        # By payload type, so a G.711 line that switches law mid-call is still
+        # read correctly. Opus has one decoder and one payload type.
+        self._decoders = {self.codec.pt: self.codec.decode}
+        if isinstance(self.codec, codecs.G711):
+            self._decoders.setdefault(PT_PCMU, pcm.ulaw_decode)
+            self._decoders.setdefault(PT_PCMA, pcm.alaw_decode)
         # Authenticated packets of a payload type we do not carry: a DTMF
         # telephone-event, comfort noise. They used to be decoded as mu-law and
         # handed to the endpointer as if they were his voice.
@@ -155,7 +184,7 @@ class MediaPump(threading.Thread):
         # Where his packets actually come FROM, once we have seen one. See
         # `_latch`.
         self.latched: tuple[str, int] | None = None
-        # Every inbound payload, still mu-law, when something asked for it.
+        # Every inbound frame, decoded but not resampled, when something asked.
         # None -- not an empty list -- so an unrecorded call does not pay a
         # branch per frame that appends to something nobody reads.
         self.wire: list[bytes] | None = None
@@ -217,8 +246,8 @@ class MediaPump(threading.Thread):
                 if now - next_frame > 0.04:
                     self.late_frames += 1
                 with self._lock:
-                    payload = self._outbox.popleft() if self._outbox else QUIET_FRAME
-                self._send(payload)
+                    frame = self._outbox.popleft() if self._outbox else None
+                self._send(frame)
                 next_frame += FRAME_MS / 1000.0
                 # Resynchronise rather than firing a catch-up burst: a burst is
                 # exactly what a jitter buffer discards.
@@ -227,11 +256,10 @@ class MediaPump(threading.Thread):
                 continue
             self._read(min(next_frame - now, 0.02))
 
-    def _send(self, payload: bytes) -> None:
+    def _send(self, frame: bytes | None) -> None:
         if self.wire_out is not None:
-            self.wire_out.append(payload)
-        if self.pt == PT_PCMA:
-            payload = pcm.alaw_encode(pcm.ulaw_decode(payload))
+            self.wire_out.append(frame if frame is not None else bytes(self.frame_bytes))
+        payload = self.codec.encode(frame) if frame is not None else self.codec.idle()
         packet = rtp.build_packet(self._seq & 0xFFFF, self._ts & 0xFFFFFFFF,
                                   self.ssrc, payload, self.pt)
         try:
@@ -240,7 +268,7 @@ class MediaPump(threading.Thread):
             return
         finally:
             self._seq += 1
-            self._ts += FRAME_SAMPLES
+            self._ts += self.codec.ts_step
             self.frames_sent += 1
 
     def _latch(self, source) -> None:
@@ -289,25 +317,29 @@ class MediaPump(threading.Thread):
         if parsed is None:
             return
         self._latch(_addr)
-        payload_type, payload = parsed[0], parsed[3]
-        if payload_type == PT_PCMA:
-            # mu-law and A-law are both 8-bit logarithmic and translate through
-            # 16-bit linear with at most one quantisation step of error.
-            payload = pcm.ulaw_encode(pcm.alaw_decode(payload))
-        elif payload_type != PT_PCMU:
+        decode = self._decoders.get(parsed[0])
+        if decode is None:
             self.foreign_frames += 1
             return
+        decoded = decode(parsed[3])
+        if not decoded:
+            return
         self.frames_received += 1
-        if self.wire is not None:
-            self.wire_at.append(self.frames_sent)
-            # Kept as it arrived: G.711 mu-law at 8 kHz, before anything decodes
-            # or resamples it. A recording of what Whisper was given is not the
-            # same artefact as a recording of what the line carried, and only
-            # the second one can score a different model fairly.
-            self.wire.append(payload)
-        # Unbounded on purpose: a turn is bounded in time by the caller, and
-        # dropping inbound audio to protect memory would lose his words.
-        self.inbox.put(payload)
+        # In 20 ms pieces whatever the far end's packet time was, because every
+        # counter above this (silence, speech, barge-in windows) is in frames.
+        for start in range(0, len(decoded), self.frame_bytes):
+            piece = decoded[start:start + self.frame_bytes]
+            if self.wire is not None:
+                self.wire_at.append(self.frames_sent)
+                # Kept as the line carried it -- decoded, at the codec's own
+                # rate, before anything resamples it. A recording of what
+                # Whisper was given is not the same artefact as a recording of
+                # what the line carried, and only the second one can score a
+                # different model fairly.
+                self.wire.append(piece)
+            # Unbounded on purpose: a turn is bounded in time by the caller, and
+            # dropping inbound audio to protect memory would lose his words.
+            self.inbox.put(piece)
 
 
 class VoiceCall:
@@ -317,6 +349,11 @@ class VoiceCall:
     speak-then-listen conversation running in an executor thread; an asyncio
     protocol here would be more machinery for the same behaviour.
     """
+
+    # Replaced per call by the negotiated codec's rate. The class-level value is
+    # for the bench scripts, which build a VoiceCall without __init__ to drive
+    # the barge-in logic over 8 kHz recordings.
+    rate = WIRE_RATE
 
     def __init__(
         self,
@@ -349,8 +386,13 @@ class VoiceCall:
         self.his_voice: np.ndarray | None = None
         # The pump owns the socket and the 20 ms clock from here on. Nothing
         # else in this class touches the wire.
+        self.codec = codecs.open_codec(answer.choice())
+        # The rate everything on this call is carried at, both directions.
+        self.rate = self.codec.rate
+        self.frame_samples = self.codec.frame_samples
         self.pump = MediaPump(media_sock, self.tx, self.rx, self.remote, self.ssrc,
-                              answer.pt)
+                              self.codec)
+        log.info("call carries %s (payload type %d)", self.codec.describe(), self.codec.pt)
         self.pump.start()
 
     # Counters live on the pump, which is the only thing that sees a packet.
@@ -393,7 +435,7 @@ class VoiceCall:
         return 0 if self.pump.wire is None else len(self.pump.wire)
 
     def recorded(self, start: int = 0, end: int | None = None) -> bytes:
-        """The mu-law between two frame cursors, concatenated."""
+        """Linear 16-bit PCM at `self.rate` between two frame cursors."""
         if self.pump.wire is None:
             return b""
         return b"".join(self.pump.wire[start:end])
@@ -528,10 +570,9 @@ class VoiceCall:
         multi-sentence answer must pass False after its first piece, or each
         piece deletes what he said during the one before it.
         """
-        wire = pcm.from_model(audio, rate=rate, out_rate=WIRE_RATE)
-        ulaw = pcm.ulaw_encode(wire)
-        frames = [ulaw[i:i + FRAME_SAMPLES]
-                  for i in range(0, len(ulaw) - FRAME_SAMPLES + 1, FRAME_SAMPLES)]
+        wire = pcm.from_model(audio, rate=rate, out_rate=self.rate)
+        size = self.frame_samples * 2
+        frames = [wire[i:i + size] for i in range(0, len(wire) - size + 1, size)]
         self.interrupted = False
         if interruptible if flush is None else flush:
             self._flush_inbound()
@@ -552,7 +593,7 @@ class VoiceCall:
                 del self._pending_rx[:-self.PENDING_RX_CAP]
             if not interruptible:
                 continue
-            samples = np.frombuffer(pcm.ulaw_decode(payload), dtype="<i2")
+            samples = np.frombuffer(payload, dtype="<i2")
             level = float(np.sqrt(np.mean((samples / 32768.0) ** 2))) if samples.size else 0.0
             bar = self._barge_threshold()
             is_him = bar is not None and level >= bar and self._sounds_like_him(samples)
@@ -599,7 +640,7 @@ class VoiceCall:
                 continue
             if not calibrate:
                 continue
-            samples = np.frombuffer(pcm.ulaw_decode(payload), dtype="<i2")
+            samples = np.frombuffer(payload, dtype="<i2")
             heard.append(float(np.sqrt(np.mean((samples / 32768.0) ** 2)))
                          if samples.size else 0.0)
         if not calibrate:
@@ -678,6 +719,11 @@ class VoiceCall:
         """Cheap timbre check. True when unknown, so it can only ever add caution."""
         if self.his_voice is None:
             return True
+        if self.rate != WIRE_RATE:
+            # VOICE_SIMILARITY was chosen against 8-band envelopes of 8 kHz
+            # frames. Eight bands over 0-24 kHz are a different measurement, so
+            # a wideband frame is brought down to the one the threshold knows.
+            samples = pcm.resample(samples.astype(np.float32), self.rate, WIRE_RATE) * 32768.0
         env = self._envelope(samples.astype(np.float32) / 32768.0, self.VOICE_BANDS)
         if not env.any():
             return True
@@ -724,7 +770,7 @@ class VoiceCall:
                 continue
         if not collected:
             return np.zeros(0, dtype=np.float32)
-        return pcm.to_model(pcm.ulaw_decode(b"".join(collected)), rate=WIRE_RATE)
+        return pcm.to_model(b"".join(collected), rate=self.rate)
 
 
     # -- turn taking ------------------------------------------------------
@@ -750,10 +796,6 @@ class VoiceCall:
     # cannot hold a turn open. Measured against his enrolment of 0.0948 this is
     # 0.0190: 4.7x the absolute minimum, and just under MAX_THRESHOLD.
     SPEECH_OF_HIS_LEVEL = 0.2
-
-    # mu-law silence. Sent continuously whenever we are not saying anything, so
-    # the stream never stops.
-    QUIET_FRAME = b"\xff" * FRAME_SAMPLES
 
     def receive_turn(
         self,
@@ -814,7 +856,7 @@ class VoiceCall:
         frames_to_calibrate = max(1, calibrate_ms // FRAME_MS)
 
         for payload in frames:
-            samples = np.frombuffer(pcm.ulaw_decode(payload), dtype="<i2")
+            samples = np.frombuffer(payload, dtype="<i2")
             levels.append(float(np.sqrt(np.mean((samples / 32768.0) ** 2))) if samples.size else 0.0)
         if levels:
             # Those frames were captured because they were loud, so credit them
@@ -837,7 +879,7 @@ class VoiceCall:
                     continue
                 frames.append(payload)
 
-                samples = np.frombuffer(pcm.ulaw_decode(payload), dtype="<i2")
+                samples = np.frombuffer(payload, dtype="<i2")
                 level = float(np.sqrt(np.mean((samples / 32768.0) ** 2))) if samples.size else 0.0
                 levels.append(level)
 
@@ -887,7 +929,7 @@ class VoiceCall:
                     if (on_chunk is not None and trailing_silence == frames_for_chunk
                             and len(frames) - emitted_to > frames_for_speech):
                         phrase = pcm.to_model(
-                            pcm.ulaw_decode(b"".join(frames[emitted_to:])), rate=WIRE_RATE)
+                            b"".join(frames[emitted_to:]), rate=self.rate)
                         emitted_to = len(frames)
                         chunk_start = emitted_to
                         try:
@@ -907,7 +949,7 @@ class VoiceCall:
         # Only the tail: everything before `emitted_to` already went to on_chunk
         # and transcribing it twice would duplicate half his sentence.
         tail = frames[emitted_to:] if on_chunk is not None else frames
-        audio = (pcm.to_model(pcm.ulaw_decode(b"".join(tail)), rate=WIRE_RATE)
+        audio = (pcm.to_model(b"".join(tail), rate=self.rate)
                  if tail else np.zeros(0, dtype=np.float32))
         return audio, reason
 
@@ -918,4 +960,5 @@ class VoiceCall:
             "auth_failures": self.auth_failures,
             "late_frames": self.late_frames,
             "foreign_frames": self.pump.foreign_frames,
+            "codec_errors": self.codec.errors,
         }
