@@ -663,7 +663,8 @@ class Service:
         threading.Thread(target=work, name="cool-models", daemon=True).start()
 
     @contextlib.contextmanager
-    def _voice_leg(self, doorbell: Any, target: CallTarget, conversation: str) -> Any:
+    def _voice_leg(self, doorbell: Any, target: CallTarget, conversation: str,
+                   engine: str = "", prepared: Any = None) -> Any:
         """Give this one ring a voice, and take it away again afterwards.
 
         Installed per ring rather than once at construction -- which is where
@@ -678,6 +679,9 @@ class Service:
         confirmed-ring path both depend on that: a ring that holds a call it has
         nothing to say on is worse than one that does not.
         """
+        if engine == "personaplex":
+            yield from self._duplex_leg(doorbell, prepared)
+            return
         # Nothing between here and the yield may raise. This runs inside
         # `place()`'s try, whose except clauses are the ring outcomes -- so an
         # exception escaping here is not a silent call, it is a 500 and NO ring
@@ -711,6 +715,55 @@ class Service:
             # so by the time this block runs the call is over -- declined,
             # unanswered, or hung up -- and nothing needs the GPU any more.
             self._cool_models()
+
+    def _prepare_duplex(self, doorbell: Any, target: CallTarget, conversation: str,
+                        loop: Any) -> tuple[list[Any], list[Any], str]:
+        """Start PersonaPlex for every link that can hold the call and wait until it
+        is READY. Runs in an executor, BEFORE the ring: if the model cannot start,
+        the call fails without his phone ever ringing.
+
+        Deliberately does NOT warm Whisper or cvoiced, and does not need
+        `can_talk`: PersonaPlex alone takes up to ~7.3 GiB of the 8 GiB card, so
+        the default call models must stay unloaded for it to fit at all.
+        """
+        from .duplexcall import DuplexCall, brief_prompt
+
+        def append(kind: str, text: str) -> None:
+            loop.call_soon_threadsafe(self._append, conversation, kind, text)
+
+        links = holds_calls(doorbell)
+        if not links:
+            return [], [], "no transport here can hold an answered call"
+        prompt = brief_prompt(target.reason, target.context, target.caller_id)
+        handlers = [DuplexCall(prompt=prompt, note=append,
+                               deliver=lambda text: append("you", text),
+                               hung_up=getattr(link, "far_end_hung_up", None),
+                               label=f"{target.caller_id}: {target.reason}")
+                    for link in links]
+        for handler in handlers:
+            if not handler.wait_ready(90.0):
+                why = handler.setup_error or "timed out waiting for the model"
+                for h in handlers:
+                    h.close()
+                return [], [], f"personaplex did not start: {why}"
+        return links, handlers, ""
+
+    def _duplex_leg(self, doorbell: Any, prepared: Any) -> Any:
+        """`_voice_leg` for `engine=personaplex`, with handlers `_prepare_duplex` built."""
+        links, handlers = prepared or ([], [])
+        if not links:
+            yield None
+            return
+        restore = [(link, link.on_answer) for link in links]
+        for link, handler in zip(links, handlers, strict=True):
+            link.on_answer = handler
+        try:
+            yield handlers[0] if len(handlers) == 1 else _the_one_that_ran(handlers)
+        finally:
+            for link, was in restore:
+                link.on_answer = was
+            for handler in handlers:
+                handler.close()
 
     @property
     def can_talk(self) -> bool:
@@ -876,8 +929,22 @@ class Service:
         # not any more.
         cursor = events.latest
 
+        engine = str(body.get("engine", "") or "")
+        prepared = None
+        if engine == "personaplex":
+            loop = asyncio.get_running_loop()
+            links, handlers, why = await loop.run_in_executor(
+                None, self._prepare_duplex, doorbell, target, conversation, loop)
+            if why:
+                # Not rung at all. A model that is not up must cost a failed call,
+                # not him answering to silence.
+                log.error("call %s not rung: %s", conversation, why)
+                self._append(conversation, "error", why)
+                self._close_conversation(conversation)
+                return self._outcome(conversation, "unreachable", began, why, transport=doorbell)
+            prepared = (links, handlers)
         try:
-            with self._voice_leg(doorbell, target, conversation) as spoken:
+            with self._voice_leg(doorbell, target, conversation, engine, prepared) as spoken:
                 await doorbell.ring(target, timeout=ring_timeout)
         except CallDeclined as exc:
             self._append(conversation, "state", "declined")

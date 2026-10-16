@@ -207,6 +207,7 @@ class AnsweredCall:
         call = VoiceCall(media_sock, answer, srtp_key, srtp_salt)
         if self.recorder is not None:
             call.record()
+            self.recorder.rate, self.recorder.codec = call.rate, call.codec.describe()
         # One worker: faster-whisper is not thread safe for concurrent
         # transcribes on the same model, and serialising is fine because each is
         # far shorter than the speech still arriving behind it.

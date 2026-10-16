@@ -122,6 +122,7 @@ def place_call(
     transport: str = "auto",
     to: str = "",
     callee: str = "",
+    engine: str = "",
     url: str = DEFAULT_URL,
 ) -> CallOutcome:
     """Ring a phone and, unless `wait` is false, come back with what was said.
@@ -140,6 +141,10 @@ def place_call(
         "wait": wait,
         "transport": transport,
     }
+    if engine:
+        # Absent unless asked for, so a daemon that predates engines sees the
+        # exact payload it always did.
+        payload["engine"] = engine
     if to:
         payload["to"] = to
         payload["callee"] = callee or "them"

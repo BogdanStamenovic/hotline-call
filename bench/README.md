@@ -10,7 +10,8 @@ public. `recordings/` is gitignored. Point these at a call directory with
 `~/data/hotline-ios/recordings/20260910-asr-benchmark`.
 
 A call directory is what `media/record.py` writes when `HOTLINE_IOS_RECORD_DIR`
-is set — `turn-NN.wav` at 8 kHz, `inbound.wav`, `outbound.wav` and
+is set — `turn-NN.wav` at the line's rate (8 kHz on G.711, 48 kHz on Opus;
+`manifest.json` says which), `inbound.wav`, `outbound.wav` and
 `manifest.json` — plus a `reference.json` you write by hand saying what he
 actually said.
 
@@ -20,6 +21,7 @@ actually said.
 | `score.py` | word error rate, three ways |
 | `noise_bench.py` | does the room trigger barge-in, and can he still interrupt |
 | `barge_sweep.py` | which barge-in thresholds separate him from his room |
+| `opus_loopback.py` | does a fake Linphone negotiate Opus, and what survives above 4 kHz each way |
 
     HOTLINE_IOS_BENCH_DIR=... python bench.py --only large-v3
     python score.py $DIR/reference.json $DIR/hyp-large-v3.json

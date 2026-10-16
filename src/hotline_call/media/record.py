@@ -7,13 +7,14 @@ linphone.org's relay are the thing being measured, and none of that was ever
 kept: before this, nothing in the repo wrote a single sample to disk. A call
 produced one model's guess and no way to check it.
 
-**Why mu-law and not what Whisper was given.** The pump hands over G.711 at
-8 kHz. `pcm.to_model` turns that into 16 kHz float, and that float is a faithful
-*rendering* of an 8 kHz signal -- but stored as a 16 kHz file it stops looking
-like one, and the next person to score a model against it will reach for
-whatever resampling their model prefers and quietly measure a different path.
-So what is written is decoded straight from the payloads, at the rate they
-arrived at.
+**Why the line's own rate and not what Whisper was given.** The pump hands over
+decoded audio at the codec's rate -- 8 kHz on G.711, 48 kHz on Opus.
+`pcm.to_model` turns that into 16 kHz float, and that float is a faithful
+*rendering* of the line -- but stored as a 16 kHz file it stops looking like
+one, and the next person to score a model against it will reach for whatever
+resampling their model prefers and quietly measure a different path. So what is
+written is the decoded payloads, at the rate they arrived at, and the manifest
+says which codec carried them.
 
 **Off unless asked**, via `HOTLINE_IOS_RECORD_DIR`. He is on these calls. An
 always-on recorder of his voice is not a default anyone should ship for him.
@@ -26,8 +27,6 @@ import logging
 import pathlib
 import time
 import wave
-
-from . import pcm
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +44,10 @@ class Recorder:
         self.note = note
         self.started = time.time()
         self.failed = ""
+        # What the line carried. Set from the call once it is answered: before
+        # Opus every call was 8 kHz mu-law, and now the codec decides.
+        self.rate = WIRE_RATE
+        self.codec = "G.711 mu-law"
 
     def turn(self, index: int, wire: bytes, text: str, model: str = "",
              reason: str = "", outbound_span: tuple[int, int] | None = None) -> None:
@@ -60,7 +63,7 @@ class Recorder:
         self.turns.append({
             "turn": index,
             "file": name,
-            "seconds": round(len(wire) / WIRE_RATE, 3),
+            "seconds": round(len(wire) / 2 / self.rate, 3),
             "heard": text,
             "model": model,
             "ended": reason,
@@ -70,7 +73,7 @@ class Recorder:
             # not survive his phone's silence suppression; this does.
             "outbound_frames": list(outbound_span) if outbound_span else None,
         })
-        log.info("recorded turn %d: %.1fs -> %s", index, len(wire) / WIRE_RATE, name)
+        log.info("recorded turn %d: %.1fs -> %s", index, len(wire) / 2 / self.rate, name)
 
     def finish(self, wire: bytes, stats: dict | None = None, ended: str = "",
                outbound: bytes = b"", inbound_at: list[int] | None = None) -> str:
@@ -95,9 +98,9 @@ class Recorder:
             manifest = {
                 "started": self.started,
                 "note": self.note,
-                "rate": WIRE_RATE,
-                "codec": "G.711 mu-law, as received",
-                "outbound_seconds": round(len(outbound) / WIRE_RATE, 2),
+                "rate": self.rate,
+                "codec": f"{self.codec}, decoded as received",
+                "outbound_seconds": round(len(outbound) / 2 / self.rate, 2),
                 "ended": ended,
                 "stats": stats or {},
                 "turns": self.turns,
@@ -110,13 +113,13 @@ class Recorder:
                 # a manifest nobody reads.
                 (self.directory / "alignment.json").write_text(json.dumps(
                     {"outbound_frame_per_inbound_frame": inbound_at,
-                     "frame_ms": 20, "rate": WIRE_RATE}))
+                     "frame_ms": 20, "rate": self.rate}))
         except OSError as exc:
             self.failed = f"{type(exc).__name__}: {exc}"
             log.error("could not finish the recording: %s", self.failed)
             return ""
         log.info("recording: %d turn(s), %.1fs inbound -> %s",
-                 len(self.turns), len(wire) / WIRE_RATE, self.directory)
+                 len(self.turns), len(wire) / 2 / self.rate, self.directory)
         return str(self.directory)
 
     def _write(self, path: pathlib.Path, wire: bytes) -> None:
@@ -124,8 +127,8 @@ class Recorder:
         with wave.open(str(path), "wb") as handle:
             handle.setnchannels(1)
             handle.setsampwidth(2)
-            handle.setframerate(WIRE_RATE)
-            handle.writeframes(pcm.ulaw_decode(wire))
+            handle.setframerate(self.rate)
+            handle.writeframes(wire)
 
 
 def from_environment(note: str = "") -> Recorder | None:
