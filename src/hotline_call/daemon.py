@@ -1046,7 +1046,20 @@ class Service:
                 # asking for the conversation got None.
                 if entry.kind in ("you", "claude"):
                     said.append({"who": entry.kind, "text": entry.text})
-            if events.closed or getattr(spoken, "ended", "not started") != "not started":
+            done = getattr(spoken, "transcribed", None)
+            if done is not None:
+                # A duplex call: the transcript is delivered after the line drops, so
+                # "ended" alone is too early. Stop once it is all delivered, after one
+                # short drain for appends still queued on the event loop.
+                finished = done.is_set()
+            else:
+                finished = getattr(spoken, "ended", "not started") != "not started"
+            if events.closed or finished:
+                if done is not None:
+                    for entry in await events.wait(cursor, 0.3):
+                        cursor = max(cursor, entry.seq)
+                        if entry.kind in ("you", "claude"):
+                            said.append({"who": entry.kind, "text": entry.text})
                 break
         return said
 

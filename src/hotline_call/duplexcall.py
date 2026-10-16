@@ -21,11 +21,12 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import threading
 import time
 import wave
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 import numpy as np
 
@@ -44,8 +45,8 @@ def free_gpu() -> None:
     import subprocess
 
     try:
-        subprocess.run([str(FREE_GPU)], timeout=20, capture_output=True)
-    except Exception:  # noqa: BLE001 -- best effort; the READY gate catches the rest
+        subprocess.run([str(FREE_GPU)], timeout=20, capture_output=True, check=False)
+    except Exception:  # best effort; the READY gate catches the rest
         log.exception("free-gpu failed")
 
 
@@ -68,8 +69,8 @@ def brief_prompt(reason: str, context: str = "", source: str = "") -> str:
     must survive verbatim should be short and stated plainly.
     """
     who = f" on behalf of {source}" if source and source not in ("an agent", "Claude") else ""
-    parts = [f"You are Ada, an assistant phoning Bogdan{who}. "
-             f"Your message for him: {reason.strip()}"]
+    parts = [(f"You are Ada, an assistant phoning Bogdan{who}. "
+              f"Your message for him: {reason.strip()}")]
     if context.strip():
         parts.append(f"Background: {context.strip()}")
     parts.append("Greet him, deliver the message accurately and early, ask your question, "
@@ -94,6 +95,10 @@ class DuplexCall:
         self.codec = ""   # what the answer settled on; set when he picks up
         # The sentinel daemon._await_transcript waits on; anything else means done.
         self.ended = "not started"
+        # Set once the post-call transcript has been delivered (or there is none).
+        # `ended` is set when the line drops, BEFORE `_save` transcribes both sides,
+        # so a caller that stopped on `ended` could return a truncated transcript.
+        self.transcribed = threading.Event()
         self.kind = "personaplex"
         self.prompt = prompt or DEFAULT_PROMPT
 
@@ -115,7 +120,7 @@ class DuplexCall:
             free_gpu()
             self.setup_seconds = self.engine.start(timeout=120.0)
             log.info("%s ready in %.1fs", self.kind, self.setup_seconds)
-        except Exception as exc:  # noqa: BLE001 -- surfaced on the call, not raised into the ring
+        except Exception as exc:  # surfaced on the call, not raised into the ring
             self.setup_error = str(exc)
             log.exception("%s failed to start", self.kind)
 
@@ -154,9 +159,11 @@ class DuplexCall:
         except SdpError as exc:
             self.ended = f"no media: {exc}"
             self.note("error", f"call answered but carried no media: {exc}")
+            self.transcribed.set()
             return
         if media_sock is None:
             self.ended = "no media socket"
+            self.transcribed.set()
             return
         self.answered = True
         call = VoiceCall(media_sock, answer, srtp_key, srtp_salt)
@@ -169,7 +176,10 @@ class DuplexCall:
         finally:
             call.close()
             self.engine.close()
-            self._save(call)
+            try:
+                self._save(call)
+            finally:
+                self.transcribed.set()
 
     def _converse(self, call: VoiceCall) -> None:
         pump = call.pump
@@ -212,7 +222,7 @@ class DuplexCall:
                     pump.inbox.get_nowait()
             try:
                 frame = pump.inbox.get_nowait()
-            except Exception:  # queue.Empty
+            except queue.Empty:
                 frame = silence
             self.engine.push(frame)
             if pump.queued() < OUT_QUEUE_FRAMES:
@@ -295,8 +305,8 @@ class DuplexCall:
                 # "claude" is only the daemon's event kind for the far side; on disk it
                 # names the model that actually spoke, so nobody reads it as Claude.
                 "".join(f"{'him' if who == 'you' else self.kind}: {said}\n" for _, who, said in turns))
-        except Exception:  # noqa: BLE001 -- stamp unset when the recording itself failed
-            pass
+        except Exception:
+            log.debug("no transcript file written", exc_info=True)
         if self.ended == "not started":
             self.ended = "done"
         log.info("%s", summary)
