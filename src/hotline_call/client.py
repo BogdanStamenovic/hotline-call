@@ -75,6 +75,11 @@ class CallOutcome:
     # True when the doorbell was a test double. Not a detail: it is the
     # difference between "he was rung" and "nothing happened".
     fake: bool = False
+    # Who held the call: "personaplex" (English duplex model) or "classic" (the
+    # Serbian ASR + Claude + TTS loop); empty from a daemon that predates engines.
+    engine: str = ""
+    # Why the call is not what was asked for, e.g. PersonaPlex fell back to classic.
+    note: str = ""
 
 
 def _post(path: str, payload: dict[str, Any], *, url: str, timeout: float) -> dict[str, Any]:
@@ -159,6 +164,8 @@ def place_call(
         transport=str(data.get("transport", "")),
         fake=bool(data.get("fake", False)),
         detail=str(data.get("detail", "")),
+        engine=str(data.get("engine", "")),
+        note=str(data.get("note", "")),
     )
 
 

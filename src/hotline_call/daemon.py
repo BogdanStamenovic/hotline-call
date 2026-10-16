@@ -182,8 +182,18 @@ class Service:
         segmenter_factory: Any = None,
         fillers: Any = None,
         store: Store | None = None,
+        default_engine: str = "",
+        gpu_handoff: Any = None,
     ) -> None:
         self.transport = transport
+        # Who talks on a call to HIM when the caller does not say: "" is the Serbian
+        # ASR + Claude + TTS loop, "personaplex" the English duplex model. A call to
+        # any other SIP address (a registry guest, in Serbian) never takes this default.
+        # Empty here so a Service built in a test never touches the GPU or cvoiced;
+        # main() sets it from HOTLINE_IOS_DEFAULT_ENGINE.
+        self.default_engine = default_engine
+        # () -> gpu_handoff.GpuHandoff, or None to leave ollama and cvoiced alone
+        self.gpu_handoff = gpu_handoff
         self.pool = pool
         self.transcriber = transcriber
         self.speaker = speaker
@@ -929,27 +939,53 @@ class Service:
         # not any more.
         cursor = events.latest
 
-        engine = str(body.get("engine", "") or "")
+        engine = str(body.get("engine", "") or "").strip().lower()
+        if engine in ("", "auto"):
+            engine = "" if to else self.default_engine
+        if engine == "classic":
+            engine = ""
         prepared = None
+        handoff = None
+        note = ""
+        loop = asyncio.get_running_loop()
         if engine == "personaplex":
-            loop = asyncio.get_running_loop()
+            if self.gpu_handoff is not None:
+                handoff = self.gpu_handoff()
+                await loop.run_in_executor(None, handoff.acquire)
             links, handlers, why = await loop.run_in_executor(
                 None, self._prepare_duplex, doorbell, target, conversation, loop)
             if why:
-                # Not rung at all. A model that is not up must cost a failed call,
-                # not him answering to silence.
-                log.error("call %s not rung: %s", conversation, why)
-                self._append(conversation, "error", why)
-                self._close_conversation(conversation)
-                return self._outcome(conversation, "unreachable", began, why, transport=doorbell)
-            prepared = (links, handlers)
+                # Not rung on PersonaPlex. Bogdan's rule (2026-10-16): place the call on
+                # the Serbian path instead of failing it, and say so. cvoiced has to be
+                # back first, because that path speaks through it.
+                log.error("call %s: personaplex did not start (%s); ringing on the Serbian path", conversation, why)
+                if handoff is not None:
+                    restored = await loop.run_in_executor(None, handoff.release)
+                    handoff = None
+                    if "NOT healthy" in restored or "could not" in restored:
+                        note = f"; {restored}"
+                note = f"PersonaPlex did not start ({why}); the call went on the Serbian voice path instead{note}"
+                self._append(conversation, "error", note)
+                engine = ""
+            else:
+                prepared = (links, handlers)
         try:
-            with self._voice_leg(doorbell, target, conversation, engine, prepared) as spoken:
-                await doorbell.ring(target, timeout=ring_timeout)
+            try:
+                with self._voice_leg(doorbell, target, conversation, engine, prepared) as spoken:
+                    await doorbell.ring(target, timeout=ring_timeout)
+            finally:
+                # However the ring ended -- answered and hung up, declined, unanswered,
+                # unreachable, or an exception -- cvoiced comes back before anything else:
+                # every other call and page speaks through it.
+                if handoff is not None:
+                    restored = await loop.run_in_executor(None, handoff.release)
+                    if "NOT healthy" in restored or "could not" in restored:
+                        note = f"{note}; {restored}" if note else restored
+                        self.degradations.append(restored)
         except CallDeclined as exc:
             self._append(conversation, "state", "declined")
             self._close_conversation(conversation)
-            return self._outcome(conversation, "declined", began, str(exc), transport=doorbell)
+            return self._outcome(conversation, "declined", began, str(exc), transport=doorbell, engine=engine or "classic", note=note)
         except CallUnanswered as exc:
             # It rang and he did not pick up. Record that it went unanswered and
             # close it, at his instruction (2026-09-01, overriding SPEC 3's
@@ -960,16 +996,16 @@ class Service:
             # stop.
             self._append(conversation, "state", "unanswered")
             self._close_conversation(conversation)
-            return self._outcome(conversation, "unanswered", began, str(exc), transport=doorbell)
+            return self._outcome(conversation, "unanswered", began, str(exc), transport=doorbell, engine=engine or "classic", note=note)
         except (CallUnreachable, CallError) as exc:
             self.degradations.append(str(exc))
             log.warning("call %s undeliverable: %s", conversation, exc)
             self._append(conversation, "error", str(exc))
             self._close_conversation(conversation)
-            return self._outcome(conversation, "unreachable", began, str(exc), transport=doorbell)
+            return self._outcome(conversation, "unreachable", began, str(exc), transport=doorbell, engine=engine or "classic", note=note)
 
         if not wait:
-            return self._outcome(conversation, "ringing", began, "not waiting", transport=doorbell)
+            return self._outcome(conversation, "ringing", began, "not waiting", transport=doorbell, engine=engine or "classic", note=note)
 
         # He may already have answered out loud, in which case the entry is
         # sitting past `cursor` and this returns at once.
@@ -985,7 +1021,7 @@ class Service:
             self._close_conversation(conversation)
             return self._outcome(conversation, "unanswered", began,
                                  f"rang, but nothing came back within {reply_timeout:.0f}s",
-                                 transport=doorbell)
+                                 transport=doorbell, engine=engine or "classic", note=note)
         transcript: list[dict[str, str]] = [{"who": "you", "text": reply}]
         turns_spoken = int(getattr(spoken, "turns", 0) or 0)
         if spoken is not None and turns_spoken:
@@ -996,7 +1032,8 @@ class Service:
             if whole:
                 transcript = whole
         return self._outcome(conversation, "answered", began, "", reply,
-                             transport=doorbell, transcript=transcript)
+                             transport=doorbell, transcript=transcript,
+                             engine=engine or "classic", note=note)
 
     async def _await_reply(self, events: EventLog, timeout: float,
                            cursor: int | None = None) -> str:
@@ -1131,6 +1168,8 @@ class Service:
         reply: str = "",
         transport: Any = None,
         transcript: list[dict[str, str]] | None = None,
+        engine: str = "",
+        note: str = "",
     ) -> dict[str, Any]:
         used = transport if transport is not None else self.transport
         out: dict[str, Any] = {
@@ -1149,6 +1188,10 @@ class Service:
             # sentence. This is the field that distinguishes them, and
             # hotline-call refuses to report success when it is true.
             "fake": bool(getattr(used, "is_fake", False)),
+            # who held the call ("personaplex" or "classic"), and why that is not what
+            # was asked for when PersonaPlex fell back
+            "engine": engine,
+            "note": note,
         }
         return out
 
@@ -3210,6 +3253,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if ip.strip()
     }
     speaker, transcriber, fillers = build_voice()
+    from .gpu_handoff import GpuHandoff
+
     service = Service(
         transport,
         SessionPool(),
@@ -3218,6 +3263,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         fillers=fillers,
         allow_ips=allow,
         api_key=os.environ.get("HOTLINE_API_KEY", ""),
+        # Bogdan, 2026-10-16: "Hotline-call uses stock personaplex from now on." Calls
+        # to him only; guests stay on the Serbian path. "" restores the old default.
+        default_engine=os.environ.get("HOTLINE_IOS_DEFAULT_ENGINE", "personaplex").strip().lower(),
+        gpu_handoff=lambda: GpuHandoff(health=speaker.health if speaker is not None else None),
     )
     if not service.can_talk:
         # On /health rather than only in the log. A doorbell that rings and then

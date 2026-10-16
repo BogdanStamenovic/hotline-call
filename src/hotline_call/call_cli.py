@@ -20,6 +20,15 @@ declined. It is a real answer and worth distinguishing from ringing out: a
 decline means he saw it and said not now, so escalating again immediately is
 the wrong move.
 
+**Who talks on the call** (Bogdan, 2026-10-16: "Hotline-call uses stock
+personaplex from now on"). A call to HIM is held by PersonaPlex, an English
+full-duplex speech model, unless `--engine classic` asks for the Serbian
+ASR + Claude + TTS loop. A call to anyone else (a registry guest, `to=` in the API) stays
+classic unless `--engine personaplex` is given. If PersonaPlex cannot start, the
+call goes out on the classic path and stderr says so. With PersonaPlex the call
+returns after he hangs up, with a transcript of both sides (`him:` / `voice:`)
+made after the call, not a single answer.
+
 **Falling back is the default.** If the call cannot be delivered at all -- the
 daemon is down, no transport is registered, the phone is off the network -- this
 shells out to `hotline-page` rather than failing. Adopting `hotline-call` is
@@ -112,10 +121,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--engine",
         default="",
-        choices=["", "personaplex"],
-        help="who talks on the call. Default: the usual Serbian ASR + Claude + TTS "
-        "loop. 'personaplex': an English full-duplex speech model (PersonaPlex-7B "
-        "on the local GPU) holds the whole call; the reason and --context become its persona prompt; the result is a Whisper transcript of both sides",
+        choices=["", "personaplex", "classic"],
+        help="who talks on the call. Default: 'personaplex' for a call to Bogdan, "
+        "'classic' for a call to anyone else. 'personaplex': an English full-duplex "
+        "speech model (PersonaPlex-7B on the local GPU) holds the whole call; the reason "
+        "and --context become its brief; it returns after he hangs up, with a "
+        "transcript of both sides ('him:' / 'voice:'), not a single answer. If it "
+        "cannot start, the call goes out on the classic path and stderr says so. "
+        "'classic': the Serbian ASR + Claude + TTS loop, which returns his answer",
     )
     parser.add_argument("-q", "--quiet", action="store_true", help="suppress non-error output")
     return parser
@@ -216,7 +229,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         log(f"ringing via {outcome.transport} (not waiting)")
         return EXIT_ANSWERED
 
-    log(f"{outcome.state} after {outcome.waited_seconds:.0f}s via {outcome.transport}")
+    held_by = f" ({outcome.engine})" if outcome.engine else ""
+    log(f"{outcome.state} after {outcome.waited_seconds:.0f}s via {outcome.transport}{held_by}")
+    if outcome.note:
+        log(f"note: {outcome.note}")
 
     if outcome.state == "answered":
         # One turn prints bare, so `answer=$(hotline-call ...)` is unchanged for
