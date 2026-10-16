@@ -780,12 +780,16 @@ class Service:
             speak=speak,
             transcribe=lambda audio: str(transcriber.transcribe(audio)),
             fillers=self.fillers,
+            # Plays while cvoiced is still warming. Without some clip here a
+            # guest hears ~9 s of silence after picking up; `greet` itself names
+            # Bogdan, so a guest gets its own.
+            opening="greet_guest" if target.address else "greet",
             greeting=str(speakable(
                 # Serbian, like the guest manners themselves. The TTS voice is a
                 # Serbian one and the ASR runs with a Serbian hint, so an English
                 # greeting is mispronounced on the way out and mis-heard on the
                 # way back.
-                f"Zdravo {target.callee}, ovde Bogdanov asistent. {target.reason}"
+                f"{target.callee}, {target.reason}"
                 if target.address else f"{target.caller_id}: {target.reason}"
             )),
             deliver=lambda text: append("you", text),

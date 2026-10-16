@@ -93,5 +93,10 @@
     "text": "Da, kaži.",
     "rate": 24000,
     "seconds": 1.4
+  },
+  "greet_guest": {
+    "text": "Zdravo, ovde Bogdanov asistent.",
+    "rate": 24000,
+    "seconds": 2.08
   }
 }

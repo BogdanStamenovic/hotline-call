@@ -506,3 +506,28 @@ def test_a_recorder_that_cannot_write_does_not_cost_the_call(tmp_path):
     assert not thread.is_alive()
     assert handler.delivered == ["da samo napred"], "the call carried on regardless"
     assert recorder.failed
+
+
+class _Clips:
+    def __init__(self, **texts: str) -> None:
+        self.texts = texts
+
+    def get(self, name: str):
+        return (speech(0.2), TONE_RATE) if name in self.texts else None
+
+
+def test_a_guest_is_not_greeted_as_bogdan():
+    """2026-10-15: the first call to a registry guest opened with the clip
+    "Zdravo Bogdane, ovde hotline", because the opening clip was hardcoded."""
+    clips = _Clips(greet="Zdravo Bogdane, ovde hotline. Slušam te.",
+                   greet_guest="Zdravo, ovde Bogdanov asistent.")
+    handler, phone, reply = dial(fillers=clips, opening="greet_guest")
+    phone.say_after(0.05, quiet(1.2))
+    phone.say_after(1.5, np.concatenate([speech(1.2), quiet(1.2)]))
+    thread = run(handler, phone, reply)
+    thread.join(timeout=20)
+    phone.stop()
+
+    spoken = [text for who, text in handler.transcript if who == "claude"]
+    assert spoken[0] == "Zdravo, ovde Bogdanov asistent.", spoken
+    assert not any("Bogdane" in text for text in spoken), spoken

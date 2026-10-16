@@ -140,6 +140,7 @@ class AnsweredCall:
         speak: Callable[[str], tuple[np.ndarray, int]],
         transcribe: Callable[[np.ndarray], str],
         fillers: Any = None,
+        opening: str = "greet",
         greeting: str = "",
         deliver: Callable[[str], None] | None = None,
         ask: Callable[[str], str] | None = None,
@@ -155,6 +156,10 @@ class AnsweredCall:
         self.speak = speak
         self.transcribe = transcribe
         self.fillers = fillers
+        # The pre-rendered clip that answers the pickup. Per call, because the
+        # default one says "Zdravo Bogdane": on 2026-10-15 the first call to a
+        # registry guest opened by greeting him as Bogdan.
+        self.opening = opening
         # Spoken after the pre-rendered greeting: the question the ring was
         # placed to ask. Empty for a call that is just a conversation.
         self.greeting = greeting
@@ -225,7 +230,8 @@ class AnsweredCall:
 
     def converse(self, call: VoiceCall, worker: ThreadPoolExecutor) -> None:
         call.send_silence(PRIME_SECONDS, calibrate=True)
-        self.play(call, "greet", interruptible=True)
+        if self.opening:
+            self.play(call, self.opening, interruptible=True)
         if self.greeting:
             self.say(call, self.greeting)
 
