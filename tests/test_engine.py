@@ -179,3 +179,72 @@ async def test_auto_and_empty_mean_the_default(engine):
     log: list[str] = []
     body = await make(log).place({"reason": "status", "engine": engine, "wait": False})
     assert body["engine"] == "personaplex"
+
+
+# ---- one PersonaPlex call at a time ---------------------------------------------------
+class SlowDoorbell(LoopbackTransport):
+    """Rings for `hold` seconds, as if the call were in progress, logging when."""
+
+    def __init__(self, log: list[str], hold: float) -> None:
+        super().__init__()
+        self.log, self.hold = log, hold
+
+    async def ring(self, target, *, timeout: float = 45.0) -> None:
+        self.log.append(f"ring-start:{target.reason}")
+        await asyncio.sleep(self.hold)
+        self.log.append(f"ring-end:{target.reason}")
+
+
+def make_slow(log: list[str], hold: float, gpu_wait_s: float = 180.0) -> Service:
+    service = Service(SlowDoorbell(log, hold), pool=None, default_engine="personaplex",
+                      gpu_handoff=lambda: FakeHandoff(log), gpu_wait_s=gpu_wait_s)
+    service._prepare_duplex = lambda *a: ([], [], "")
+    return service
+
+
+@pytest.mark.parametrize("second", ["personaplex", "classic"])
+async def test_a_call_placed_during_a_personaplex_call_waits_for_the_gpu_to_come_back(second):
+    """A second PersonaPlex would not fit on the card; a classic call would have no
+    voice while cvoiced is stopped. Either way it waits for the release."""
+    log: list[str] = []
+    service = make_slow(log, hold=0.3)
+    first = asyncio.ensure_future(service.place({"reason": "first", "wait": False}))
+    await asyncio.sleep(0.1)                       # the first is on the phone now
+    body = await service.place({"reason": "second", "engine": second, "wait": False})
+    await first
+    assert log.index("release") < log.index("ring-start:second"), log
+    assert body["note"] == ""
+
+
+async def test_the_wait_is_capped_and_the_result_says_so():
+    log: list[str] = []
+    service = make_slow(log, hold=0.5, gpu_wait_s=0.1)
+    first = asyncio.ensure_future(service.place({"reason": "first", "wait": False}))
+    await asyncio.sleep(0.05)
+    body = await service.place({"reason": "second", "engine": "classic", "wait": False})
+    await first
+    assert log.index("ring-start:second") < log.index("release")
+    assert "went ahead anyway" in body["note"]
+
+
+async def test_classic_calls_still_overlap_each_other():
+    log: list[str] = []
+    service = make_slow(log, hold=0.3)
+    a = asyncio.ensure_future(service.place({"reason": "a", "engine": "classic", "wait": False}))
+    await asyncio.sleep(0.05)
+    await service.place({"reason": "b", "engine": "classic", "wait": False})
+    await a
+    assert log.index("ring-start:b") < log.index("ring-end:a"), "a classic call must not queue behind another"
+
+
+async def test_a_personaplex_that_raises_while_starting_frees_the_lock_and_falls_back():
+    log: list[str] = []
+    service = make_slow(log, hold=0.0)
+
+    def boom(*a):
+        raise RuntimeError("CUDA error")
+
+    service._prepare_duplex = boom
+    body = await service.place({"reason": "x", "wait": False})
+    assert body["engine"] == "classic" and "RuntimeError: CUDA error" in body["note"]
+    assert not service._gpu_lock.locked()

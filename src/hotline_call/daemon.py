@@ -184,6 +184,7 @@ class Service:
         store: Store | None = None,
         default_engine: str = "",
         gpu_handoff: Any = None,
+        gpu_wait_s: float = 180.0,
     ) -> None:
         self.transport = transport
         # Who talks on a call to HIM when the caller does not say: "" is the Serbian
@@ -194,6 +195,12 @@ class Service:
         self.default_engine = default_engine
         # () -> gpu_handoff.GpuHandoff, or None to leave ollama and cvoiced alone
         self.gpu_handoff = gpu_handoff
+        # Held by a PersonaPlex call from handing the GPU over to handing it back.
+        # Any call placed meanwhile waits for it: a second PersonaPlex would not fit
+        # on the card, and a classic call would have no voice while cvoiced is down.
+        # Classic calls only wait; they do not hold it, so they still overlap freely.
+        self._gpu_lock = asyncio.Lock()
+        self.gpu_wait_s = gpu_wait_s
         self.pool = pool
         self.transcriber = transcriber
         self.speaker = speaker
@@ -948,12 +955,29 @@ class Service:
         handoff = None
         note = ""
         loop = asyncio.get_running_loop()
+        holds_gpu = False
+        if engine == "personaplex" or self._gpu_lock.locked():
+            # ~180 s covers a PersonaPlex call at its 150 s cap plus the transcription
+            try:
+                await asyncio.wait_for(self._gpu_lock.acquire(), self.gpu_wait_s)
+                holds_gpu = True
+            except TimeoutError:
+                note = (f"waited {self.gpu_wait_s:.0f} s for another PersonaPlex call to "
+                        "finish and went ahead anyway")
+                log.warning("call %s: %s", conversation, note)
+            if holds_gpu and engine != "personaplex":
+                self._gpu_lock.release()   # it only had to wait for cvoiced to be back
+                holds_gpu = False
         if engine == "personaplex":
             if self.gpu_handoff is not None:
                 handoff = self.gpu_handoff()
                 await loop.run_in_executor(None, handoff.acquire)
-            links, handlers, why = await loop.run_in_executor(
-                None, self._prepare_duplex, doorbell, target, conversation, loop)
+            try:
+                links, handlers, why = await loop.run_in_executor(
+                    None, self._prepare_duplex, doorbell, target, conversation, loop)
+            except Exception as exc:
+                log.exception("call %s: preparing personaplex raised", conversation)
+                links, handlers, why = [], [], f"{type(exc).__name__}: {exc}"
             if why:
                 # Not rung on PersonaPlex. Bogdan's rule (2026-10-16): place the call on
                 # the Serbian path instead of failing it, and say so. cvoiced has to be
@@ -967,6 +991,9 @@ class Service:
                 note = f"PersonaPlex did not start ({why}); the call went on the Serbian voice path instead{note}"
                 self._append(conversation, "error", note)
                 engine = ""
+                if holds_gpu:
+                    self._gpu_lock.release()
+                    holds_gpu = False
             else:
                 prepared = (links, handlers)
         try:
@@ -977,11 +1004,15 @@ class Service:
                 # However the ring ended -- answered and hung up, declined, unanswered,
                 # unreachable, or an exception -- cvoiced comes back before anything else:
                 # every other call and page speaks through it.
-                if handoff is not None:
-                    restored = await loop.run_in_executor(None, handoff.release)
-                    if "NOT healthy" in restored or "could not" in restored:
-                        note = f"{note}; {restored}" if note else restored
-                        self.degradations.append(restored)
+                try:
+                    if handoff is not None:
+                        restored = await loop.run_in_executor(None, handoff.release)
+                        if "NOT healthy" in restored or "could not" in restored:
+                            note = f"{note}; {restored}" if note else restored
+                            self.degradations.append(restored)
+                finally:
+                    if holds_gpu:
+                        self._gpu_lock.release()
         except CallDeclined as exc:
             self._append(conversation, "state", "declined")
             self._close_conversation(conversation)
