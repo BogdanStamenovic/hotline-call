@@ -21,16 +21,37 @@ def sse(*texts, stop=True):
     return io.BytesIO(b"\n".join(lines) + b"\n")
 
 
-@pytest.fixture
-def sent(monkeypatch):
+class FakeResponse:
+    def __init__(self, stream, status=200):
+        self.stream, self.status = stream, status
+
+    def readline(self):
+        return self.stream.readline()
+
+    def read(self, n=-1):
+        return self.stream.read(n)
+
+
+class FakeConn:
+    def close(self):
+        pass
+
+
+def fake_pool(monkeypatch, responder):
     bodies = []
 
-    def fake_urlopen(request, timeout=None):
-        bodies.append(json.loads(request.data))
-        return sse("Dobro, ", "evo me.")
+    def post(body, headers):
+        bodies.append(json.loads(body))
+        return FakeConn(), FakeResponse(responder())
 
-    monkeypatch.setattr(haikuagent.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(haikuagent._POOL, "post", post)
+    monkeypatch.setattr(haikuagent._POOL, "give_back", lambda conn, reuse: None)
     return bodies
+
+
+@pytest.fixture
+def sent(monkeypatch):
+    return fake_pool(monkeypatch, lambda: sse("Dobro, ", "evo me."))
 
 
 def test_deltas_arrive_in_order_and_the_turn_is_remembered(sent):
@@ -54,10 +75,10 @@ def test_a_cut_short_reply_is_remembered_only_as_far_as_it_got(sent):
 
 
 def test_a_failed_turn_leaves_no_dangling_question(monkeypatch):
-    def boom(request, timeout=None):
-        raise OSError("down")
+    def boom(body, headers):
+        raise HaikuUnavailable("API unreachable: down")
 
-    monkeypatch.setattr(haikuagent.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(haikuagent._POOL, "post", boom)
     agent = HaikuAgent("ctx", key="k")
     with pytest.raises(HaikuUnavailable):
         list(agent.reply_stream("zdravo"))
@@ -99,13 +120,7 @@ def test_a_lookup_flushes_first_then_answers_from_the_result(monkeypatch, tmp_pa
             {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
             {"type": "message_stop"}),
     ]
-    bodies = []
-
-    def fake(request, timeout=None):
-        bodies.append(json.loads(request.data))
-        return rounds.pop(0)
-
-    monkeypatch.setattr(haikuagent.urllib.request, "urlopen", fake)
+    bodies = fake_pool(monkeypatch, lambda: rounds.pop(0))
     agent = HaikuAgent("ctx", key="k")
     assert list(agent.reply_stream("kako stoji build?")) == ["Samo sekund.", None, "Build je zelen."]
     result = bodies[1]["messages"][-1]["content"][0]
@@ -140,3 +155,12 @@ def test_git_log_answers_what_changed(monkeypatch, tmp_path):
     monkeypatch.setattr(calltools, "ROOT", tmp_path.parent)
     text, failed = calltools.run("git_log", {"repo": tmp_path.name})
     assert not failed and "Prvi commit" in text
+
+
+def test_a_fork_changes_nothing_until_adopted(sent):
+    agent = HaikuAgent("ctx", key="k")
+    twin = agent.fork()
+    list(twin.reply_stream("zdravo"))
+    assert agent.history == []
+    agent.adopt(twin)
+    assert [m["role"] for m in agent.history] == ["user", "assistant"]

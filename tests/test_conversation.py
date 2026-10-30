@@ -593,3 +593,66 @@ def test_a_stream_that_fails_before_any_audio_apologises_out_loud():
 def test_a_token_stream_without_a_voice_stream_uses_the_ordinary_path():
     handler, _, _ = dial(ask=lambda text: "x", ask_stream=_token_stream("y"))
     assert handler.ask_stream is None
+
+
+# -- speculating at the first pause ------------------------------------------
+
+
+def _forking(asked, committed, reply="Važi, krećem."):
+    def ask_fork():
+        def ask_stream(heard):
+            asked.append(heard)
+            yield from _token_stream(reply)(heard)
+        return ask_stream, lambda: committed.append(True)
+    return ask_fork
+
+
+def test_an_answer_started_at_the_pause_is_used_when_he_really_had_stopped():
+    asked, committed, spoken = [], [], []
+    handler, phone, reply = dial(
+        ask_stream=_token_stream("never used"),
+        speak_stream=_voice_stream(spoken),
+        ask_fork=_forking(asked, committed))
+    phone.say_after(0.05, quiet(1.4))
+    phone.say_after(1.7, np.concatenate([speech(1.0), quiet(1.6)]))
+    thread = run(handler, phone, reply)
+    thread.join(timeout=20)
+    phone.stop()
+    assert handler.speculation["used"] == 1, handler.speculation
+    assert asked == ["da samo napred"]
+    assert committed == [True]
+    assert "never used" not in " ".join(spoken)
+
+
+def _words_by_length(audio):
+    """Transcribes to one word per 0.4 s of speech, so a phrase and the same
+    phrase continued come out different - which a constant fake would hide."""
+    loud = np.abs(audio) > 0.05
+    return " ".join(["reč"] * max(0, int(loud.sum() / 16000 / 0.4))) if loud.any() else ""
+
+
+def test_a_pause_he_talks_through_drops_the_speculation_and_answers_all_of_it():
+    asked, committed, spoken, heard = [], [], [], []
+
+    def ask_stream(text):
+        heard.append(text)
+        yield from _token_stream("Razumem.")(text)
+
+    handler, phone, reply = dial(
+        transcribe=_words_by_length,
+        ask_stream=ask_stream,
+        speak_stream=_voice_stream(spoken),
+        ask_fork=_forking(asked, committed),
+        utterance_seconds=4.0)
+    phone.say_after(0.05, quiet(1.4))
+    # A 250 ms pause: past the 150 ms speculation point, short of a phrase end.
+    phone.say_after(1.7, np.concatenate([speech(1.0), quiet(0.25), speech(1.0), quiet(1.6)]))
+    thread = run(handler, phone, reply)
+    thread.join(timeout=25)
+    phone.stop()
+    answered = (asked if handler.speculation["used"] else heard)[-1]
+    full = next(text for who, text in handler.transcript if who == "you")
+    # Whatever answered him answered all of it, not the half before the pause.
+    assert answered == full, (answered, full, handler.speculation)
+    assert len(full.split()) > len(_words_by_length(speech(1.0, rate=16000)).split()), full
+    assert len(committed) == handler.speculation["used"]

@@ -131,6 +131,52 @@ def sentences(text: str, *, minimum: int = MIN_CHUNK_CHARS,
     return [chunk for chunk in chunks if chunk]
 
 
+class Speculation:
+    """An answer started at the first pause, held until the turn is known to be over.
+
+    Produces into a queue exactly as `reply_streaming` consumes, so using it is
+    handing the queue over; dropping it is setting `stop`. Audio is never sent
+    from here -- nothing he hears can come from a turn he had not finished.
+    """
+
+    def __init__(self, text: str, ask_stream, speak_stream, commit) -> None:
+        self.text = text
+        self.commit = commit
+        self.chunks: queue.Queue = queue.Queue()
+        self.stop = threading.Event()
+        self.began = time.monotonic()
+        self.thread = threading.Thread(
+            target=_produce, args=(ask_stream, speak_stream, text, self.chunks, self.stop),
+            daemon=True, name="call-speculate")
+        self.thread.start()
+
+    def drop(self) -> None:
+        self.stop.set()
+
+
+def _produce(ask_stream, speak_stream, said, chunks: queue.Queue, stop: threading.Event) -> None:
+    """Agent tokens -> voice chunks -> `chunks`, until done, failed, or `stop`."""
+    pieces = None
+    try:
+        pieces = speak_stream(ask_stream(said))
+        for piece in pieces:
+            chunks.put(("chunk", piece))
+            if stop.is_set():
+                break
+        chunks.put(("done", None))
+    except Exception as exc:
+        if not stop.is_set():
+            log.exception("the streaming leg failed")
+        chunks.put(("err", f"{type(exc).__name__}: {exc}"))
+    finally:
+        if pieces is not None:
+            pieces.close()
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.split()).lower()
+
+
 class AnsweredCall:
     """One answered SIP call, from the 200 OK until one of us hangs up.
 
@@ -152,6 +198,7 @@ class AnsweredCall:
         ask: Callable[[str], str] | None = None,
         ask_stream: Callable[[str], Iterator[str | None]] | None = None,
         speak_stream: Callable[[Iterable[str | None]], Iterator[tuple[np.ndarray, int, str]]] | None = None,
+        ask_fork: Callable[[], tuple[Callable[[str], Iterator[str | None]], Callable[[], None]]] | None = None,
         hung_up: Callable[[], bool] | None = None,
         note: Callable[[str, str], None] | None = None,
         recorder: Any = None,
@@ -177,6 +224,14 @@ class AnsweredCall:
         # stream with nothing feeding it, is just the slow path with extra steps.
         self.ask_stream = ask_stream if speak_stream is not None else None
         self.speak_stream = speak_stream
+        # Speculation needs an agent it can throw away: `ask_fork()` returns a
+        # copy's `ask_stream` and a `commit` that makes the copy's history the
+        # real one. Without it there is no speculating, only the ordinary path.
+        self.ask_fork = ask_fork if self.ask_stream is not None else None
+        self._spec: Speculation | None = None
+        self._spec_lock = threading.Lock()
+        self._pause_gen = 0
+        self.speculation = {"started": 0, "used": 0, "dropped": 0}
         self.hung_up = hung_up
         self.note = note or (lambda kind, text: None)
         # Off unless something handed one in. See `media/record.py` for why an
@@ -379,14 +434,39 @@ class AnsweredCall:
         # dropped them.
         self._wire_at = max(0, call.recorded_frames - len(call._pending_rx))
 
+        # The pause transcription of the phrase in progress, if he has not
+        # spoken since it was taken. At 350 ms the same phrase plus 200 ms of
+        # silence is emitted as a chunk; reusing this result instead of running
+        # Whisper on it again saves the GPU a pass and keeps the speculation's
+        # text identical to the final one whenever he really had stopped.
+        early: list = []
+        self._drop_speculation()
+
         def on_chunk(phrase: np.ndarray) -> None:
             captured.append(phrase)
-            pending.append(worker.submit(self._transcribe, phrase))
+            pending.append(early.pop() if early else worker.submit(self._transcribe, phrase))
+
+        def on_pause(phrase: np.ndarray) -> None:
+            if self.ask_fork is None:
+                return
+            future = worker.submit(self._transcribe, phrase)
+            early[:] = [future]
+            with self._spec_lock:
+                self._pause_gen += 1
+                gen = self._pause_gen
+            threading.Thread(target=self._speculate, args=(list(pending), future, gen),
+                             daemon=True, name="call-early").start()
+
+        def on_resume() -> None:
+            early.clear()
+            self._drop_speculation()
 
         listened = 0.0
         why = "no-audio"
         while True:
-            tail, why = call.receive_turn(max_seconds=self.turn_seconds, on_chunk=on_chunk)
+            tail, why = call.receive_turn(max_seconds=self.turn_seconds, on_chunk=on_chunk,
+                                          on_pause=on_pause if self.ask_fork else None,
+                                          on_resume=on_resume if self.ask_fork else None)
             if tail.size:
                 captured.append(tail)
                 pending.append(worker.submit(self._transcribe, tail))
@@ -402,6 +482,35 @@ class AnsweredCall:
         # Everything he said was noise or an invention. Do not hand that on: it
         # answers a question he never asked.
         return (said if len(said) >= 3 else ""), captured, why
+
+    def _speculate(self, before: list, future, gen: int) -> None:
+        """Once the pause transcription is in, start answering it - unless he
+        has spoken again meanwhile, which moves `_pause_gen` on."""
+        try:
+            text = " ".join(f.result() for f in [*before, future]).strip()
+        except Exception:
+            return
+        if len(text) < 3 or is_farewell(text) or gen != self._pause_gen:
+            return
+        ask_stream, commit = self.ask_fork()
+        spec = Speculation(text, ask_stream, self.speak_stream, commit)
+        with self._spec_lock:
+            if gen != self._pause_gen:      # he resumed while it was starting
+                spec.drop()
+                return
+            old, self._spec = self._spec, spec
+        if old is not None:
+            old.drop()
+        self.speculation["started"] += 1
+        log.info("speculating on %r", text[-80:])
+
+    def _drop_speculation(self) -> None:
+        with self._spec_lock:
+            self._pause_gen += 1
+            spec, self._spec = self._spec, None
+        if spec is not None:
+            spec.drop()
+            self.speculation["dropped"] += 1
 
     def _transcribe(self, audio: np.ndarray) -> str:
         try:
@@ -472,28 +581,23 @@ class AnsweredCall:
         history keeps only what was actually produced).
         """
         assert self.ask_stream is not None and self.speak_stream is not None
-        chunks: queue.Queue = queue.Queue()
-        stop = threading.Event()
-        ask_stream, speak_stream = self.ask_stream, self.speak_stream
-
-        def produce() -> None:
-            pieces = None
-            try:
-                pieces = speak_stream(ask_stream(said))
-                for piece in pieces:
-                    chunks.put(("chunk", piece))
-                    if stop.is_set():
-                        break
-                chunks.put(("done", None))
-            except Exception as exc:
-                log.exception("the streaming leg failed")
-                chunks.put(("err", f"{type(exc).__name__}: {exc}"))
-            finally:
-                if pieces is not None:
-                    pieces.close()
-
-        thread = threading.Thread(target=produce, daemon=True, name="call-stream")
-        thread.start()
+        with self._spec_lock:
+            spec, self._spec = self._spec, None
+        commit = None
+        if spec is not None and _norm(spec.text) == _norm(said):
+            self.speculation["used"] += 1
+            log.info("speculation used: started %.2f s before the turn ended",
+                     time.monotonic() - spec.began)
+            chunks, stop, commit = spec.chunks, spec.stop, spec.commit
+        else:
+            if spec is not None:
+                spec.drop()
+                self.speculation["dropped"] += 1
+                log.info("speculation dropped: %r is not %r", spec.text[-60:], said[-60:])
+            chunks = queue.Queue()
+            stop = threading.Event()
+            threading.Thread(target=_produce, args=(self.ask_stream, self.speak_stream, said, chunks, stop),
+                             daemon=True, name="call-stream").start()
         began = time.monotonic()
         spoken: list[str] = []
         held = nudged = False
@@ -535,6 +639,11 @@ class AnsweredCall:
                 log.info("he cut in %d streamed chunk(s) in", len(spoken))
                 stop.set()
                 break
+        if commit is not None:
+            # After the speculative stream has finished or been stopped, so the
+            # copy's history holds the whole turn - or only what was said of it.
+            spec.thread.join(timeout=5.0)
+            commit()
         if spoken:
             text = " ".join(spoken)
             self.note("claude", text)

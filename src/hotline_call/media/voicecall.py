@@ -806,6 +806,9 @@ class VoiceCall:
         calibrate_ms: int = 300,
         chunk_at_ms: int = 350,
         on_chunk=None,
+        pause_at_ms: int = 150,
+        on_pause=None,
+        on_resume=None,
     ) -> tuple[np.ndarray, str]:
         """Listen until he stops talking, then return what he said.
 
@@ -826,6 +829,12 @@ class VoiceCall:
         silence he is waiting through, and on a 10 s turn that was 4.4 s of dead
         air. Feeding phrases out as they complete moves nearly all of it under
         his own speech, leaving only the final phrase to transcribe at the end.
+
+        `on_pause` is handed the same unemitted phrase earlier, at the first
+        `pause_at_ms` of silence, and `on_resume` is called if he then speaks
+        again before the turn ends. That is the hook for speculating: start
+        answering at the first sign of a pause, drop it if he carries on.
+        Nothing about when the turn ENDS changes; `silence_ms` still decides.
 
         Chunking happens at pauses rather than on a timer because a fixed
         boundary lands mid-word, and Whisper given half a word transcribes half
@@ -852,6 +861,8 @@ class VoiceCall:
         threshold: float | None = None
         frames_for_silence = max(1, silence_ms // FRAME_MS)
         frames_for_chunk = max(1, chunk_at_ms // FRAME_MS)
+        frames_for_pause = max(1, pause_at_ms // FRAME_MS)
+        paused = False           # on_pause fired and he has not spoken since
         frames_for_speech = max(1, min_speech_ms // FRAME_MS)
         frames_to_calibrate = max(1, calibrate_ms // FRAME_MS)
 
@@ -918,8 +929,24 @@ class VoiceCall:
                 if level >= threshold:
                     speech_frames += 1
                     trailing_silence = 0
+                    if paused:
+                        paused = False
+                        if on_resume is not None:
+                            try:
+                                on_resume()
+                            except Exception:
+                                log.exception("resume handler raised; continuing to listen")
                 else:
                     trailing_silence += 1
+                    if (on_pause is not None and not paused
+                            and trailing_silence == frames_for_pause
+                            and speech_frames >= frames_for_speech
+                            and len(frames) - emitted_to > frames_for_pause):
+                        paused = True
+                        try:
+                            on_pause(pcm.to_model(b"".join(frames[emitted_to:]), rate=self.rate))
+                        except Exception:
+                            log.exception("pause handler raised; continuing to listen")
                     if speech_frames >= frames_for_speech and trailing_silence >= frames_for_silence:
                         reason = "endpointed"
                         break

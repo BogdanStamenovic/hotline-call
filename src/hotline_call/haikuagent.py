@@ -17,7 +17,8 @@ question that was 220 output tokens instead of 111, and every one of them is
 silence on the line.
 
 **Why stdlib HTTP.** hotline-ios has no runtime dependencies outside the voice
-extra, and server-sent events are lines: `urllib` reads them fine.
+extra, and server-sent events are lines: `http.client` reads them fine, and
+keeps the connection open between turns (see `_Pool`).
 
 **Cost.** $0.10/M input, $0.50/M output (prompts under 100k tokens). A turn is
 a few thousand tokens in and ~100 out, so a long call costs well under a cent.
@@ -25,13 +26,13 @@ a few thousand tokens in and ~100 out, so a long call costs well under a cent.
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
 import pathlib
+import threading
 import time
-import urllib.error
-import urllib.request
 from collections.abc import Iterator
 
 from . import calltools
@@ -85,6 +86,69 @@ class HaikuUnavailable(RuntimeError):
     pass
 
 
+def _lines(response):
+    while True:
+        line = response.readline()
+        if not line:
+            return
+        yield line
+
+
+class _Pool:
+    """Idle HTTPS connections to the API, reused across turns.
+
+    urllib opens a new TCP + TLS connection per request; on this box that is
+    ~0.1-0.2 s before the first byte of every turn. A pool rather than one
+    connection because a dropped speculation can still be mid-stream while the
+    real turn starts, and one HTTP/1.1 connection carries one request at a time.
+    """
+
+    def __init__(self, host: str = "api.anthropic.com", keep: int = 3) -> None:
+        self.host = host
+        self.keep = keep
+        self.idle: list[http.client.HTTPSConnection] = []
+        self.lock = threading.Lock()
+
+    def _new(self) -> http.client.HTTPSConnection:
+        return http.client.HTTPSConnection(self.host, timeout=TIMEOUT)
+
+    def warm(self) -> None:
+        try:
+            conn = self._new()
+            conn.connect()
+            self.give_back(conn, reuse=True)
+        except OSError as exc:
+            log.info("could not pre-open the API connection (%s); the first turn will", exc)
+
+    def post(self, body: bytes, headers: dict):
+        for attempt in range(2):
+            with self.lock:
+                conn = self.idle.pop() if self.idle else None
+            fresh = conn is None
+            conn = conn or self._new()
+            try:
+                conn.request("POST", "/v1/messages", body=body, headers=headers)
+                return conn, conn.getresponse()
+            except (OSError, http.client.HTTPException) as exc:
+                conn.close()
+                # A pooled connection the server already closed fails here;
+                # one retry on a fresh connection, never two.
+                if fresh or attempt:
+                    raise HaikuUnavailable(f"API unreachable: {exc}") from exc
+        raise AssertionError("unreachable")
+
+    def give_back(self, conn, *, reuse: bool) -> None:
+        if reuse:
+            with self.lock:
+                if len(self.idle) < self.keep:
+                    self.idle.append(conn)
+                    return
+        conn.close()
+
+
+_POOL = _Pool()
+
+
 def api_key() -> str:
     key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if key:
@@ -114,8 +178,21 @@ class HaikuAgent:
         self.failed = "" if self.key else f"no API key (ANTHROPIC_API_KEY or {KEY_FILE})"
 
     def start(self) -> None:
-        """Nothing to seed: the API holds no session. Kept so the daemon can
-        treat both agents alike."""
+        """Nothing to seed, but open a connection to the API now, while the
+        phone rings, so the first turn does not pay for TLS."""
+        if self.key:
+            threading.Thread(target=_POOL.warm, daemon=True, name="api-warm").start()
+
+    def fork(self) -> "HaikuAgent":
+        """A copy to answer speculatively with. Its history is its own until
+        `adopt` makes it the real one; a dropped fork changes nothing."""
+        twin = HaikuAgent.__new__(HaikuAgent)
+        twin.__dict__.update(self.__dict__)
+        twin.history = list(self.history)
+        return twin
+
+    def adopt(self, twin: "HaikuAgent") -> None:
+        self.history = twin.history
 
     def reply(self, heard: str) -> str:
         return "".join(d for d in self.reply_stream(heard) if d)
@@ -185,21 +262,19 @@ class HaikuAgent:
         }
         if tools:
             body["tools"] = calltools.SCHEMAS
-        request = urllib.request.Request(API, data=json.dumps(body).encode(), headers={
-            "x-api-key": self.key, "anthropic-version": "2023-06-01",
-            "content-type": "application/json"})
-        try:
-            response = urllib.request.urlopen(request, timeout=TIMEOUT)
-        except urllib.error.HTTPError as exc:
-            detail = exc.read()[:400].decode("utf-8", "replace")
-            raise HaikuUnavailable(f"API said {exc.code}: {detail}") from exc
-        except OSError as exc:
-            raise HaikuUnavailable(f"API unreachable: {exc}") from exc
+        headers = {"x-api-key": self.key, "anthropic-version": "2023-06-01",
+                   "content-type": "application/json"}
+        conn, response = _POOL.post(json.dumps(body).encode(), headers)
+        if response.status != 200:
+            detail = response.read()[:400].decode("utf-8", "replace")
+            _POOL.give_back(conn, reuse=False)
+            raise HaikuUnavailable(f"API said {response.status}: {detail}")
         blocks: dict[int, dict] = {}
         partial: dict[int, list[str]] = {}
         stop = ""
-        with response:
-            for raw in response:
+        finished = False
+        try:
+            for raw in _lines(response):
                 line = raw.decode("utf-8", "replace").strip()
                 if not line.startswith("data: "):
                     continue
@@ -228,7 +303,14 @@ class HaikuAgent:
                 elif kind == "error":
                     raise HaikuUnavailable(f"API stream error: {event.get('error')}")
                 elif kind == "message_stop":
+                    finished = True
                     break
+        finally:
+            # A stream abandoned mid-way (barge-in, a dropped speculation)
+            # leaves unread bytes on the socket; that connection cannot be reused.
+            if finished:
+                response.read()
+            _POOL.give_back(conn, reuse=finished)
         content = [b for _, b in sorted(blocks.items())
                    if b.get("type") == "tool_use" or b.get("text")]
         yield content, stop

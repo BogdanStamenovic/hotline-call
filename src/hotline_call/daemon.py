@@ -847,7 +847,7 @@ class Service:
             # picking up; `CallAgent.reply` waits for it if there were not.
             agent.start()
 
-        ask_stream = speak_stream = None
+        ask_stream = speak_stream = ask_fork = None
         if engine == "haiku" and agent is not None and not target.address:
             # His test, 2026-10-30: Haiku 5.5 over the API, its tokens streamed
             # straight into cvoiced. The CallAgent seeded above stays as the
@@ -865,6 +865,11 @@ class Service:
                 log.error("call %s: the TTS client cannot stream; classic voice instead", conversation)
             else:
                 ask_stream, speak_stream = haiku.reply_stream, speaker.stream
+                haiku.start()   # opens the API connection while the phone rings
+
+                def ask_fork(haiku=haiku):
+                    twin = haiku.fork()
+                    return twin.reply_stream, lambda: haiku.adopt(twin)
 
         return AnsweredCall(
             speak=speak,
@@ -886,6 +891,7 @@ class Service:
             ask=agent.reply if agent is not None else None,
             ask_stream=ask_stream,
             speak_stream=speak_stream,
+            ask_fork=ask_fork,
             hung_up=getattr(link, "far_end_hung_up", None),
             note=append,
             recorder=from_environment(f"{target.caller_id}: {target.reason}"),
