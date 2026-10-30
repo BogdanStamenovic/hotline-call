@@ -705,7 +705,7 @@ class Service:
         # at all, which is worse than the bug this whole path fixes.
         try:
             links = holds_calls(doorbell) if self.can_talk else []
-            handlers = [self._answered_call(target, conversation, link) for link in links]
+            handlers = [self._answered_call(target, conversation, link, engine) for link in links]
         except Exception:
             log.exception("could not build the answered-call handler; ringing anyway")
             yield None
@@ -791,7 +791,8 @@ class Service:
         speak is the silence this whole path exists to end."""
         return self.speaker is not None and self.transcriber is not None
 
-    def _answered_call(self, target: CallTarget, conversation: str, link: Any) -> Any:
+    def _answered_call(self, target: CallTarget, conversation: str, link: Any,
+                       engine: str = "") -> Any:
         """The handler `SipTransport` calls when he picks up.
 
         Everything crossing into it is a plain callable, so `conversation.py`
@@ -846,6 +847,25 @@ class Service:
             # picking up; `CallAgent.reply` waits for it if there were not.
             agent.start()
 
+        ask_stream = speak_stream = None
+        if engine == "haiku" and agent is not None and not target.address:
+            # His test, 2026-10-30: Haiku 5.5 over the API, its tokens streamed
+            # straight into cvoiced. The CallAgent seeded above stays as the
+            # fallback for a missing key or an old cvoiced; its seed costs
+            # nothing he hears, it runs while the phone rings.
+            from .haikuagent import HaikuAgent
+
+            haiku = HaikuAgent(agent.context)   # already call_context.txt + this call
+            if haiku.failed:
+                log.error("call %s: haiku engine unavailable (%s); classic voice instead",
+                          conversation, haiku.failed)
+                self._append(conversation, "error",
+                             f"haiku engine unavailable ({haiku.failed}); the classic voice took the call")
+            elif not hasattr(speaker, "stream"):
+                log.error("call %s: the TTS client cannot stream; classic voice instead", conversation)
+            else:
+                ask_stream, speak_stream = haiku.reply_stream, speaker.stream
+
         return AnsweredCall(
             speak=speak,
             transcribe=lambda audio: str(transcriber.transcribe(audio)),
@@ -864,6 +884,8 @@ class Service:
             )),
             deliver=lambda text: append("you", text),
             ask=agent.reply if agent is not None else None,
+            ask_stream=ask_stream,
+            speak_stream=speak_stream,
             hung_up=getattr(link, "far_end_hung_up", None),
             note=append,
             recorder=from_environment(f"{target.caller_id}: {target.reason}"),

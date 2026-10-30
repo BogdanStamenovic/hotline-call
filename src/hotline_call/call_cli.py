@@ -121,14 +121,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--engine",
         default="",
-        choices=["", "personaplex", "classic"],
+        choices=["", "personaplex", "classic", "haiku"],
         help="who talks on the call. Default: 'personaplex' for a call to Bogdan, "
         "'classic' for a call to anyone else. 'personaplex': an English full-duplex "
         "speech model (PersonaPlex-7B on the local GPU) holds the whole call; the reason "
         "and --context become its brief; it returns after he hangs up, with a "
         "transcript of both sides ('him:' / 'voice:'), not a single answer. If it "
         "cannot start, the call goes out on the classic path and stderr says so. "
-        "'classic': the Serbian ASR + Claude + TTS loop, which returns his answer",
+        "'classic': the Serbian ASR + Claude + TTS loop, which returns his answer. "
+        "'haiku': classic, but the voice is Haiku 5.5 over the API with its tokens "
+        "streamed into cvoiced, so it starts speaking before the reply is written; "
+        "it cannot look anything up. Falls back to classic without an API key",
     )
     parser.add_argument("-q", "--quiet", action="store_true", help="suppress non-error output")
     return parser

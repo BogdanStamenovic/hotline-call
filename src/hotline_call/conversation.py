@@ -42,7 +42,7 @@ import queue
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
@@ -75,6 +75,12 @@ MAX_UTTERANCE_SECONDS = 180.0
 
 TURN_SECONDS = 30.0
 AGENT_SLOW_AFTER = 3.0
+FIRST_AUDIO_GRACE = 1.5
+"""How long a streamed reply may take to its first audio before a holding
+phrase goes out. Above the measured median (1.73 s under GPU contention,
+~1.0 s expected without), because a filler blocks: one that starts just
+before the real answer delays the answer by the filler's own length. So it
+covers the slow tail, not the typical turn."""
 """When a second, apologetic filler goes out because the agent is still thinking."""
 
 MIN_CHUNK_CHARS = 80
@@ -144,6 +150,8 @@ class AnsweredCall:
         greeting: str = "",
         deliver: Callable[[str], None] | None = None,
         ask: Callable[[str], str] | None = None,
+        ask_stream: Callable[[str], Iterator[str]] | None = None,
+        speak_stream: Callable[[Iterable[str]], Iterator[tuple[np.ndarray, int, str]]] | None = None,
         hung_up: Callable[[], bool] | None = None,
         note: Callable[[str, str], None] | None = None,
         recorder: Any = None,
@@ -165,6 +173,10 @@ class AnsweredCall:
         self.greeting = greeting
         self.deliver = deliver
         self.ask = ask
+        # Both or neither: a token stream with nothing to speak it, or a voice
+        # stream with nothing feeding it, is just the slow path with extra steps.
+        self.ask_stream = ask_stream if speak_stream is not None else None
+        self.speak_stream = speak_stream
         self.hung_up = hung_up
         self.note = note or (lambda kind, text: None)
         # Off unless something handed one in. See `media/record.py` for why an
@@ -185,6 +197,8 @@ class AnsweredCall:
         self.stats: dict[str, int] = {}
         self.answered = ""
         self.turns = 0
+        # Seconds from his turn ending to the first streamed audio, per turn.
+        self.first_audio: list[float] = []
         self.ended = "not started"
 
     # -- the entry point --------------------------------------------------
@@ -406,6 +420,9 @@ class AnsweredCall:
         slow. A holding phrase asserts nothing, so unlike a speculative *answer*
         it cannot be contradicted by the rest of his sentence.
         """
+        if self.ask_stream is not None:
+            self.reply_streaming(call, said)
+            return
         ask = self.ask
         if ask is None:
             self.play(call, "ack_mhm")
@@ -441,6 +458,87 @@ class AnsweredCall:
         else:
             self.note("claude", text)
         self.say(call, text)
+
+    def reply_streaming(self, call: VoiceCall, said: str) -> None:
+        """Answer while the answer is still being written.
+
+        The agent's tokens go straight into cvoiced, and each clause is played
+        the moment it is rendered. The first one arrives ~1-1.7 s after `said`
+        (cvoice `bench/haiku_ws_bench.py`, 2026-10-30), so the holding phrase
+        goes out only if it has NOT arrived within `FIRST_AUDIO_GRACE`.
+
+        Barge-in closes the stream, which closes cvoiced's socket (it stops
+        rendering) and the agent's HTTP response (it stops generating, and its
+        history keeps only what was actually produced).
+        """
+        assert self.ask_stream is not None and self.speak_stream is not None
+        chunks: queue.Queue = queue.Queue()
+        stop = threading.Event()
+        ask_stream, speak_stream = self.ask_stream, self.speak_stream
+
+        def produce() -> None:
+            pieces = None
+            try:
+                pieces = speak_stream(ask_stream(said))
+                for piece in pieces:
+                    chunks.put(("chunk", piece))
+                    if stop.is_set():
+                        break
+                chunks.put(("done", None))
+            except Exception as exc:
+                log.exception("the streaming leg failed")
+                chunks.put(("err", f"{type(exc).__name__}: {exc}"))
+            finally:
+                if pieces is not None:
+                    pieces.close()
+
+        thread = threading.Thread(target=produce, daemon=True, name="call-stream")
+        thread.start()
+        began = time.monotonic()
+        spoken: list[str] = []
+        held = nudged = False
+        while True:
+            waited = time.monotonic() - began
+            try:
+                kind, item = chunks.get(timeout=0.05)
+            except queue.Empty:
+                if waited > self.turn_seconds:
+                    kind, item = "err", "the stream did not answer in time"
+                elif spoken:
+                    continue
+                elif not held and waited > FIRST_AUDIO_GRACE:
+                    held = True
+                    self.play(call, "hold_nejasno_2")
+                    continue
+                elif not nudged and waited > AGENT_SLOW_AFTER:
+                    nudged = True
+                    self.play(call, "wait_proveri")
+                    continue
+                else:
+                    continue
+            if kind == "done":
+                break
+            if kind == "err":
+                stop.set()
+                self.note("error", str(item))
+                if not spoken:
+                    self.say(call, "Izvini, nešto mi se zaglavilo. Pokušaj ponovo.")
+                break
+            audio, rate, text = item
+            if not spoken:
+                log.info("first streamed audio %.2f s after he stopped", waited)
+                self.first_audio.append(round(waited, 3))
+            if audio.size:
+                call.send_audio(audio, rate, interruptible=True, flush=not spoken)
+            spoken.append(text)
+            if call.interrupted:
+                log.info("he cut in %d streamed chunk(s) in", len(spoken))
+                stop.set()
+                break
+        if spoken:
+            text = " ".join(spoken)
+            self.note("claude", text)
+            self.transcript.append(("claude", text))
 
     # -- speaking ---------------------------------------------------------
 

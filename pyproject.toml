@@ -25,7 +25,8 @@ telegram = ["telethon>=1.44"]
 # `pcm.resample` falls back to linear interpolation without it, which downsamples
 # 24 kHz speech to 8 kHz with no anti-aliasing and folds the noise straight into
 # the band Whisper listens to. The TTS is cvoiced over HTTP and needs nothing.
-voice = ["numpy>=2", "soxr>=0.5", "faster-whisper>=1.1"]
+# websockets: cvoiced's /speak/ws, for the streamed (`--engine haiku`) voice.
+voice = ["numpy>=2", "soxr>=0.5", "faster-whisper>=1.1", "websockets>=12"]
 dev = [
   "pytest>=8.0,<10",
   "pytest-asyncio>=0.23,<2",

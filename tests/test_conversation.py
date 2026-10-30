@@ -531,3 +531,65 @@ def test_a_guest_is_not_greeted_as_bogdan():
     spoken = [text for who, text in handler.transcript if who == "claude"]
     assert spoken[0] == "Zdravo, ovde Bogdanov asistent.", spoken
     assert not any("Bogdane" in text for text in spoken), spoken
+
+
+# -- streaming: the agent's tokens straight into the voice ------------------
+
+
+def _token_stream(text):
+    def ask_stream(heard):
+        for word in text.split(" "):
+            yield word + " "
+    return ask_stream
+
+
+def _voice_stream(spoken):
+    """Stands in for `Voice.stream`: one chunk per sentence of whatever arrives."""
+    def speak_stream(deltas):
+        buf = ""
+        for delta in deltas:
+            buf += delta
+            while ". " in buf:
+                piece, buf = buf.split(". ", 1)
+                spoken.append(piece + ".")
+                yield speech(0.3), TONE_RATE, piece + "."
+        if buf.strip():
+            spoken.append(buf.strip())
+            yield speech(0.3), TONE_RATE, buf.strip()
+    return speak_stream
+
+
+def test_a_streamed_answer_is_spoken_chunk_by_chunk_and_recorded_whole():
+    spoken: list[str] = []
+    handler, phone, reply = dial(
+        ask=lambda text: "never used",
+        ask_stream=_token_stream("Važi, krećem. Javiću se kad završim."),
+        speak_stream=_voice_stream(spoken))
+    phone.say_after(0.05, quiet(1.4))
+    phone.say_after(1.7, np.concatenate([speech(1.0), quiet(1.6)]))
+    thread = run(handler, phone, reply)
+    thread.join(timeout=20)
+    phone.stop()
+    assert spoken == ["Važi, krećem.", "Javiću se kad završim."], spoken
+    assert ("claude", "Važi, krećem. Javiću se kad završim.") in handler.transcript
+    assert "never used" not in handler.said
+    assert len(handler.first_audio) == 1
+
+
+def test_a_stream_that_fails_before_any_audio_apologises_out_loud():
+    def broken(_heard):
+        raise RuntimeError("no API key")
+        yield  # pragma: no cover
+
+    handler, phone, reply = dial(ask_stream=broken, speak_stream=_voice_stream([]))
+    phone.say_after(0.05, quiet(1.4))
+    phone.say_after(1.7, np.concatenate([speech(1.0), quiet(1.6)]))
+    thread = run(handler, phone, reply)
+    thread.join(timeout=20)
+    phone.stop()
+    assert any("zaglavilo" in line for line in handler.said), handler.said
+
+
+def test_a_token_stream_without_a_voice_stream_uses_the_ordinary_path():
+    handler, _, _ = dial(ask=lambda text: "x", ask_stream=_token_stream("y"))
+    assert handler.ask_stream is None

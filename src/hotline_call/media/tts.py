@@ -30,6 +30,7 @@ import pathlib
 import urllib.error
 import urllib.request
 import wave
+from collections.abc import Iterable, Iterator
 
 import numpy as np
 
@@ -76,6 +77,7 @@ class Voice:
         *,
         fallback: str = "",
         takes: int = 1,
+        steps: int | None = None,
         timeout: float = 60.0,
         config_path: str = "",
     ) -> None:
@@ -92,6 +94,11 @@ class Voice:
         self.profile = (profile or os.environ.get("CVOICE_PROFILE", "")
                         or client.get("profile", ""))
         self.takes = takes
+        # 8, not cvoice's 32. Measured 2026-10-30 on the 4060 (cvoice README,
+        # "Streaming"): 0.39 s instead of 1.52 s for a short line, with Whisper
+        # CER inside its own noise; 6 and below garble words. 0 means "the
+        # server's default".
+        self.steps = int(os.environ.get("HOTLINE_IOS_TTS_STEPS", "8")) if steps is None else steps
         self.timeout = timeout
         # Deliberately the same shape as `hotline.audio.Speaker`: `synthesize`
         # plus a `rate`. That is what lets the answered-call handler take either
@@ -110,6 +117,8 @@ class Voice:
         if not text.strip():
             return np.zeros(0, dtype=np.float32)
         body: dict[str, object] = {"text": text, "takes": self.takes}
+        if self.steps:
+            body["steps"] = self.steps
         if self.profile:
             body["profile"] = self.profile
         payload = self._post("/speak", body)
@@ -118,6 +127,76 @@ class Voice:
         audio, rate = _wav_to_float(base64.b64decode(payload["audio_b64"]))
         self.rate = rate
         return audio
+
+    def stream(self, deltas: Iterable[str]) -> Iterator[tuple[np.ndarray, int, str]]:
+        """Text deltas in, (audio, rate, text) per clause out, as each is rendered.
+
+        cvoiced's `/speak/ws`: the first clause comes back ~0.4 s after it is
+        complete, while the rest of `deltas` is still arriving. `deltas` is
+        drained on its own thread, so a slow token stream never blocks a chunk
+        that is already rendered. Closing this generator (barge-in) closes the
+        socket, and cvoiced stops rendering what is left.
+
+        Raises VoiceUnavailable if the socket cannot be opened or cvoiced
+        reports an error; a cvoiced too old to have `/speak/ws` is one of those.
+        """
+        import base64
+        import threading
+
+        from websockets.exceptions import WebSocketException
+        from websockets.sync.client import connect
+
+        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+        ws = None
+        last: BaseException | None = None
+        for base in dict.fromkeys(b for b in (self.base, self.fallback) if b):
+            try:
+                ws = connect(base.replace("http", "ws", 1) + "/speak/ws",
+                             additional_headers=headers, max_size=2**26,
+                             open_timeout=10)
+                break
+            except (OSError, WebSocketException) as exc:
+                last = exc
+        if ws is None:
+            raise VoiceUnavailable(f"cvoiced /speak/ws unreachable: {last}")
+        failed: list[BaseException] = []
+
+        def feed() -> None:
+            try:
+                first: dict[str, object] = {"steps": self.steps} if self.steps else {}
+                if self.profile:
+                    first["profile"] = self.profile
+                ws.send(json.dumps(first))
+                for delta in deltas:
+                    if delta:
+                        ws.send(json.dumps({"text": delta}))
+                ws.send(json.dumps({"end": True}))
+            except Exception as exc:  # noqa: BLE001 - surfaced on the reading side
+                failed.append(exc)
+                ws.close()
+
+        sender = threading.Thread(target=feed, daemon=True, name="tts-feed")
+        sender.start()
+        try:
+            while True:
+                try:
+                    msg = json.loads(ws.recv(timeout=self.timeout))
+                except (WebSocketException, TimeoutError) as exc:
+                    if failed:
+                        raise failed[0]
+                    raise VoiceUnavailable(f"cvoiced stream broke: {exc}") from exc
+                if "error" in msg:
+                    raise VoiceUnavailable(f"cvoiced said: {msg['error']}")
+                if msg.get("done"):
+                    if failed:
+                        raise failed[0]
+                    return
+                pcm = np.frombuffer(base64.b64decode(msg["pcm_b64"]), dtype="<i2")
+                rate = int(msg["samplerate"])
+                self.rate = rate
+                yield pcm.astype(np.float32) / 32767.0, rate, str(msg["text"])
+        finally:
+            ws.close()
 
     def load(self) -> bool:
         """Ask cvoiced to warm its model. Never raises.
