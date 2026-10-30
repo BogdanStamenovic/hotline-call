@@ -128,7 +128,7 @@ class Voice:
         self.rate = rate
         return audio
 
-    def stream(self, deltas: Iterable[str]) -> Iterator[tuple[np.ndarray, int, str]]:
+    def stream(self, deltas: Iterable[str | None]) -> Iterator[tuple[np.ndarray, int, str]]:
         """Text deltas in, (audio, rate, text) per clause out, as each is rendered.
 
         cvoiced's `/speak/ws`: the first clause comes back ~0.4 s after it is
@@ -168,7 +168,9 @@ class Voice:
                     first["profile"] = self.profile
                 ws.send(json.dumps(first))
                 for delta in deltas:
-                    if delta:
+                    if delta is None:      # the agent's "speak what you have now"
+                        ws.send(json.dumps({"flush": True}))
+                    elif delta:
                         ws.send(json.dumps({"text": delta}))
                 ws.send(json.dumps({"end": True}))
             except Exception as exc:  # noqa: BLE001 - surfaced on the reading side
