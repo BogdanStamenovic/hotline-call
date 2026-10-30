@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import pathlib
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
@@ -70,7 +71,9 @@ an agent) is something you DO NOT KNOW unless a file you just read says so, \
 and then say how old that file is if it matters. "As far as I know it is fine" \
 is a guess. If files cannot answer it, say so and that you will pass it on.
 - The context below was written by hand and is dated; where it disagrees with \
-these rules (about what you can and cannot do), these rules win.
+these rules (about what you can and cannot do), these rules win. Do not bring \
+up anything from it unprompted: it is background for answering him, not a list \
+of topics. Asked why you called, give the reason for THIS CALL and nothing else.
 - If he asks for something to be DONE, do not promise to do it and do not \
 pretend it is done. Say it is being passed on - "Važi, prosleđujem."
 - If you did not understand him, say so and ask him to repeat.
@@ -98,7 +101,12 @@ class HaikuAgent:
 
     def __init__(self, context: str = "", *, model: str = DEFAULT_MODEL,
                  manners: str = MANNERS, key: str = "", tools: bool = True) -> None:
-        self.system = f"{manners}\n\nKONTEKST:\n{context or 'Nema posebnog konteksta.'}"
+        # The date, because call_context.txt narrates "today" as of the day it
+        # was written; on the 2026-10-30 test call the voice offered a seven-week-old
+        # fix as current news.
+        today = time.strftime("%Y-%m-%d, %A")
+        self.system = (f"{manners}\n\nDANAS JE {today}.\n\n"
+                       f"KONTEKST:\n{context or 'Nema posebnog konteksta.'}")
         self.model = model
         self.key = key or api_key()
         self.history: list[dict] = []
