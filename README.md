@@ -118,7 +118,11 @@ to `hotline-page` by itself. `--engine personaplex|classic|haiku` picks who talk
 `hotline-call --help` has the rest.
 
 The client talks to `HOTLINE_CALL_URL`, else `HOTLINE_IOS_URL`, else
-`http://127.0.0.1:8792`.
+`http://127.0.0.1:8792`. With neither variable set, a *refused* connection on
+8792 is retried once on hotline-iosd's 8789, which rang him itself before the
+split and forwards to hotline-calld after it -- so the client works on either
+side of the cut-over. A refused connect placed no call, so this cannot ring him
+twice; a timeout or a reset mid-call is never retried.
 
 `./ownbox.sh status` shows the unit, the config and the live `/health`.
 

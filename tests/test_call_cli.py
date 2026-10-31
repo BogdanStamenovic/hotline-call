@@ -184,3 +184,74 @@ def test_post_connection_refused_stays_a_plain_daemon_error(monkeypatch):
         client._post("/api/v1/call", {}, url="http://127.0.0.1:8792", timeout=1.0)
     assert not isinstance(ei.value, client.CallTimeout)
     assert "cannot reach" in str(ei.value)
+
+
+# ---- the cut-over fallback ---------------------------------------------------
+
+
+def _serve_once(answer):
+    """One HTTP server on a free port answering /api/v1/call, on a thread."""
+    import http.server
+    import json as _json
+    import threading
+
+    got = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            got.append(_json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            body = _json.dumps(answer).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, got
+
+
+def _refused_url():
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    return f"http://127.0.0.1:{port}"   # closed again: connecting is refused
+
+
+def test_a_refused_call_daemon_falls_back_to_hotline_iosd(monkeypatch):
+    # Before the cut-over nothing listens on 8792 and hotline-iosd still rings
+    # him itself; after it, hotline-iosd forwards. Either way 8789 is right.
+    from hotline_call import client
+
+    server, got = _serve_once({"state": "answered", "reply": "yes"})
+    try:
+        refused = _refused_url()
+        monkeypatch.setattr(client, "CALLD_URL", refused)
+        monkeypatch.setattr(client, "LEGACY_URL", f"http://127.0.0.1:{server.server_port}")
+        monkeypatch.setattr(client, "_CONFIGURED", "")
+        outcome = client.place_call("may I?", url=refused)
+        assert outcome.state == "answered" and outcome.reply == "yes"
+        assert got[0]["reason"] == "may I?"
+    finally:
+        server.shutdown()
+
+
+def test_a_configured_url_is_never_second_guessed(monkeypatch):
+    from hotline_call import client
+
+    server, got = _serve_once({"state": "answered", "reply": "yes"})
+    try:
+        refused = _refused_url()
+        monkeypatch.setattr(client, "CALLD_URL", refused)
+        monkeypatch.setattr(client, "LEGACY_URL", f"http://127.0.0.1:{server.server_port}")
+        monkeypatch.setattr(client, "_CONFIGURED", refused)
+        with pytest.raises(client.DaemonUnreachable):
+            client.place_call("may I?", url=refused)
+        assert got == []
+    finally:
+        server.shutdown()

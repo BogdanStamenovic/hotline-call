@@ -17,17 +17,25 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
-DEFAULT_URL = (os.environ.get("HOTLINE_CALL_URL", "") or os.environ.get("HOTLINE_IOS_URL", "")
-               or "http://127.0.0.1:8792")
-"""hotline-calld on loopback.
+CALLD_URL = "http://127.0.0.1:8792"
+"""hotline-calld on loopback."""
 
-HOTLINE_IOS_URL is still honoured because it is what callers set before the
-call daemon was split out of hotline-iosd, and hotline-iosd still answers
-`/api/v1/call` on 8789 by forwarding it here, so an old setting keeps working."""
+LEGACY_URL = "http://127.0.0.1:8789"
+"""hotline-iosd, which rang him itself until 2026-10-31 and forwards
+`/api/v1/call` to hotline-calld since."""
+
+_CONFIGURED = os.environ.get("HOTLINE_CALL_URL", "") or os.environ.get("HOTLINE_IOS_URL", "")
+DEFAULT_URL = _CONFIGURED or CALLD_URL
+"""HOTLINE_IOS_URL is still honoured because it is what callers set before the
+call daemon was split out of hotline-iosd."""
 
 
 class DaemonError(Exception):
     """The daemon could not be reached or refused the request."""
+
+
+class DaemonUnreachable(DaemonError):
+    """The connection was refused, so nothing can have been rung."""
 
 
 class CallTimeout(DaemonError):
@@ -118,6 +126,10 @@ def _post(path: str, payload: dict[str, Any], *, url: str, timeout: float) -> di
         ):
             elapsed = time.monotonic() - started
             raise CallTimeout(elapsed, _daemon_reachable(url), url) from exc
+        if isinstance(reason, ConnectionRefusedError) or isinstance(exc, ConnectionRefusedError):
+            raise DaemonUnreachable(f"cannot reach hotline-calld at {url}: {exc}") from exc
+        # Anything else -- a reset mid-response above all -- may have come after
+        # the request landed, so it is not proof that nothing rang.
         raise DaemonError(f"cannot reach hotline-calld at {url}: {exc}") from exc
 
 
@@ -161,7 +173,18 @@ def place_call(
         payload["callee"] = callee or "them"
     # The HTTP timeout has to outlive the call itself, or a long conversation
     # looks to the caller exactly like a dead daemon.
-    data = _post("/api/v1/call", payload, url=url, timeout=timeout + 30.0)
+    try:
+        data = _post("/api/v1/call", payload, url=url, timeout=timeout + 30.0)
+    except DaemonUnreachable:
+        # The cut-over fallback. With no URL configured, a refused connection on
+        # hotline-calld's port means it is not running yet -- or not any more --
+        # and hotline-iosd on 8789 either still rings him itself (before the
+        # cut-over) or forwards to hotline-calld (after). A refused connect
+        # placed no call, so trying the second address cannot ring him twice.
+        # A timeout is never retried: that call may be ringing right now.
+        if url != CALLD_URL or _CONFIGURED:
+            raise
+        data = _post("/api/v1/call", payload, url=LEGACY_URL, timeout=timeout + 30.0)
     return CallOutcome(
         state=str(data.get("state", "unreachable")),
         reply=str(data.get("reply", "")),
