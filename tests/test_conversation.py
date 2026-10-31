@@ -686,3 +686,45 @@ def test_the_intent_filler_plays_the_moment_he_stops_then_the_answer():
     assert picked == ["da samo napred"]
     assert "intent_pitanje" in fillers.played
     assert spoken[-1] == "Server radi."
+
+
+def test_a_speculation_that_reaches_a_side_effect_tool_is_redone_for_real():
+    """2026-10-31 23:33: "kaži Hotline 80 da pozove Mihajla" - the speculative
+    copy was refused message_agent, the refusal became the answer, and the
+    relay was silently dropped. Now the copy is thrown away and the real agent
+    answers the same turn, where the tool may run."""
+    from hotline_call.haikuagent import SpeculationAborted
+
+    real, committed, spoken = [], [], []
+
+    def ask_fork():
+        def aborting(heard):
+            yield "Samo sekund. "
+            raise SpeculationAborted("a tool with side effects was reached while speculating")
+        return aborting, lambda: committed.append(True)
+
+    def ask_stream(heard):
+        real.append(heard)
+        yield from _token_stream("Prosleđeno je.")(heard)
+
+    handler, phone, reply = dial(ask_stream=ask_stream, speak_stream=_voice_stream(spoken),
+                                 ask_fork=ask_fork)
+    phone.say_after(0.05, quiet(1.4))
+    phone.say_after(1.7, np.concatenate([speech(1.0), quiet(1.6)]))
+    thread = run(handler, phone, reply)
+    thread.join(timeout=20)
+    phone.stop()
+    assert real == ["da samo napred"], real          # the real agent answered the turn
+    assert committed == []                            # nothing adopted from the copy
+    assert spoken[-1] == "Prosleđeno je.", spoken
+
+
+def test_a_side_effect_tool_in_a_fork_aborts_instead_of_answering_an_error():
+    from hotline_call.haikuagent import HaikuAgent, SpeculationAborted
+
+    agent = HaikuAgent("ctx", key="k", extra_tools={
+        "message_agent": ({"name": "message_agent"}, lambda name, text: "SENT")})
+    twin = agent.fork()
+    with pytest.raises(SpeculationAborted):
+        twin._run_tool("message_agent", {"name": "hotline-80", "text": "x"})
+    assert agent._run_tool("message_agent", {"name": "hotline-80", "text": "x"}) == ("SENT", False)

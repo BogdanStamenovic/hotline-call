@@ -142,8 +142,16 @@ READ_ONLY_EXTRA = frozenset({"list_agents"})
 fork as calltools' lookups are."""
 
 
+class SpeculationAborted(RuntimeError):
+    """A speculative answer reached a tool with side effects. The speculation
+    must be thrown away and the turn answered for real once he has finished -
+    never handed back to the model as a tool error, which it then read out or
+    papered over: on 2026-10-31 23:33 two "tell hotline-80 to call Mihajlo"
+    relays died that way, silently."""
+
+
 def _not_while_speculating(**_args) -> str:
-    raise RuntimeError("not available before he has finished speaking")
+    raise SpeculationAborted("a tool with side effects was reached while speculating")
 
 
 def _lines(response):
@@ -334,6 +342,8 @@ class HaikuAgent:
             return calltools.run(name, args)
         try:
             return str(extra[1](**args)), False
+        except SpeculationAborted:
+            raise
         except TypeError as exc:
             return f"TypeError: {exc}", True
         except Exception as exc:  # noqa: BLE001 - said out loud, never a dropped call

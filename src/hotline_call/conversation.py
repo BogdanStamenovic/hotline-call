@@ -668,6 +668,19 @@ class AnsweredCall:
                     continue
             if kind == "done":
                 break
+            if kind == "err" and commit is not None and "SpeculationAborted" in str(item):
+                # The speculative copy wanted to act (message or connect an
+                # agent). Throw it away and answer the turn for real: the real
+                # agent may act, because he has finished speaking.
+                log.info("speculation aborted at a side-effect tool; answering for real")
+                stop.set()
+                commit = None
+                self.speculation["dropped"] += 1
+                chunks, stop = queue.Queue(), threading.Event()
+                threading.Thread(target=_produce,
+                                 args=(self.ask_stream, self.speak_stream, said, chunks, stop),
+                                 daemon=True, name="call-stream").start()
+                continue
             if kind == "err":
                 stop.set()
                 self.note("error", str(item))

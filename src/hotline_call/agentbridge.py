@@ -629,7 +629,8 @@ class AgentBridge:
                     "something on ('reci manageru 5 da...', 'javi X da...', 'pošalji "
                     "poruku X'). It reads it when its current turn ends. `name` is the "
                     "exact name from list_agents; `text` is the message in his words, "
-                    "complete and self-contained. Ask him if the agent is unclear."),
+                    "complete and self-contained. Ask him if the agent is unclear. If it "
+                    "returns NOT SENT, tell him plainly that it did not go through and why."),
                 "input_schema": {
                     "type": "object",
                     "properties": {"name": {"type": "string"},
