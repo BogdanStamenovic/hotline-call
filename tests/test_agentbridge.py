@@ -281,9 +281,12 @@ def test_a_speculative_fork_cannot_connect_anyone(monkeypatch):
     bodies = fake_pool(monkeypatch, lambda: rounds.pop(0))
     b, hot = bridge()
     twin = HaikuAgent("ctx", key="k", extra_tools=b.tools()).fork()
-    list(twin.reply_stream("spoji me sa tells"))
+    # The fork does not act and does not answer: it aborts, so the real agent
+    # redoes the turn once he has finished (see conversation.reply_streaming).
+    from hotline_call.haikuagent import SpeculationAborted
+    with pytest.raises(SpeculationAborted):
+        list(twin.reply_stream("spoji me sa tells"))
     assert hot.log == [] and not b.connected
-    assert bodies[1]["messages"][-1]["content"][0]["is_error"] is True
     # Same tool list as the real agent, so the prompt cache is shared.
     assert [t["name"] for t in bodies[0]["tools"]][-3:] == ["list_agents", "connect_agent", "message_agent"]
 
