@@ -398,6 +398,8 @@ fb_find_mac() {
 # libopus -- from THIS checkout's code, so the clip always matches the code
 # that plays it whatever version archserver's own install is on. The source
 # goes over as a tar on stdin and the clip comes back as a tar on stdout.
+# The remote script must not rely on word splitting: archserver's login shell
+# is zsh, which does not split an unquoted "$run" into a command and its args.
 fb_clip() {
     local want have
     want=$(fb_py -c 'from hotline_call.fallback import CLIP_TEXT, CLIP_FORMAT; import hashlib; print(CLIP_FORMAT, hashlib.sha256(CLIP_TEXT.encode()).hexdigest()[:16])')
@@ -415,11 +417,13 @@ fb_clip() {
         d=\$(mktemp -d); trap 'rm -rf \"\${d:?}\"' EXIT
         tar -x -C \"\$d\"
         py=\"\$HOME/$ARCH_DIR/.venv/bin/python\"
-        run=\"\$py\"
+        export PYTHONPATH=\"\$d/src\"
         if command -v systemd-run >/dev/null; then
-            run=\"systemd-run --user --scope -q -p MemoryMax=3G -p MemorySwapMax=0 \$py\"
+            systemd-run --user --scope -q -p MemoryMax=3G -p MemorySwapMax=0 \\
+                \"\$py\" -m hotline_call.fallback render-clip --out \"\$d/out\" >&2
+        else
+            \"\$py\" -m hotline_call.fallback render-clip --out \"\$d/out\" >&2
         fi
-        PYTHONPATH=\"\$d/src\" \$run -m hotline_call.fallback render-clip --out \"\$d/out\" >&2
         tar -c -C \"\$d/out\" ." | tar -x -C "$tmp" && [ -f "$tmp/manifest.json" ]; then
         mkdir -p "$(dirname "$FB_CLIP")"
         rm -rf "${FB_CLIP:?}.old"
