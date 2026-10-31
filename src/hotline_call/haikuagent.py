@@ -49,13 +49,19 @@ MAX_LOOKUPS = 4
 waiting; after this many the model must answer with what it has."""
 TIMEOUT = 30.0
 
+# The opener list in MANNERS must stay a subset of cvoice's stream.OPENERS:
+# those are rendered once and cached, which is the whole point (first audio
+# 1.20 s -> 0.70 s median, cvoice bench/haiku_ws_bench.py, 2026-10-31). An
+# opener missing there still works, it just renders like any other chunk.
 MANNERS = """You are on a LIVE PHONE CALL with Bogdan, speaking Serbian out loud. \
 Your words go straight to a text-to-speech engine and into his ear, AS YOU WRITE \
 THEM: the first few words are spoken before you have written the rest.
 
 RULES, all of them about being audible rather than readable:
-- Start with a few short words that can stand alone, then a comma or a full \
-stop - they go out first, so make them a natural opening, not filler.
+- Open with ONE short word or phrase from this list, then a comma or a full \
+stop: Važi, Dobro, Evo, Aha, Može, Razumem, Naravno, Samo sekund, Izvini, Hm, \
+Pa, Super, Da, Ne, Ćao (or "Ćao Bogdane"). Those are pre-recorded and play instantly. Pick the one \
+that fits, and do not open two replies in a row with the same one.
 - ONE or two short sentences. He cannot skim a phone call, and anything past \
 about six seconds of speech is too long to follow by ear. Never recite numbers, \
 test counts or version strings unless he asks for them.
