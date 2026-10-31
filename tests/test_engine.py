@@ -18,7 +18,7 @@ import threading
 import pytest
 
 from hotline_call.daemon import Service
-from hotline_call.events import EventLog
+from hotline_call.calllog import CallLog as EventLog
 from hotline_call.gpu_handoff import GpuHandoff
 from hotline_call.ring.base import CallUnreachable
 from hotline_call.ring.loopback import LoopbackTransport
@@ -50,7 +50,7 @@ class Doorbell(LoopbackTransport):
 
 def make(log: list[str], default_engine: str = "personaplex", why: str = "", fail: bool = False):
     bell = Doorbell(log, fail=fail)
-    service = Service(bell, pool=None, default_engine=default_engine,
+    service = Service(bell, default_engine=default_engine,
                       gpu_handoff=lambda: FakeHandoff(log))
     sip = Doorbell(log, name="sip", fail=fail)
     service.set_links({"loopback": bell, "sip": sip})
@@ -149,7 +149,7 @@ def test_handoff_with_no_ollama_running_is_not_an_error():
 def test_a_duplex_transcript_is_returned_whole_not_cut_at_the_hangup():
     """`ended` is set when the line drops, BEFORE the post-call transcription
     appends the turns; stopping on it could hand back the first line only."""
-    service = Service(LoopbackTransport(), pool=None)
+    service = Service(LoopbackTransport())
     events = EventLog()
 
     class Spoken:
@@ -196,7 +196,7 @@ class SlowDoorbell(LoopbackTransport):
 
 
 def make_slow(log: list[str], hold: float, gpu_wait_s: float = 180.0) -> Service:
-    service = Service(SlowDoorbell(log, hold), pool=None, default_engine="personaplex",
+    service = Service(SlowDoorbell(log, hold), default_engine="personaplex",
                       gpu_handoff=lambda: FakeHandoff(log), gpu_wait_s=gpu_wait_s)
     service._prepare_duplex = lambda *a: ([], [], "")
     return service
