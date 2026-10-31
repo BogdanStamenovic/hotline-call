@@ -150,7 +150,7 @@ No GPU, no models: the suite fakes Whisper, cvoiced and the SIP peer.
 PYTHONPATH=src:$HOME/data/hotline/src .venv/bin/python -m pytest -q tests
 ```
 
-362 passed, 1 skipped, in 243 s on archserver (2026-10-31).
+363 passed in 241 s on archserver (2026-10-31), in the venv `ownbox install` built.
 
 ## Limitations
 
