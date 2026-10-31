@@ -636,8 +636,11 @@ class AnsweredCall:
         if clip and clip in self.fillers:
             # Blocking on purpose: it is a word, and half a word is worse than none.
             # The answer keeps being produced behind it.
+            log.info("intent filler %s for %r", clip, said[-60:])
             self.play(call, clip)
             held = True
+        elif self.intent_filler is not None:
+            log.info("no intent filler for %r (picked %r)", said[-60:], clip)
         limit = self.turn_seconds
         if self.answer_seconds is not None:
             try:
