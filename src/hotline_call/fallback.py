@@ -46,9 +46,10 @@ hotline's account to itself reaches only the test registration. See
 - **Wake-on-LAN is fire-and-forget.** The packet leaves pigion's wifi as a
   broadcast; whether archserver's NIC and firmware act on it is not something
   this side can see, beyond calld coming back.
-- **Media goes over the tailnet**, as calld's does: the SDP offers pigion's
-  tailnet address, so his phone must have Tailscale up -- the same condition
-  calld's own calls already have.
+- **Audio leans on linphone.org's media relay.** The answer offers pigion's
+  tailnet address, but on the live test flexisip rewrote both SDPs to its relay
+  and pigion sent there; symmetric latching in `play` follows wherever his
+  packets actually come from.
 - **One call at a time**, and while one is up a second gets 486.
 """
 

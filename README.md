@@ -173,8 +173,8 @@ calld answers again ─▶ REGISTER Expires: 0 ─▶ POST calld /api/v1/call (o
   nothing is decoded or encoded there. `ownbox.sh` renders the clip on
   archserver with cvoiced (takes=1) and pre-encodes it into 20 ms Opus payloads
   and G.711 mu-law and A-law frames; the Pi only adds RTP headers, SRTP and
-  pacing, with the system `python3` and `cryptography`. Measured RSS: see the
-  commit that deployed it.
+  pacing, with the system `python3` and `cryptography`. Measured on pigion
+  (2026-10-31): 25.9 MB RSS idle, 30.3 MB at the peak of a call.
 - **No wake on outage, only on his call.** archserver powers itself off on
   purpose (wake's `then_do=poweroff`); waking it every time would undo that.
 - **One callback per outage**, recorded in
@@ -208,6 +208,11 @@ hotline-call-fallback serve --test --for-seconds 120
 instance, takes calls only from hotline's own account (which production calld
 refuses with 403) and keeps its own state file. `bench/fallback_live.py` on
 archserver places that call through linphone.org and checks what arrives.
+Measured that way on 2026-10-31: calld logged the 403, pigion answered with
+Opus, 314 of 314 frames arrived and decrypted with 0 authentication failures
+(6.28 s decoded, 0 decode errors), pigion's BYE came 6.5 s after the 200, and a
+magic packet for archserver's MAC was captured on archserver's NIC within the
+same second the INVITE arrived.
 
 ## Tests
 
@@ -217,7 +222,7 @@ No GPU, no models: the suite fakes Whisper, cvoiced and the SIP peer.
 PYTHONPATH=src:$HOME/data/hotline/src .venv/bin/python -m pytest -q tests
 ```
 
-365 passed in about 240 s on archserver (2026-10-31), both in the venv `ownbox install`
+378 passed in about 245 s on archserver (2026-10-31), both in the venv `ownbox install`
 builds and in hotline-ios's old one.
 
 ## Limitations
@@ -232,8 +237,11 @@ builds and in hotline-ios's old one.
   each followed by a boot at 08:00 local.
 - **The fallback's clip is screened, not checked.** A take is rejected for an
   implausible length, silence or clipping; nothing confirms it says the text.
-- **Media on a fallback call goes over the tailnet**, as calld's does, so his
-  phone needs Tailscale up for him to hear the clip.
+- **A fallback call's audio depends on linphone.org's media relay.** On the live
+  test (2026-10-31) flexisip rewrote both SDPs to its relay (176.31.149.179), so
+  pigion sent to the relay over the internet, not over the tailnet. That is the
+  path that was measured; a call that bypassed the relay would need his phone
+  to reach pigion's tailnet address.
 
 - **It depends on hotline's source tree being at `~/data/hotline/src`.** hotline
   is not packaged; this reads it over PYTHONPATH like hotline-iosd did.
