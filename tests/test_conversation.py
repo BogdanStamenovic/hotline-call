@@ -570,7 +570,9 @@ def test_a_streamed_answer_is_spoken_chunk_by_chunk_and_recorded_whole():
     thread = run(handler, phone, reply)
     thread.join(timeout=20)
     phone.stop()
-    assert spoken == ["Važi, krećem.", "Javiću se kad završim."], spoken
+    # The greeting goes through the same streamed voice now; the answer is the tail.
+    assert spoken[-2:] == ["Važi, krećem.", "Javiću se kad završim."], spoken
+    assert spoken[0].startswith("Claude here"), spoken
     assert ("claude", "Važi, krećem. Javiću se kad završim.") in handler.transcript
     assert "never used" not in handler.said
     assert len(handler.first_audio) == 1
@@ -581,13 +583,14 @@ def test_a_stream_that_fails_before_any_audio_apologises_out_loud():
         raise RuntimeError("no API key")
         yield  # pragma: no cover
 
-    handler, phone, reply = dial(ask_stream=broken, speak_stream=_voice_stream([]))
+    spoken: list[str] = []
+    handler, phone, reply = dial(ask_stream=broken, speak_stream=_voice_stream(spoken))
     phone.say_after(0.05, quiet(1.4))
     phone.say_after(1.7, np.concatenate([speech(1.0), quiet(1.6)]))
     thread = run(handler, phone, reply)
     thread.join(timeout=20)
     phone.stop()
-    assert any("zaglavilo" in line for line in handler.said), handler.said
+    assert any("zaglavilo" in line for line in spoken), spoken
 
 
 def test_a_token_stream_without_a_voice_stream_uses_the_ordinary_path():

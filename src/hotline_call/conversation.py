@@ -666,6 +666,31 @@ class AnsweredCall:
         self.transcript.append(("claude", text))
 
     def say(self, call: VoiceCall, text: str) -> None:
+        if self.speak_stream is not None:
+            self._say_streamed(call, text)
+            return
+        self._say_whole(call, text)
+
+    def _say_streamed(self, call: VoiceCall, text: str) -> None:
+        """Fixed text through the streaming voice, so it gets the same seams and
+        room tone as an answer. The whole-clip path pads each piece with digital
+        silence, which on the 2026-10-31 call was the only silence left in it."""
+        first = True
+        try:
+            for audio, rate, _piece in self.speak_stream(iter([text, None])):
+                if audio.size:
+                    call.send_audio(audio, rate, interruptible=True, flush=first)
+                first = False
+                if call.interrupted:
+                    break
+        except Exception:
+            log.exception("streamed speech failed; saying it the old way")
+            if first:
+                self._say_whole(call, text)
+                return
+        self.transcript.append(("claude", text))
+
+    def _say_whole(self, call: VoiceCall, text: str) -> None:
         """Speak, sentence by sentence, synthesising the next while this one plays.
 
         cvoiced runs at roughly 0.6x realtime, so the piece after the one being
