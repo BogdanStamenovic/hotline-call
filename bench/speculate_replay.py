@@ -132,7 +132,9 @@ def _run(row: dict) -> dict:
 
 
 def main() -> None:
-    out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "bench/speculate-replay.json")
+    # His words: results go under the gitignored recordings/, never into this
+    # public repo (the first run committed its transcripts here, 2026-10-31).
+    out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else RECORDINGS / "bench-results/speculate-replay.json")
     rows = cases(spoken(), "spoken") + cases(typed(), "typed")
     print(f"{len(rows)} cut points", flush=True)
     with cf.ThreadPoolExecutor(8) as pool:
