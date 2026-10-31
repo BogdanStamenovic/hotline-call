@@ -297,8 +297,17 @@ class Service:
             if self._calls_holding_models:
                 return
 
+        # The voice stays loaded unless asked otherwise. cvoiced leaks ~780 MB of
+        # VRAM on every /unload + /load cycle (measured 2026-10-31: 2488 -> 3270
+        # -> 4034 -> 4796 MiB after each unload), and one cycle per call filled
+        # the 8 GB card within a few calls: CUDA OOM, no greeting, and every
+        # phrase transcribed to nothing ("nisam te čuo" on a loop). A resident
+        # voice costs ~2 GB and never grows.
+        keep_voice = os.environ.get("HOTLINE_CALL_UNLOAD_VOICE", "0") != "1"
+        things = [("ears", self.transcriber)] + ([] if keep_voice else [("voice", self.speaker)])
+
         def work() -> None:
-            for name, thing in (("ears", self.transcriber), ("voice", self.speaker)):
+            for name, thing in things:
                 unloader = getattr(thing, "unload", None)
                 if unloader is None:
                     continue

@@ -472,7 +472,8 @@ async def test_a_ring_loads_the_models_and_the_end_of_the_call_unloads_them():
     _settle(service, 1, "loads")
     assert ears.loads == 1 and voice.loads == 1, "the ring must warm both halves"
     _settle(service, 1, "unloads")
-    assert ears.unloads == 1 and voice.unloads == 1, "the end of the call must drop both"
+    # The voice stays resident: cvoiced leaks VRAM on every unload/load cycle.
+    assert ears.unloads == 1 and voice.unloads == 0, "the end of the call drops the ears only"
 
 
 @pytest.mark.asyncio
@@ -493,7 +494,7 @@ async def test_a_second_call_does_not_unload_the_models_under_the_first():
 
     service._cool_models()
     _settle(service, 1, "unloads")
-    assert ears.unloads == 1 and voice.unloads == 1, "the last one out unloads"
+    assert ears.unloads == 1 and voice.unloads == 0, "the last one out unloads the ears; the voice stays resident"
 
 
 @pytest.mark.asyncio
