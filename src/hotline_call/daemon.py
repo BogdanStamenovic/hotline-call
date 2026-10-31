@@ -69,6 +69,13 @@ REAP_AFTER = 3600.0
 durable copy; this only has to outlive a caller reading its own outcome."""
 
 
+class _Whole:
+    """An agent whose `reply` is a whole string - what the non-streamed path wants."""
+
+    def __init__(self, reply) -> None:
+        self.reply = reply
+
+
 class Service:
     def __init__(
         self,
@@ -430,8 +437,16 @@ class Service:
         speaker, transcriber = self.speaker, self.transcriber
         speakable = _speakable()
 
+        from . import features as _features
+
+        # Read fresh for every call: he flips a switch, rings, listens.
+        feat = _features.load()
+
         def speak(text: str) -> tuple[Any, int]:
-            audio = speaker.synthesize(text)
+            try:
+                audio = speaker.synthesize(text, steps=feat["tts_steps"])
+            except TypeError:            # a speaker without per-call steps (hotline.audio)
+                audio = speaker.synthesize(text)
             return audio, int(getattr(speaker, "rate", 24_000))
 
         def append(kind: str, text: str) -> None:
@@ -493,16 +508,20 @@ class Service:
             # "spoji me sa <agent>": his request, 2026-10-31. Only on his own
             # calls (not a guest's), and only with the Haiku voice, which is
             # what understands the name. See agentbridge.py.
-            from .haikuagent import MANNERS
+            from .haikuagent import manners as build_manners
 
-            manners, extra = MANNERS, None
-            if os.environ.get("HOTLINE_IOS_BRIDGE", "1") != "0":
+            base = build_manners(openers=feat["opener_nudge"], tools=feat["tools"],
+                                 context_rules=feat["context_rules"])
+            manners, extra = base, None
+            if os.environ.get("HOTLINE_IOS_BRIDGE", "1") != "0" and feat["bridge"]:
                 from .agentbridge import AgentBridge
 
-                bridge = AgentBridge()
-                manners, extra = f"{MANNERS}\n- {bridge.manners()}", bridge.tools()
+                bridge = AgentBridge(mode=feat["bridge_mode"])
+                manners, extra = f"{base}\n- {bridge.manners()}", bridge.tools()
             haiku = HaikuAgent(agent.context, manners=manners,   # already call_context.txt + this call
-                               extra_tools=extra)
+                               extra_tools=extra, tools=feat["tools"],
+                               thinking=feat["thinking"], keepalive=feat["keepalive"],
+                               date=feat["context_rules"])
             if haiku.failed:
                 log.error("call %s: haiku engine unavailable (%s); classic voice instead",
                           conversation, haiku.failed)
@@ -511,14 +530,26 @@ class Service:
             elif not hasattr(speaker, "stream"):
                 log.error("call %s: the TTS client cannot stream; classic voice instead", conversation)
             else:
-                ask_stream, speak_stream = haiku.reply_stream, speaker.stream
+                def voice_stream(deltas, _speaker=speaker):
+                    return _speaker.stream(deltas, steps=feat["tts_steps"], join=feat["join"],
+                                           openers=feat["openers"])
+
+                ask_stream = haiku.reply_stream
                 if bridge is not None:
                     ask_stream = bridge.stream_for(haiku)
                 haiku.start()   # opens the API connection while the phone rings
-
-                def ask_fork(haiku=haiku):
-                    twin = haiku.fork()
-                    return twin.reply_stream, lambda: haiku.adopt(twin)
+                if feat["streaming"]:
+                    speak_stream = voice_stream
+                    if feat["speculation"]:
+                        def ask_fork(haiku=haiku):
+                            twin = haiku.fork()
+                            return twin.reply_stream, lambda: haiku.adopt(twin)
+                else:
+                    # Streaming off: the Haiku brain on the old whole-reply path,
+                    # so streaming can be judged alone. Same ask, spoken by `say`.
+                    whole = ask_stream
+                    agent = _Whole(lambda heard, f=whole: "".join(d for d in f(heard) if d))
+                    ask_stream = None
 
         return AnsweredCall(
             speak=speak,
@@ -544,6 +575,7 @@ class Service:
             speak_stream=speak_stream,
             ask_fork=ask_fork,
             hung_up=getattr(link, "far_end_hung_up", None),
+            stream_fixed_lines=feat["streamed_greeting"],
             may_speculate=bridge.may_speculate if bridge is not None else None,
             # Generous only when an agent is (or is being) put on the line: a
             # Claude session's turn is tens of seconds, not Haiku's one or two.
@@ -585,7 +617,10 @@ class Service:
         self._append(conversation, "state", "he called hotline")
         target = CallTarget(device="phone", agent=None, reason="Bogdan called hotline",
                             caller_id="Bogdan", context="", address="", callee="Bogdan")
-        engine = os.environ.get("HOTLINE_IOS_INBOUND_ENGINE", "haiku").strip().lower()
+        from . import features as _features
+
+        engine = os.environ.get("HOTLINE_IOS_INBOUND_ENGINE", "").strip().lower() \
+            or _features.load()["inbound_engine"]
         if engine in ("classic", "auto"):
             engine = ""
         # Warmed while it rings, exactly as an outbound ring does, and released

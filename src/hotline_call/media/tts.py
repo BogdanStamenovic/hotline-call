@@ -112,13 +112,13 @@ class Voice:
     def health(self) -> dict:
         return self._get("/health")
 
-    def synthesize(self, text: str) -> np.ndarray:
+    def synthesize(self, text: str, *, steps: int | None = None) -> np.ndarray:
         """Float32 mono in [-1, 1] at `self.rate`."""
         if not text.strip():
             return np.zeros(0, dtype=np.float32)
         body: dict[str, object] = {"text": text, "takes": self.takes}
-        if self.steps:
-            body["steps"] = self.steps
+        if steps or self.steps:
+            body["steps"] = steps or self.steps
         if self.profile:
             body["profile"] = self.profile
         payload = self._post("/speak", body)
@@ -128,7 +128,9 @@ class Voice:
         self.rate = rate
         return audio
 
-    def stream(self, deltas: Iterable[str | None]) -> Iterator[tuple[np.ndarray, int, str]]:
+    def stream(self, deltas: Iterable[str | None], *, steps: int | None = None,
+               join: str | None = None, openers: bool | None = None,
+               ) -> Iterator[tuple[np.ndarray, int, str]]:
         """Text deltas in, (audio, rate, text) per clause out, as each is rendered.
 
         cvoiced's `/speak/ws`: the first clause comes back ~0.4 s after it is
@@ -163,7 +165,12 @@ class Voice:
 
         def feed() -> None:
             try:
-                first: dict[str, object] = {"steps": self.steps} if self.steps else {}
+                first: dict[str, object] = {"steps": steps or self.steps} if (steps or self.steps) else {}
+                # Per-call switches (features.py); an older cvoiced ignores them.
+                if join:
+                    first["join"] = join
+                if openers is not None:
+                    first["openers"] = openers
                 if self.profile:
                     first["profile"] = self.profile
                 ws.send(json.dumps(first))

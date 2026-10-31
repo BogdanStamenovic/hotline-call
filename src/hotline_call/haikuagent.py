@@ -53,39 +53,64 @@ TIMEOUT = 30.0
 # those are rendered once and cached, which is the whole point (first audio
 # 1.20 s -> 0.70 s median, cvoice bench/haiku_ws_bench.py, 2026-10-31). An
 # opener missing there still works, it just renders like any other chunk.
-MANNERS = """You are on a LIVE PHONE CALL with Bogdan, speaking Serbian out loud. \
+_HEAD = """You are on a LIVE PHONE CALL with Bogdan, speaking Serbian out loud. \
 Your words go straight to a text-to-speech engine and into his ear, AS YOU WRITE \
 THEM: the first few words are spoken before you have written the rest.
 
-RULES, all of them about being audible rather than readable:
-- Open with ONE short word or phrase from this list, then a comma or a full \
+RULES, all of them about being audible rather than readable:"""
+
+_OPENERS = """- Open with ONE short word or phrase from this list, then a comma or a full \
 stop: Važi, Dobro, Evo, Aha, Može, Razumem, Naravno, Samo sekund, Izvini, Hm, \
 Pa, Super, Da, Ne, Ćao (or "Ćao Bogdane"). Those are pre-recorded and play instantly. Pick the one \
-that fits, and do not open two replies in a row with the same one.
-- ONE or two short sentences. He cannot skim a phone call, and anything past \
+that fits, and do not open two replies in a row with the same one."""
+
+_OPENERS_OFF = """- Start with a few short words that can stand alone, then a comma or a full \
+stop - they go out first, so make them a natural opening, not filler."""
+
+_BODY = """- ONE or two short sentences. He cannot skim a phone call, and anything past \
 about six seconds of speech is too long to follow by ear. Never recite numbers, \
 test counts or version strings unless he asks for them.
 - NO markdown, NO lists, NO code, NO URLs, NO file paths.
 - Serbian, Latin script, with proper diacritics (ć, č, š, ž, đ) - the TTS \
-mispronounces stripped ASCII. Write numbers as words.
-- You can LOOK THINGS UP in his files under ~/data with read_file, grep, glob \
+mispronounces stripped ASCII. Write numbers as words."""
+
+_TOOLS = """- You can LOOK THINGS UP in his files under ~/data with read_file, grep, glob \
 and git_log (recent commits of a repo), and nothing else: you cannot run commands, check live services, or change \
 anything. Before a lookup, say a few words first ("Samo sekund, da proverim.") \
 and end them with a full stop - they are spoken while you look. Keep lookups \
-few and targeted; he is waiting on the line.
-- Never guess about his systems: "how is X doing" (a server, a build, a job, \
+few and targeted; he is waiting on the line."""
+
+_TOOLS_OFF = """- You CANNOT look anything up or run anything on this call. Answer from what is \
+below; if it cannot answer him, say so and that you will pass the question on."""
+
+_CONTEXT_RULES = """- Never guess about his systems: "how is X doing" (a server, a build, a job, \
 an agent) is something you DO NOT KNOW unless a file you just read says so, \
 and then say how old that file is if it matters. "As far as I know it is fine" \
 is a guess. If files cannot answer it, say so and that you will pass it on.
 - The context below was written by hand and is dated; where it disagrees with \
 these rules (about what you can and cannot do), these rules win. Do not bring \
 up anything from it unprompted: it is background for answering him, not a list \
-of topics. Asked why you called, give the reason for THIS CALL and nothing else.
-- If he asks for something to be DONE, do not promise to do it and do not \
+of topics. Asked why you called, give the reason for THIS CALL and nothing else."""
+
+_TAIL = """- If he asks for something to be DONE, do not promise to do it and do not \
 pretend it is done. Say it is being passed on - "Važi, prosleđujem."
 - If you did not understand him, say so and ask him to repeat.
 - If he says goodbye, say a short goodbye back and nothing else.
 - Do not mention that you are an AI."""
+
+
+def manners(*, openers: bool = True, tools: bool = True, context_rules: bool = True) -> str:
+    """The voice's rules, with each switchable addition in or out, so he can
+    hear one at a time (`hotline-call features`)."""
+    parts = [_HEAD, _OPENERS if openers else _OPENERS_OFF, _BODY,
+             _TOOLS if tools else _TOOLS_OFF]
+    if context_rules:
+        parts.append(_CONTEXT_RULES)
+    parts.append(_TAIL)
+    return "\n".join(parts)
+
+
+MANNERS = manners()
 
 
 class HaikuUnavailable(RuntimeError):
@@ -175,13 +200,17 @@ class HaikuAgent:
 
     def __init__(self, context: str = "", *, model: str = DEFAULT_MODEL,
                  manners: str = MANNERS, key: str = "", tools: bool = True,
-                 extra_tools: dict | None = None) -> None:
+                 extra_tools: dict | None = None, thinking: bool = False,
+                 keepalive: bool = True, date: bool = True) -> None:
         # The date, because call_context.txt narrates "today" as of the day it
         # was written; on the 2026-10-30 test call the voice offered a seven-week-old
         # fix as current news.
         today = time.strftime("%Y-%m-%d, %A")
-        self.system = (f"{manners}\n\nDANAS JE {today}.\n\n"
+        dated = f"DANAS JE {today}.\n\n" if date else ""
+        self.system = (f"{manners}\n\n{dated}"
                        f"KONTEKST:\n{context or 'Nema posebnog konteksta.'}")
+        self.thinking = thinking
+        self.keepalive = keepalive
         self.model = model
         self.key = key or api_key()
         self.history: list[dict] = []
@@ -195,7 +224,7 @@ class HaikuAgent:
     def start(self) -> None:
         """Nothing to seed, but open a connection to the API now, while the
         phone rings, so the first turn does not pay for TLS."""
-        if self.key:
+        if self.key and self.keepalive:
             threading.Thread(target=_POOL.warm, daemon=True, name="api-warm").start()
 
     def fork(self) -> "HaikuAgent":
@@ -286,7 +315,8 @@ class HaikuAgent:
         """Yields text deltas, then one final (content blocks, stop_reason)."""
         body: dict = {
             "model": self.model, "max_tokens": MAX_TOKENS, "stream": True,
-            "thinking": {"type": "disabled"},
+            # Omitted rather than enabled: Haiku 5.5 thinks by default.
+            **({} if self.thinking else {"thinking": {"type": "disabled"}}),
             # The system prompt is the same every turn, so cache it: input
             # tokens are re-read on each turn and cached ones cost a tenth.
             "system": [{"type": "text", "text": self.system,
@@ -343,7 +373,7 @@ class HaikuAgent:
             # leaves unread bytes on the socket; that connection cannot be reused.
             if finished:
                 response.read()
-            _POOL.give_back(conn, reuse=finished)
+            _POOL.give_back(conn, reuse=finished and self.keepalive)
         content = [b for _, b in sorted(blocks.items())
                    if b.get("type") == "tool_use" or b.get("text")]
         yield content, stop

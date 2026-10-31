@@ -201,6 +201,7 @@ class AnsweredCall:
         ask_fork: Callable[[], tuple[Callable[[str], Iterator[str | None]], Callable[[], None]]] | None = None,
         hung_up: Callable[[], bool] | None = None,
         may_speculate: Callable[[str], bool] | None = None,
+        stream_fixed_lines: bool = True,
         answer_seconds: Callable[[], float] | None = None,
         on_end: Callable[[str], None] | None = None,
         note: Callable[[str, str], None] | None = None,
@@ -239,6 +240,7 @@ class AnsweredCall:
         # agent is on the line, or when the turn may be asking for one: a
         # speculative turn that reached an agent cannot be taken back.
         self.may_speculate = may_speculate
+        self.stream_fixed_lines = stream_fixed_lines
         # How long a streamed answer may take, asked per turn. `turn_seconds`
         # unless something says otherwise; a connected agent takes minutes.
         self.answer_seconds = answer_seconds
@@ -692,7 +694,7 @@ class AnsweredCall:
         self.transcript.append(("claude", text))
 
     def say(self, call: VoiceCall, text: str) -> None:
-        if self.speak_stream is not None:
+        if self.speak_stream is not None and self.stream_fixed_lines:
             self._say_streamed(call, text)
             return
         self._say_whole(call, text)

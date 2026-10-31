@@ -154,7 +154,46 @@ def _fall_back(args: argparse.Namespace, reason: str, why: str, log) -> int:
     return subprocess.call(argv)
 
 
+def features_cmd(argv: Sequence[str]) -> int:
+    """`hotline-call features [list | set NAME VALUE | reset [NAME]]`.
+
+    Not an argparse subcommand: `hotline-call <reason...>` takes free text, and
+    a reason that happens to start with another word must keep ringing him.
+    Only the exact first word `features` lands here."""
+    from . import features
+
+    values = features.load()
+    if not argv or argv[0] == "list":
+        print(features.show(values))
+        return 0
+    if argv[0] == "set" and len(argv) == 3:
+        try:
+            values[argv[1]] = features.parse(argv[1], argv[2])
+        except ValueError as exc:
+            print(f"hotline-call features: {exc}", file=sys.stderr)
+            return EXIT_USAGE
+        features.write(values)
+        print(features.show(features.load()))
+        return 0
+    if argv[0] == "reset":
+        if len(argv) == 2:
+            if argv[1] not in features.BY_NAME:
+                print(f"hotline-call features: no feature {argv[1]!r}", file=sys.stderr)
+                return EXIT_USAGE
+            values[argv[1]] = features.BY_NAME[argv[1]].default
+        else:
+            values = {}
+        features.write(values)
+        print(features.show(features.load()))
+        return 0
+    print("usage: hotline-call features [list | set NAME VALUE | reset [NAME]]", file=sys.stderr)
+    return EXIT_USAGE
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["features"]:
+        return features_cmd(argv[1:])
     parser = _build_parser()
     try:
         args = parser.parse_args(argv)
