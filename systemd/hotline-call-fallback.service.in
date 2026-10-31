@@ -1,0 +1,28 @@
+# Rendered by `ownbox.sh setup` (role fallback) into
+# ~/.config/systemd/user/hotline-call-fallback.service. Edit this template, not
+# the rendered file: `ownbox update hotline-call` renders it again.
+[Unit]
+Description=hotline-call fallback (answers his calls while archserver is down)
+Documentation=file://@DIR@/README.md
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=@DIR@
+# No venv on purpose: the fallback is the standard library plus `cryptography`,
+# which the system python already has on the Pi. A venv with numpy would not
+# fit the box (415 MB of RAM, ~90 MB free).
+Environment=PYTHONPATH=@DIR@/src
+Environment=PYTHONUNBUFFERED=1
+@ENVIRONMENT@
+# SIP credentials are read from ~/.config/hotline-call/env by the process, not
+# put here, so they never show in `systemctl show`.
+ExecStart=@PYTHON@ -m hotline_call.fallback serve
+Restart=always
+RestartSec=10
+# A ceiling, not a target: measured RSS is far under it. A leak here must not
+# take wake-server, which shares the box, down with it.
+MemoryMax=80M
+
+[Install]
+WantedBy=default.target

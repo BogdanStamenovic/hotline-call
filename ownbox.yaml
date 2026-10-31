@@ -1,8 +1,8 @@
 schema: 1
 name: hotline-call
-description: Phone calls between Claude Code sessions and people — the SIP ring, the voice on an answered call, inbound calls, and the hotline-call CLI agents use to ring Bogdan.
+description: Phone calls between Claude Code sessions and people — the SIP ring, the voice on an answered call, inbound calls, the hotline-call CLI agents use to ring Bogdan, and a lean fallback role for a Raspberry Pi that answers him while the main box is off.
 homepage: https://github.com/BogdanStamenovic/hotline-call
-tags: [sip, voip, phone, voice, whisper, tts, claude, agents, python, systemd]
+tags: [sip, voip, phone, voice, whisper, tts, claude, agents, python, systemd, raspberry-pi, wake-on-lan]
 install:
   platforms: [linux]
   setup:
@@ -11,8 +11,14 @@ install:
     linux: [./ownbox.sh update]
   remove:
     linux: [./ownbox.sh remove]
+# Two roles share this manifest (ownbox has no roles of its own): `full` on
+# archserver, `fallback` on the Pi. ownbox.sh picks -- HOTLINE_CALL_ROLE, the
+# remembered choice, a prompt on a terminal, or a guess from the RAM -- and
+# the launchers go through it so they work on either.
 commands:
   hotline-call:
-    linux: .venv/bin/hotline-call
+    linux: ./ownbox.sh cli
   hotline-calld:
     linux: ./ownbox.sh status
+  hotline-call-fallback:
+    linux: ./ownbox.sh fallback

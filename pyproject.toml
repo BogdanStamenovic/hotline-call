@@ -50,6 +50,7 @@ dev = [
 [project.scripts]
 hotline-call = "hotline_call.call_cli:main"
 hotline-calld = "hotline_call.daemon:main"
+hotline-call-fallback = "hotline_call.fallback:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hotline_call"]

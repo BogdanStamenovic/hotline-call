@@ -146,6 +146,69 @@ has always used, so `HOTLINE_ALLOW_IPS` there still wins), then
 | `HOTLINE_CALL_APP_URL` | `http://127.0.0.1:8789` | hotline-iosd, for the mirror |
 | `HOTLINE_CALL_APP_MIRROR` | `1` | `0`: keep calls out of the app |
 
+## The fallback on pigion
+
+When archserver is off, a call to hotline would ring out unanswered. The
+fallback role runs on pigion (a Pi Zero 2 W that is always on) and covers
+that: it answers him, says in his own cloned voice *"Ćao Bogdane. Archserver je
+trenutno ugašen. Budim ga, i čim se podigne, hotline će te pozvati."*, hangs
+up, wakes archserver with a Wake-on-LAN packet, and once hotline-calld is back
+it asks calld to ring him.
+
+```
+pigion: ping calld /api/v1/ping every 10 s ──60 s of silence──▶ REGISTER hotline-caller
+        (instance of its own)                                    │
+his call ─▶ linphone.org ─▶ pigion: 200 OK, 6.3 s clip (SRTP) , BYE
+                                    └─▶ magic packet now, +90 s, +240 s
+calld answers again ─▶ REGISTER Expires: 0 ─▶ POST calld /api/v1/call (once)
+```
+
+- **Only during an outage.** While calld answers pings, pigion holds no
+  registration, so his calls only ever reach calld. Down means 60 s with no
+  successful ping (`HOTLINE_CALL_FALLBACK_DOWN_AFTER`), so a calld restart is
+  not an outage.
+- **Its own `+sip.instance`**, never production's: the same instance would
+  replace calld's binding rather than sit beside it.
+- **Lean on purpose.** The Pi has 415 MB of RAM, no numpy and no libopus, so
+  nothing is decoded or encoded there. `ownbox.sh` renders the clip on
+  archserver with cvoiced (takes=1) and pre-encodes it into 20 ms Opus payloads
+  and G.711 mu-law and A-law frames; the Pi only adds RTP headers, SRTP and
+  pacing, with the system `python3` and `cryptography`. Measured RSS: see the
+  commit that deployed it.
+- **No wake on outage, only on his call.** archserver powers itself off on
+  purpose (wake's `then_do=poweroff`); waking it every time would undo that.
+- **One callback per outage**, recorded in
+  `~/.local/state/hotline-call/fallback.json` before the request goes out, so a
+  pigion reboot neither loses it nor repeats it. Retried only when calld
+  refused it before ringing (connection refused or an HTTP error), up to 5 times.
+
+Install on the Pi (ownbox has no roles, so `ownbox.sh` picks: `HOTLINE_CALL_ROLE`,
+the remembered role, a prompt on a terminal, or a guess from the RAM):
+
+```bash
+HOTLINE_CALL_ROLE=fallback ownbox install hotline-call --yes
+```
+
+Setup checks the system python has `cryptography` and that the fallback
+imports without numpy, copies the SIP keys from `archserver:~/.config/hotline-call/env`
+over ssh (asked for on a terminal if that fails; `SIP_MEDIA_HOST` is not copied,
+the Pi offers its own tailnet address), reads archserver's MAC over ssh, renders
+the clip, and installs and starts `hotline-call-fallback.service`. Update
+re-renders the clip only when its text or format changed and keeps the old one if
+archserver is unreachable; the state file is never touched. Remove asks before
+deleting the clip, the state and the credentials (kept by default).
+
+```bash
+hotline-call-fallback status         # config, clip, callback state, does calld answer
+hotline-call-fallback wol --dry-run  # what the magic packet would be
+hotline-call-fallback serve --test --for-seconds 120
+```
+
+`--test` forces "down" without touching archserver, registers a separate test
+instance, takes calls only from hotline's own account (which production calld
+refuses with 403) and keeps its own state file. `bench/fallback_live.py` on
+archserver places that call through linphone.org and checks what arrives.
+
 ## Tests
 
 No GPU, no models: the suite fakes Whisper, cvoiced and the SIP peer.
@@ -158,6 +221,19 @@ PYTHONPATH=src:$HOME/data/hotline/src .venv/bin/python -m pytest -q tests
 builds and in hotline-ios's old one.
 
 ## Limitations
+
+- **The fallback reads "calld does not answer" as "archserver is off".** A
+  crashed calld on a running archserver gets the same message and a magic
+  packet it does not need.
+- **Wake-on-LAN is fire-and-forget.** The packet leaves pigion's wifi as a
+  broadcast to 255.255.255.255:9; whether archserver wakes is only visible as
+  calld coming back. archserver's NIC has `wake-on-lan magic` in
+  NetworkManager, and wake's own 06:00Z wol tasks on 2026-09-04 and 09-05 were
+  each followed by a boot at 08:00 local.
+- **The fallback's clip is screened, not checked.** A take is rejected for an
+  implausible length, silence or clipping; nothing confirms it says the text.
+- **Media on a fallback call goes over the tailnet**, as calld's does, so his
+  phone needs Tailscale up for him to hear the clip.
 
 - **It depends on hotline's source tree being at `~/data/hotline/src`.** hotline
   is not packaged; this reads it over PYTHONPATH like hotline-iosd did.
