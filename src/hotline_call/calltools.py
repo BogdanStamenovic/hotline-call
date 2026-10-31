@@ -202,7 +202,77 @@ def git_log(repo: str, count: int = 10) -> str:
     return _cap(run.stdout.strip() or run.stderr.strip() or "no commits")
 
 
-TOOLS = {"read_file": read_file, "grep": grep, "glob": glob, "git_log": git_log}
+BASH_TIMEOUT = 10.0
+HOME = pathlib.Path.home()
+# Masked out of the sandbox entirely: what a command prints is sent to the API.
+SECRET_DIRS = (".ssh", ".gnupg", ".config/anthropic", ".config/gh", ".config/cvoice",
+               ".config/hotline-call", ".config/hotline", ".local/share/keyrings",
+               ".password-store", ".aws", ".docker")
+SECRET_FILES = (".claude/.credentials.json", ".netrc", ".git-credentials")
+_REDACT = re.compile(
+    r"(sk-ant-[\w-]{8,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abp]-[\w-]{10,}"
+    r"|(?i:(?:token|secret|password|passwd|api[_-]?key)\s*[=:]\s*)\S+)")
+
+
+def _env_files() -> list[pathlib.Path]:
+    out = []
+    for base in (ROOT, HOME / ".config"):
+        try:
+            out += [p for p in base.glob("*/.env*") if p.is_file()]
+            out += [p for p in base.glob("*/*/.env*") if p.is_file()]
+            out += [p for p in base.glob("*/*.env") if p.is_file()]
+        except OSError:
+            continue
+    return out
+
+
+def _sandbox() -> list[str]:
+    """bwrap: the whole filesystem read-only, a private /tmp and /run (so no
+    D-Bus or docker socket: `systemctl stop` cannot reach anything), no
+    network, secrets masked. Read-only is enforced by the mounts, not asked
+    for in the prompt - plenty of ordinary commands write."""
+    cmd = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+           "--tmpfs", "/tmp", "--tmpfs", "/run", "--unshare-net", "--unshare-ipc",
+           "--die-with-parent", "--new-session", "--chdir", str(ROOT)]
+    for dev in ("nvidiactl", "nvidia0", "nvidia-uvm"):
+        if pathlib.Path("/dev", dev).exists():     # nvidia-smi needs these
+            cmd += ["--dev-bind", f"/dev/{dev}", f"/dev/{dev}"]
+    for rel in SECRET_DIRS:
+        if (HOME / rel).is_dir():
+            cmd += ["--tmpfs", str(HOME / rel)]
+    for path in [HOME / rel for rel in SECRET_FILES] + _env_files():
+        if path.is_file():
+            cmd += ["--ro-bind", "/dev/null", str(path)]
+    return cmd
+
+
+def bash(command: str) -> str:
+    """A shell command, read-only and offline. See `_sandbox` for what that means."""
+    if not command.strip():
+        raise ValueError("empty command")
+    try:
+        run_ = subprocess.run(_sandbox() + ["bash", "-c", command], capture_output=True,
+                              text=True, timeout=BASH_TIMEOUT)
+        out = (run_.stdout + (("\n" + run_.stderr) if run_.stderr.strip() else "")).strip()
+        status = "" if run_.returncode == 0 else f"\n[exit {run_.returncode}]"
+    except subprocess.TimeoutExpired:
+        return f"[stopped after {BASH_TIMEOUT:.0f} s]"
+    return _cap(_REDACT.sub("[redacted]", out) + status) or "(no output)"
+
+
+SCHEMAS.append({
+    "name": "bash",
+    "description": (
+        "Run a shell command on archserver to LOOK something up: nvidia-smi, df, free, "
+        "ps, uptime, journalctl --user -u X, ls, cat, grep, git log... The whole "
+        "filesystem is READ-ONLY and there is no network: anything that writes, "
+        "installs, restarts or sends fails. systemctl cannot reach services (use "
+        "journalctl to see their state). Output is capped; keep commands short."),
+    "input_schema": {"type": "object", "properties": {"command": {"type": "string"}},
+                     "required": ["command"]},
+})
+
+TOOLS = {"read_file": read_file, "grep": grep, "glob": glob, "git_log": git_log, "bash": bash}
 
 
 def run(name: str, args: dict) -> tuple[str, bool]:

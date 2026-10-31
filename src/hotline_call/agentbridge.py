@@ -407,7 +407,7 @@ class AgentBridge:
                  for a in agents]
         return "\n".join(lines) or "no live agents"
 
-    def find(self, spoken: str) -> Agent:
+    def find(self, spoken: str, *, allow_denied: bool = False) -> Agent:
         """The one live agent `spoken` names, or BridgeError saying why not.
 
         Exact first (spaces for hyphens, as speech recognition writes them),
@@ -434,7 +434,7 @@ class AgentBridge:
             raise BridgeError(f"{spoken!r} matches several agents: "
                               + ", ".join(a.name for a in hits) + ". Ask him which one.")
         hit = hits[0]
-        if hit.denied:
+        if hit.denied and not allow_denied:
             raise BridgeError(f"{hit.name} cannot be connected: {hit.denied}")
         return hit
 
@@ -621,7 +621,46 @@ class AgentBridge:
                     "required": ["name"],
                 },
             }, self._connect_tool),
+            "message_agent": ({
+                "name": "message_agent",
+                "description": (
+                    "Leave a message for a live hotline agent WITHOUT interrupting it or "
+                    "putting it on the call, when Bogdan asks you to tell or pass "
+                    "something on ('reci manageru 5 da...', 'javi X da...', 'pošalji "
+                    "poruku X'). It reads it when its current turn ends. `name` is the "
+                    "exact name from list_agents; `text` is the message in his words, "
+                    "complete and self-contained. Ask him if the agent is unclear."),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"},
+                                   "text": {"type": "string"},
+                                   "his_words": {"type": "string",
+                                                 "description": "What he said, verbatim."}},
+                    "required": ["name", "text"],
+                },
+            }, self._message_tool),
         }
+
+    def _message_tool(self, name: str, text: str, his_words: str = "") -> str:
+        """Queued, never an interrupt - so the deny list, which exists to keep
+        the bridge from interrupting manager-6 and the operator, does not apply:
+        on 2026-10-31 he tried to reach manager-6 on a call and could not."""
+        try:
+            agent = self.find(name, allow_denied=True)
+        except BridgeError as exc:
+            return f"NOT SENT: {exc}"
+        body = ("Poruka od Bogdana sa telefonskog poziva. Napisao ju je glas poziva "
+                "(Haiku) po onome što je rekao; Whisper transkript, bez Discord "
+                f"potvrde.\n\n{text.strip()}")
+        if his_words.strip():
+            body += f"\n\nNjegove reči: «{his_words.strip()}»"
+        try:
+            self.hotline.tell(agent, body, origin(_label()))
+        except Exception as exc:  # noqa: BLE001 - said out loud, not a dropped call
+            log.exception("message to %s failed", agent.name)
+            return f"NOT SENT: {type(exc).__name__}: {exc}"
+        log.info("bridge message -> %s: %r", agent.name, text[:160])
+        return f"SENT to {agent.name}. Tell him in one short sentence that it is passed on."
 
     def _connect_tool(self, name: str, his_words: str = "") -> str:
         try:
@@ -645,7 +684,9 @@ class AgentBridge:
             "AGENTS: Bogdan can ask you to connect one of his hotline agents to this "
             "call ('spoji me sa manager pet', 'dodaj tells u poziv'). Say a few words "
             "first ('Samo sekund, povezujem.'), then call connect_agent with the exact "
-            "name; use list_agents if you are not sure which one he means. Never "
+            "name; use list_agents if you are not sure which one he means. If he only "
+            "wants something passed on ('reci X da...', 'javi X'), use message_agent "
+            "instead: it does not interrupt the agent or put it on the call. Never "
             "claim an agent said or did something that its own words do not say.\n"
             f"Live agents when this call started:\n{self.roster()}")
 

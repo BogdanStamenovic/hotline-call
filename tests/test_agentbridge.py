@@ -285,7 +285,7 @@ def test_a_speculative_fork_cannot_connect_anyone(monkeypatch):
     assert hot.log == [] and not b.connected
     assert bodies[1]["messages"][-1]["content"][0]["is_error"] is True
     # Same tool list as the real agent, so the prompt cache is shared.
-    assert [t["name"] for t in bodies[0]["tools"]][-2:] == ["list_agents", "connect_agent"]
+    assert [t["name"] for t in bodies[0]["tools"]][-3:] == ["list_agents", "connect_agent", "message_agent"]
 
 
 def test_relay_turns_go_to_haiku_without_tools(monkeypatch):
@@ -343,3 +343,26 @@ def test_may_speculate_false_means_no_speculation_is_started():
 def test_a_reply_in_cyrillic_is_spoken_in_latin():
     assert speakable("Последњи је осамсто, četrdeset други. Џеп, љубав, њива.") == \
         "Poslednji je osamsto, četrdeset drugi. Džep, ljubav, njiva."
+
+
+def test_message_agent_queues_without_interrupting_even_a_denied_agent():
+    from hotline_call.agentbridge import Agent, AgentBridge
+
+    sent, interrupted = [], []
+
+    class FakeHotline:
+        def agents(self):
+            return [Agent(name="manager-6", session=object(), task="t", pane="p",
+                          denied="that agent is off limits to the call bridge")]
+
+        def tell(self, agent, text, origin):
+            sent.append((agent.name, text))
+
+        def interrupt(self, agent):
+            interrupted.append(agent.name)
+
+    bridge = AgentBridge(hotline=FakeHotline())
+    out = bridge.tools()["message_agent"][1](name="manager-6", text="Sve radi.",
+                                             his_words="reci manageru 6 da sve radi")
+    assert out.startswith("SENT") and interrupted == []
+    assert sent and "Sve radi." in sent[0][1] and "Whisper" in sent[0][1]

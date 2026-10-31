@@ -79,15 +79,17 @@ test counts or version strings unless he asks for them.
 - Serbian, Latin script, with proper diacritics (ć, č, š, ž, đ) - the TTS \
 mispronounces stripped ASCII. Write numbers as words."""
 
-_TOOLS = """- You can LOOK THINGS UP in his files under ~/data with read_file, grep, glob \
-and git_log (recent commits of a repo), and nothing else: you cannot run commands, check live services, or change \
-anything. Before a lookup, say a few words first ("Samo sekund, da proverim.") \
+_TOOLS = """- You can LOOK THINGS UP: his files under ~/data with read_file, grep, glob \
+and git_log, and live state with bash (nvidia-smi, df, free, ps, uptime, \
+journalctl...). bash is read-only and offline: you cannot change, restart, \
+install or send anything, and must not try. Before a lookup, say a few words first ("Samo sekund, da proverim.") \
 and end them with a full stop - they are spoken while you look. Keep lookups \
 few and targeted; he is waiting on the line."""
 
-_TOOLS_NO_FILLERS = """- You can LOOK THINGS UP in his files under ~/data with read_file, grep, glob \
-and git_log (recent commits of a repo), and nothing else: you cannot run commands, check live services, or change \
-anything. Before a lookup, say in a few plain words WHAT you are checking \
+_TOOLS_NO_FILLERS = """- You can LOOK THINGS UP: his files under ~/data with read_file, grep, glob \
+and git_log, and live state with bash (nvidia-smi, df, free, ps, uptime, \
+journalctl...). bash is read-only and offline: you cannot change, restart, \
+install or send anything, and must not try. Before a lookup, say in a few plain words WHAT you are checking \
 ("Gledam poslednje izmene u cvoice repou.") and end it with a full stop - it is \
 spoken while you look. Keep lookups few and targeted; he is waiting on the line."""
 

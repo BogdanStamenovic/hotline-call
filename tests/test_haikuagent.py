@@ -177,3 +177,27 @@ def test_a_fork_may_read_but_not_act():
     with pytest.raises(RuntimeError):
         twin.extra_tools["connect_agent"][1](name="manager-5")
     assert calls == ["list"]
+
+
+def test_bash_is_read_only_offline_and_hides_secrets(tmp_path, monkeypatch):
+    import shutil
+
+    from hotline_call import calltools
+
+    if not shutil.which("bwrap"):
+        pytest.skip("bwrap not installed")
+    monkeypatch.setattr(calltools, "ROOT", tmp_path)
+    (tmp_path / "proj").mkdir()
+    (tmp_path / "proj" / ".env").write_text("API_KEY=sk-ant-api03-leakleakleak\n")
+    out, failed = calltools.run("bash", {"command": f"touch {tmp_path}/new"})
+    # pytest's tmp_path lives under /tmp, which is a private tmpfs inside the
+    # sandbox: the write lands there and vanishes. What matters is the host.
+    assert not (tmp_path / "new").exists()
+    out, _ = calltools.run("bash", {"command": "touch /home/.hotline-call-probe"})
+    assert "Read-only" in out
+    out, _ = calltools.run("bash", {"command": f"cat {tmp_path}/proj/.env"})
+    assert "leak" not in out
+    out, _ = calltools.run("bash", {"command": "echo sk-ant-api03-abcdefghijkl token=xyz"})
+    assert "abcdefghijkl" not in out and "xyz" not in out
+    out, _ = calltools.run("bash", {"command": "echo hi"})
+    assert out == "hi"
