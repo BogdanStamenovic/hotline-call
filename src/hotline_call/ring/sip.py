@@ -278,6 +278,7 @@ class SipTransport:
         # (`_srtp_key`, `_dialog_over`, `_ack`): one SipRing rings one address at
         # a time, and `ring()` is the only entry point.
         self._dialing = ""
+        self._invite_branch = ""
 
     async def start(self) -> None:
         if not (self.user and self.password and self.peer):
@@ -543,9 +544,16 @@ class SipTransport:
             + "".join(f"{line}\r\n" for line in codec_lines)
             + "a=sendrecv\r\n"
         )
+        # Kept for the CANCEL, which RFC 3261 9.1 requires to carry the same
+        # top Via branch as the INVITE it cancels. A fresh branch there is
+        # answered `481 Call/Transaction Does Not Exist` by linphone.org and
+        # cancels nothing: measured 2026-10-31 by ringing our own account, and
+        # flexisip then kept the abandoned call alive long enough to deliver it
+        # to the next registration that appeared.
+        self._invite_branch = _tag()
         lines = [
             f"INVITE {them} SIP/2.0",
-            self._via(_tag()),
+            self._via(self._invite_branch),
             f"From: <{me}>;tag={from_tag}",
             f"To: <{them}>",
             f"Call-ID: {call_id}",
@@ -809,7 +817,7 @@ class SipTransport:
         them = self._them()
         message = "\r\n".join([
             f"CANCEL {them} SIP/2.0",
-            self._via(_tag()),
+            self._via(self._invite_branch or _tag()),
             f"From: <{me}>;tag={from_tag}",
             f"To: <{them}>",
             f"Call-ID: {call_id}",

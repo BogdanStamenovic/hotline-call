@@ -89,6 +89,7 @@ class FakeRegistrar(threading.Thread):
         self.saw_invite = False
         self.invites = []
         self.saw_cancel = False
+        self.cancels: list[str] = []
         self.seen: list[str] = []
 
     def _reply(self, request, addr, status, extra=()):
@@ -134,6 +135,7 @@ class FakeRegistrar(threading.Thread):
                     self._reply(request, addr, text)
             elif method == "CANCEL":
                 self.saw_cancel = True
+                self.cancels.append(request)
                 self._reply(request, addr, "200 OK")
             elif method in ("ACK", "BYE"):
                 self.seen.append(method)
@@ -173,6 +175,20 @@ async def test_a_ring_is_confirmed_by_180_ringing(registrar):
     assert registrar.saw_invite
     # And it stops ringing afterwards rather than buzzing him indefinitely.
     assert await eventually(lambda: registrar.saw_cancel)
+
+
+async def test_the_cancel_names_the_invite_it_cancels(registrar):
+    # RFC 3261 9.1: same top Via branch as the INVITE. A fresh one was answered
+    # 481 by linphone.org on 2026-10-31, and the phone kept ringing.
+    registrar.invite_script = [180]
+    t = transport_for(registrar)
+    with pytest.raises(CallUnanswered):
+        await t.ring(WHO, timeout=1.0)
+    assert await eventually(lambda: registrar.cancels)
+    branch = lambda m: header_of(m, "Via").split("branch=")[1].split(";")[0]  # noqa: E731
+    assert branch(registrar.cancels[0]) == branch(registrar.invites[-1])
+    assert header_of(registrar.cancels[0], "CSeq").split()[0] == \
+        header_of(registrar.invites[-1], "CSeq").split()[0]
 
 
 async def test_183_counts_as_ringing_too(registrar):
