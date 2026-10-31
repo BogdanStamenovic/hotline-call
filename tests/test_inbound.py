@@ -122,9 +122,9 @@ class FakeProxy(threading.Thread):
         if message.startswith("REGISTER "):
             self.registers.append(message)
             if "Authorization:" not in message:
-                self.reply(message, "401 Unauthorized", [
+                self.reply(message, "401 Unauthorized", [(
                     f'WWW-Authenticate: Digest realm="127.0.0.1", nonce="{NONCE}", '
-                    'opaque="+GNywA==", algorithm=MD5, qop="auth"'])
+                    'opaque="+GNywA==", algorithm=MD5, qop="auth"')])
             else:
                 contact = header_of(message, "Contact")
                 self.reply(message, "200 Registration successful",
@@ -417,7 +417,7 @@ def test_his_bye_ends_it_and_frees_the_line(proxy, listener):
 
 def test_when_we_finish_first_the_bye_goes_to_his_handset_by_the_route_set(proxy, listener):
     listener.hold["seconds"] = 0.3
-    call, ok, _ringing, sock, _k, _s = answered(proxy, listener)
+    _call, ok, _ringing, sock, _k, _s = answered(proxy, listener)
     bye = proxy.expect(request("BYE"))
     assert bye.startswith("BYE sip:him@10.0.0.2:5061;transport=tls SIP/2.0")
     # A UAS uses Record-Route in the order it arrived, not reversed.
@@ -561,4 +561,36 @@ def test_audio_flows_both_ways_through_the_answered_call(proxy, listener):
     assert heard > 20, "his phone heard nothing from us"
     assert stats["frames_received"] > 20, stats
     assert stats["auth_failures"] == 0
+    sock.close()
+
+
+def test_a_redial_right_after_his_hangup_is_answered_not_busy(proxy, listener):
+    """The conversation only checks for a hangup between turns, so its thread
+    can outlive the BYE by most of a turn. The line must be free anyway."""
+    stubborn = threading.Event()
+
+    def on_call(call):
+        def run(reply, media, key, salt):
+            stubborn.wait(5)      # ignores the hangup, like a turn in progress
+        return run
+
+    listener.on_call = on_call
+    first, *_rest, sock, _k, _s = answered(proxy, listener)
+    held = listener.call
+    first.bye()
+    proxy.expect(status(200))
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and listener.call is not None:
+        time.sleep(0.02)
+    assert listener.call is None
+    assert held.media is not None, "the media socket was closed under a running pump"
+
+    second, ok, *_more = answered(proxy, listener)
+    assert header_of(ok, "Call-ID") == second.call_id
+    stubborn.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and held.media is not None:
+        time.sleep(0.02)
+    assert held.media is None
+    second.bye()
     sock.close()

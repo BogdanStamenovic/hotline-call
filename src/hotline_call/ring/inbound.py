@@ -344,6 +344,7 @@ class SipInbound:
         self._pongs = False
         self._attempt = 0
         self.call: InboundCall | None = None
+        self._draining: list[InboundCall] = []
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -824,12 +825,12 @@ class SipInbound:
             call.handler_done.set()
 
     def _tick_call(self, now: float) -> None:
+        for gone in [c for c in self._draining if c.handler_done.is_set()]:
+            self._draining.remove(gone)
+            self._close_media(gone)
+            log.info("inbound: call wound down (%s)", gone.ended)
         call = self.call
         if call is None:
-            return
-        if call.state == "over":
-            if call.handler_done.is_set():
-                self._release(call)
             return
         if call.state == "ringing" and now >= call.answer_at:
             self._answer(call)
@@ -869,17 +870,22 @@ class SipInbound:
                     call.media.close()
             call.handler_done.set()
         call.state = "over"
+        if self.call is call:
+            self.call = None
+            log.info("inbound: call over (%s)", call.ended)
         if call.handler_done.is_set():
-            self._release(call)
-        # Otherwise the conversation thread is still winding down after a BYE;
-        # `_tick_call` releases it once it has. A second call must not start
-        # while the first still holds the models and the media socket.
+            self._close_media(call)
+        else:
+            # The conversation only notices `far_end_hung_up` between turns,
+            # which can be most of `TURN_SECONDS` away. The line is free now --
+            # a redial must not be told 486 for half a minute -- but the media
+            # socket stays open until the pump on it has stopped: closed under
+            # a running pump, every read fails at once and the thread spins.
+            # Models are refcounted by the daemon, so a short overlap is safe.
+            self._draining.append(call)
 
-    def _release(self, call: InboundCall) -> None:
+    def _close_media(self, call: InboundCall) -> None:
         if call.media is not None:
             with contextlib.suppress(OSError):
                 call.media.close()
             call.media = None
-        if self.call is call:
-            self.call = None
-            log.info("inbound: call over (%s)", call.ended)
