@@ -67,6 +67,11 @@ that fits, and do not open two replies in a row with the same one."""
 _OPENERS_OFF = """- Start with a few short words that can stand alone, then a comma or a full \
 stop - they go out first, so make them a natural opening, not filler."""
 
+_NO_FILLERS = """- Answer DIRECTLY. Do not open with filler or acknowledgement words - no \
+"Važi", "Dobro", "Evo", "Aha", "Može", "Razumem", "Naravno", "Hm", "Pa", \
+"Samo sekund" - and do not echo his question back. The first words you write \
+are already the answer."""
+
 _BODY = """- ONE or two short sentences. He cannot skim a phone call, and anything past \
 about six seconds of speech is too long to follow by ear. Never recite numbers, \
 test counts or version strings unless he asks for them.
@@ -79,6 +84,12 @@ and git_log (recent commits of a repo), and nothing else: you cannot run command
 anything. Before a lookup, say a few words first ("Samo sekund, da proverim.") \
 and end them with a full stop - they are spoken while you look. Keep lookups \
 few and targeted; he is waiting on the line."""
+
+_TOOLS_NO_FILLERS = """- You can LOOK THINGS UP in his files under ~/data with read_file, grep, glob \
+and git_log (recent commits of a repo), and nothing else: you cannot run commands, check live services, or change \
+anything. Before a lookup, say in a few plain words WHAT you are checking \
+("Gledam poslednje izmene u cvoice repou.") and end it with a full stop - it is \
+spoken while you look. Keep lookups few and targeted; he is waiting on the line."""
 
 _TOOLS_OFF = """- You CANNOT look anything up or run anything on this call. Answer from what is \
 below; if it cannot answer him, say so and that you will pass the question on."""
@@ -99,11 +110,18 @@ pretend it is done. Say it is being passed on - "Važi, prosleđujem."
 - Do not mention that you are an AI."""
 
 
-def manners(*, openers: bool = True, tools: bool = True, context_rules: bool = True) -> str:
+def manners(*, openers: bool = True, tools: bool = True, context_rules: bool = True,
+            fillers: bool = True) -> str:
     """The voice's rules, with each switchable addition in or out, so he can
-    hear one at a time (`hotline-call features`)."""
-    parts = [_HEAD, _OPENERS if openers else _OPENERS_OFF, _BODY,
-             _TOOLS if tools else _TOOLS_OFF]
+    hear one at a time (`hotline-call features`).
+
+    `fillers=False` overrides `openers`: he did not like the "Važi," openers
+    at all (2026-10-31), so that mode forbids filler words outright."""
+    if not fillers:
+        opening, lookups = _NO_FILLERS, _TOOLS_NO_FILLERS
+    else:
+        opening, lookups = (_OPENERS if openers else _OPENERS_OFF), _TOOLS
+    parts = [_HEAD, opening, _BODY, lookups if tools else _TOOLS_OFF]
     if context_rules:
         parts.append(_CONTEXT_RULES)
     parts.append(_TAIL)

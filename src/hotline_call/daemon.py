@@ -511,7 +511,8 @@ class Service:
             from .haikuagent import manners as build_manners
 
             base = build_manners(openers=feat["opener_nudge"], tools=feat["tools"],
-                                 context_rules=feat["context_rules"])
+                                 context_rules=feat["context_rules"],
+                                 fillers=feat["filler_words"])
             manners, extra = base, None
             if os.environ.get("HOTLINE_IOS_BRIDGE", "1") != "0" and feat["bridge"]:
                 from .agentbridge import AgentBridge

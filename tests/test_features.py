@@ -56,3 +56,9 @@ def test_manners_with_everything_on_is_the_live_text():
     bare = manners(openers=False, tools=False, context_rules=False)
     assert "pre-recorded" not in bare and "read_file" not in bare and "Never guess" not in bare
     assert "CANNOT look anything up" in bare
+
+
+def test_no_fillers_forbids_the_openers_and_the_samo_sekund_lookup_line():
+    text = manners(fillers=False)
+    assert "Answer DIRECTLY" in text and "pre-recorded" not in text
+    assert '("Samo sekund, da proverim.")' not in text
