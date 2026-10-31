@@ -59,7 +59,7 @@ def test_declined_is_its_own_exit_code_and_does_not_fall_back(monkeypatch, fake_
 
 def test_a_dead_daemon_falls_back_to_hotline_page(monkeypatch, capfd, fake_page):
     def explode(*a, **kw):
-        raise DaemonError("cannot reach hotline-iosd at http://127.0.0.1:8789")
+        raise DaemonError("cannot reach hotline-calld at http://127.0.0.1:8792")
 
     monkeypatch.setattr(call_cli, "place_call", explode)
     assert call_cli.main(["-q", "the build is blocked", "--source", "the ios build"]) == 0
@@ -105,7 +105,7 @@ def test_read_timeout_with_live_daemon_is_unanswered_not_undeliverable(
     from hotline_call.client import CallTimeout
 
     def timed_out(*a, **kw):
-        raise CallTimeout(elapsed=530.0, daemon_up=True, url="http://127.0.0.1:8789")
+        raise CallTimeout(elapsed=530.0, daemon_up=True, url="http://127.0.0.1:8792")
 
     monkeypatch.setattr(call_cli, "place_call", timed_out)
     # No -q: the informational line is gated behind quiet, and asserting on it
@@ -122,7 +122,7 @@ def test_read_timeout_with_live_daemon_falls_back_like_ringing_out(
     from hotline_call.client import CallTimeout
 
     def timed_out(*a, **kw):
-        raise CallTimeout(elapsed=530.0, daemon_up=True, url="http://127.0.0.1:8789")
+        raise CallTimeout(elapsed=530.0, daemon_up=True, url="http://127.0.0.1:8792")
 
     monkeypatch.setattr(call_cli, "place_call", timed_out)
     assert call_cli.main(["-q", "test"]) == 0
@@ -135,7 +135,7 @@ def test_timeout_against_a_dead_daemon_is_still_undeliverable(monkeypatch, capsy
     from hotline_call.client import CallTimeout
 
     def timed_out(*a, **kw):
-        raise CallTimeout(elapsed=2.0, daemon_up=False, url="http://127.0.0.1:8789")
+        raise CallTimeout(elapsed=2.0, daemon_up=False, url="http://127.0.0.1:8792")
 
     monkeypatch.setattr(call_cli, "place_call", timed_out)
     assert call_cli.main(["-q", "--no-fallback", "test"]) == call_cli.EXIT_UNDELIVERABLE
@@ -155,7 +155,7 @@ def test_post_classifies_read_timeout_as_calltimeout(monkeypatch):
     monkeypatch.setattr(client.urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(client, "_daemon_reachable", lambda url, timeout=2.0: True)
     with pytest.raises(client.CallTimeout) as ei:
-        client._post("/api/v1/call", {}, url="http://127.0.0.1:8789", timeout=1.0)
+        client._post("/api/v1/call", {}, url="http://127.0.0.1:8792", timeout=1.0)
     assert ei.value.daemon_up is True
     assert isinstance(ei.value, client.DaemonError)
 
@@ -169,7 +169,7 @@ def test_post_unwraps_timeout_nested_in_urlerror(monkeypatch):
     monkeypatch.setattr(client.urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(client, "_daemon_reachable", lambda url, timeout=2.0: False)
     with pytest.raises(client.CallTimeout) as ei:
-        client._post("/api/v1/call", {}, url="http://127.0.0.1:8789", timeout=1.0)
+        client._post("/api/v1/call", {}, url="http://127.0.0.1:8792", timeout=1.0)
     assert ei.value.daemon_up is False
 
 
@@ -181,6 +181,6 @@ def test_post_connection_refused_stays_a_plain_daemon_error(monkeypatch):
 
     monkeypatch.setattr(client.urllib.request, "urlopen", fake_urlopen)
     with pytest.raises(client.DaemonError) as ei:
-        client._post("/api/v1/call", {}, url="http://127.0.0.1:8789", timeout=1.0)
+        client._post("/api/v1/call", {}, url="http://127.0.0.1:8792", timeout=1.0)
     assert not isinstance(ei.value, client.CallTimeout)
     assert "cannot reach" in str(ei.value)

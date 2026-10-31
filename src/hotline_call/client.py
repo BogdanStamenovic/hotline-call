@@ -1,4 +1,4 @@
-"""Thin HTTP client for `hotline-iosd`. Standard library only.
+"""Thin HTTP client for `hotline-calld`. Standard library only.
 
 Deliberately not `httpx`/`requests`: this is what a *blocked* agent runs, and
 the one thing it must not do is fail because a virtualenv is missing a wheel.
@@ -17,7 +17,13 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
-DEFAULT_URL = os.environ.get("HOTLINE_IOS_URL", "http://127.0.0.1:8789")
+DEFAULT_URL = (os.environ.get("HOTLINE_CALL_URL", "") or os.environ.get("HOTLINE_IOS_URL", "")
+               or "http://127.0.0.1:8792")
+"""hotline-calld on loopback.
+
+HOTLINE_IOS_URL is still honoured because it is what callers set before the
+call daemon was split out of hotline-iosd, and hotline-iosd still answers
+`/api/v1/call` on 8789 by forwarding it here, so an old setting keeps working."""
 
 
 class DaemonError(Exception):
@@ -42,7 +48,7 @@ class CallTimeout(DaemonError):
         self.url = url
         where = "reachable" if daemon_up else "unreachable"
         super().__init__(
-            f"no response from hotline-iosd at {url} within {elapsed:.0f}s "
+            f"no response from hotline-calld at {url} within {elapsed:.0f}s "
             f"(daemon {where} on a fresh connect)"
         )
 
@@ -112,7 +118,7 @@ def _post(path: str, payload: dict[str, Any], *, url: str, timeout: float) -> di
         ):
             elapsed = time.monotonic() - started
             raise CallTimeout(elapsed, _daemon_reachable(url), url) from exc
-        raise DaemonError(f"cannot reach hotline-iosd at {url}: {exc}") from exc
+        raise DaemonError(f"cannot reach hotline-calld at {url}: {exc}") from exc
 
 
 def place_call(
@@ -175,4 +181,4 @@ def status(*, url: str = DEFAULT_URL, timeout: float = 5.0) -> dict[str, Any]:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return dict(json.loads(response.read() or b"{}"))
     except Exception as exc:
-        raise DaemonError(f"cannot reach hotline-iosd at {url}: {exc}") from exc
+        raise DaemonError(f"cannot reach hotline-calld at {url}: {exc}") from exc
