@@ -9,8 +9,8 @@ import textwrap
 
 import pytest
 
-from hotline_ios import call_cli
-from hotline_ios.client import CallOutcome, DaemonError
+from hotline_call import call_cli
+from hotline_call.client import CallOutcome, DaemonError
 
 
 @pytest.fixture
@@ -102,7 +102,7 @@ def test_read_timeout_with_live_daemon_is_unanswered_not_undeliverable(
     reported as a dead daemon. A CallTimeout whose daemon_up is True must read
     as 'rang, no answer', return EXIT_UNANSWERED under --no-fallback, and never
     claim the daemon is unreachable."""
-    from hotline_ios.client import CallTimeout
+    from hotline_call.client import CallTimeout
 
     def timed_out(*a, **kw):
         raise CallTimeout(elapsed=530.0, daemon_up=True, url="http://127.0.0.1:8789")
@@ -119,7 +119,7 @@ def test_read_timeout_with_live_daemon_is_unanswered_not_undeliverable(
 def test_read_timeout_with_live_daemon_falls_back_like_ringing_out(
     monkeypatch, fake_page
 ):
-    from hotline_ios.client import CallTimeout
+    from hotline_call.client import CallTimeout
 
     def timed_out(*a, **kw):
         raise CallTimeout(elapsed=530.0, daemon_up=True, url="http://127.0.0.1:8789")
@@ -132,7 +132,7 @@ def test_read_timeout_with_live_daemon_falls_back_like_ringing_out(
 def test_timeout_against_a_dead_daemon_is_still_undeliverable(monkeypatch, capsys):
     """daemon_up False means nothing answered a fresh connect -- the original
     dead-daemon path, exit 1."""
-    from hotline_ios.client import CallTimeout
+    from hotline_call.client import CallTimeout
 
     def timed_out(*a, **kw):
         raise CallTimeout(elapsed=2.0, daemon_up=False, url="http://127.0.0.1:8789")
@@ -147,7 +147,7 @@ def test_post_classifies_read_timeout_as_calltimeout(monkeypatch):
     CallTimeout, and probe the socket to fill daemon_up -- not raise a bare
     'cannot reach' DaemonError."""
 
-    from hotline_ios import client
+    from hotline_call import client
 
     def fake_urlopen(*a, **kw):
         raise TimeoutError("timed out")
@@ -161,7 +161,7 @@ def test_post_classifies_read_timeout_as_calltimeout(monkeypatch):
 
 
 def test_post_unwraps_timeout_nested_in_urlerror(monkeypatch):
-    from hotline_ios import client
+    from hotline_call import client
 
     def fake_urlopen(*a, **kw):
         raise client.urllib.error.URLError(TimeoutError("timed out"))
@@ -174,7 +174,7 @@ def test_post_unwraps_timeout_nested_in_urlerror(monkeypatch):
 
 
 def test_post_connection_refused_stays_a_plain_daemon_error(monkeypatch):
-    from hotline_ios import client
+    from hotline_call import client
 
     def fake_urlopen(*a, **kw):
         raise client.urllib.error.URLError(ConnectionRefusedError("refused"))

@@ -61,7 +61,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
-log = logging.getLogger("hotline-ios.agentbridge")
+log = logging.getLogger("hotline-call.agentbridge")
 
 MODES = ("relay", "direct")
 DEFAULT_MODE = os.environ.get("HOTLINE_IOS_BRIDGE_MODE", "direct").strip().lower()

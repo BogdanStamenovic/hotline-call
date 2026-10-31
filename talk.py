@@ -8,7 +8,7 @@ where you change one thing and ring again without restarting `hotline-iosd` or
 involving the roster, the store or a blocked agent.
 
 **Everything that decides how the call FEELS moved out of here** into
-`hotline_ios.conversation`, `media/tts.py`, `media/ears.py` and `callagent.py`,
+`hotline_call.conversation`, `media/tts.py`, `media/ears.py` and `callagent.py`,
 because the daemon needs exactly the same behaviour and two copies of it would
 drift within a week. The rules that were learned here -- Serbian, never hanging
 up on him, "ćao" not being a farewell, fillers off disk -- are documented where
@@ -37,10 +37,10 @@ log = logging.getLogger("talk")
 
 
 def load_env() -> None:
-    """SIP_* out of hotline-ios's own .env, the same file the daemon reads."""
+    """SIP_* out of hotline-call's own .env, the same file the daemon reads."""
     os.environ.setdefault("SIP_MEDIA_HOST", "100.72.2.62")
     try:
-        lines = (HERE.parent / ".env").read_text().splitlines()
+        lines = (HERE / ".env").read_text().splitlines()
     except OSError:
         return
     for line in lines:
@@ -61,13 +61,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     load_env()
-    from hotline_ios.callagent import CallAgent, default_context
-    from hotline_ios.conversation import AnsweredCall
-    from hotline_ios.media.ears import Ears
-    from hotline_ios.media.record import Recorder, from_environment
-    from hotline_ios.media.tts import Fillers, Voice
-    from hotline_ios.ring.base import CallTarget
-    from hotline_ios.ring.sip import SipTransport
+    from hotline_call.callagent import CallAgent, default_context
+    from hotline_call.conversation import AnsweredCall
+    from hotline_call.media.ears import Ears
+    from hotline_call.media.record import Recorder, from_environment
+    from hotline_call.media.tts import Fillers, Voice
+    from hotline_call.ring.base import CallTarget
+    from hotline_call.ring.sip import SipTransport
 
     voice = Voice()
     log.info("cvoiced: %s", voice.health())

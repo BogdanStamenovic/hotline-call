@@ -38,7 +38,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-log = logging.getLogger("hotline-ios.sipprobe")
+log = logging.getLogger("hotline-call.sipprobe")
 
 PUSH_PARAMS = ("pn-provider", "pn-prid", "pn-param", "pn-tok", "pn-type", "app-id")
 """Both the RFC 8599 names and Linphone's older proprietary ones. Looking for

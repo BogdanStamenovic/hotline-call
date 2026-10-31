@@ -10,7 +10,7 @@ import asyncio
 import numpy as np
 import pytest
 
-from hotline_ios.media.rtp import (
+from hotline_call.media.rtp import (
     PCMU_FORMAT,
     PT_PCMU,
     SAMPLES_PER_FRAME,

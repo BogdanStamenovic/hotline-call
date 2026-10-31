@@ -12,8 +12,8 @@ import threading
 
 import pytest
 
-from hotline_ios.ring.base import CallDeclined, CallTarget, CallUnanswered, CallUnreachable
-from hotline_ios.ring.sip import (
+from hotline_call.ring.base import CallDeclined, CallTarget, CallUnanswered, CallUnreachable
+from hotline_call.ring.sip import (
     SipTransport,
     _digest,
     header_of,
@@ -374,7 +374,7 @@ def test_a_body_split_across_segments_is_reassembled():
     One recv() returned the 200's headers and none of its SDP, so the parse saw
     a message with no c= line and blamed the far end for a short read here.
     """
-    from hotline_ios.ring.sip import SipTransport
+    from hotline_call.ring.sip import SipTransport
 
     body = "v=0\r\nc=IN IP4 192.168.1.50\r\nm=audio 7078 RTP/SAVP 0\r\n"
     head = ("SIP/2.0 200 OK\r\n"
@@ -388,7 +388,7 @@ def test_a_body_split_across_segments_is_reassembled():
 
 def test_two_messages_in_one_segment_are_returned_one_at_a_time():
     """100 Trying and 180 Ringing arrive back to back; neither may be dropped."""
-    from hotline_ios.ring.sip import SipTransport
+    from hotline_call.ring.sip import SipTransport
 
     both = (b"SIP/2.0 100 Trying\r\nContent-Length: 0\r\n\r\n"
             b"SIP/2.0 180 Ringing\r\nContent-Length: 0\r\n\r\n")
@@ -620,7 +620,7 @@ def test_a_guest_call_speaks_serbian_not_english():
     piper voice, which mangles English, and the ASR runs with a Serbian hint,
     which mis-transcribes English replies. The first guest call went out in
     English and fought both ends of the stack."""
-    from hotline_ios.callagent import GUEST_MANNERS
+    from hotline_call.callagent import GUEST_MANNERS
 
     manners = GUEST_MANNERS.format(callee="Milos")
     assert "SRPSKI" in manners
@@ -633,7 +633,7 @@ def test_a_guest_call_speaks_serbian_not_english():
 def test_a_guest_is_told_it_can_look_nothing_up():
     """The prompt half of the confinement. The other half is an empty working
     directory; either alone fails quietly."""
-    from hotline_ios.callagent import GUEST_MANNERS
+    from hotline_call.callagent import GUEST_MANNERS
 
     manners = GUEST_MANNERS.format(callee="Milos")
     assert "NEMAS" in manners or "NEMAŠ" in manners
@@ -645,7 +645,7 @@ def test_a_guest_agent_gets_the_brief_and_nothing_else():
     `default_context` prepends it. A third party gets what the calling agent
     chose to tell them and nothing more -- asserted on what the agent actually
     holds, not on what the docstring says it does."""
-    from hotline_ios.callagent import GUEST_CWD, guest_agent
+    from hotline_call.callagent import GUEST_CWD, guest_agent
 
     agent = guest_agent("Milos", "  only this  ")
     assert agent.context == "only this"
@@ -656,6 +656,6 @@ def test_a_guest_agent_gets_the_brief_and_nothing_else():
 
 
 def test_a_guest_call_with_no_brief_still_says_so_in_serbian():
-    from hotline_ios.callagent import guest_agent
+    from hotline_call.callagent import guest_agent
 
     assert guest_agent("Milos", "   ").context == "Nema posebnog konteksta za ovaj poziv."

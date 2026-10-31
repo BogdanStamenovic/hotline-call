@@ -15,7 +15,7 @@ import time
 import numpy as np
 import pytest
 
-from hotline_ios.media import pcm, rtp, srtp, voicecall
+from hotline_call.media import pcm, rtp, srtp, voicecall
 
 
 def sdp_200(host="192.168.1.50", port=7078, key=None, salt=None, pts="0 8 101"):

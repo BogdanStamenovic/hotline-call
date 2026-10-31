@@ -13,9 +13,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from hotline_ios import agentbridge, haikuagent
-from hotline_ios.agentbridge import Agent, AgentBridge, BridgeError, speakable
-from hotline_ios.haikuagent import HaikuAgent
+from hotline_call import agentbridge, haikuagent
+from hotline_call.agentbridge import Agent, AgentBridge, BridgeError, speakable
+from hotline_call.haikuagent import HaikuAgent
 
 from test_conversation import _voice_stream, dial, quiet, run, speech
 from test_haikuagent import fake_pool, sse_events

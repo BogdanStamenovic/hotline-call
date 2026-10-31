@@ -57,7 +57,7 @@ import secrets
 
 from .base import CallDeclined, CallTarget, CallUnanswered, CallUnreachable
 
-log = logging.getLogger("hotline-ios.ring.telegram")
+log = logging.getLogger("hotline-call.ring.telegram")
 
 MIN_LAYER = 65
 MAX_LAYER = 92

@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
 
-from hotline_ios.media import pcm
-from hotline_ios.ring.base import AudioFormat, as_int16, frames
+from hotline_call.media import pcm
+from hotline_call.ring.base import AudioFormat, as_int16, frames
 
 
 def test_ulaw_roundtrip_is_exact_on_codec_levels():

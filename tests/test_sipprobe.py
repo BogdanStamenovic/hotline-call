@@ -9,7 +9,7 @@ explicitly.
 
 import asyncio
 
-from hotline_ios.sipprobe import header, parse_push_params, serve
+from hotline_call.sipprobe import header, parse_push_params, serve
 
 # A real-shaped Linphone iOS Contact, RFC 8599 spelling.
 MODERN = (
@@ -47,7 +47,7 @@ def test_absence_is_reported_as_absence():
 
 
 def test_pushable_requires_an_actual_token():
-    from hotline_ios.sipprobe import Registration
+    from hotline_call.sipprobe import Registration
 
     assert Registration("a", MODERN, parse_push_params(MODERN)).pushable
     assert not Registration("a", BARE, parse_push_params(BARE)).pushable

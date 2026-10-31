@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from hotline_ios import speculate
-from hotline_ios.speculate import NEUTRAL, Speculator
+from hotline_call import speculate
+from hotline_call.speculate import NEUTRAL, Speculator
 
 
 # -- the fallback, which must work with no model at all ---------------------

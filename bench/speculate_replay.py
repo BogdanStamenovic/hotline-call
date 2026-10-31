@@ -33,13 +33,13 @@ import time
 import urllib.request
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
-from hotline_ios.haikuagent import API, api_key  # noqa: E402
+from hotline_call.haikuagent import API, api_key  # noqa: E402
 
 MODEL = os.environ.get("BENCH_MODEL", "claude-haiku-5-5")
 KEY = api_key()
 STEP = 3
 MIN_WORDS = 5
-RECORDINGS = pathlib.Path(__file__).resolve().parents[2] / "recordings"
+RECORDINGS = pathlib.Path(__file__).resolve().parents[1] / "recordings"
 ARCHIVE = pathlib.Path.home() / ".local/state/hotline/discord-archive"
 HIM = "1329897799336071311"
 

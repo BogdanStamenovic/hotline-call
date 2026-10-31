@@ -61,7 +61,7 @@ from collections.abc import Callable
 
 from .base import CallTarget, CallUnreachable
 
-log = logging.getLogger("hotline-ios.ring.watch")
+log = logging.getLogger("hotline-call.ring.watch")
 
 DEFAULT_CONFIRM_WITHIN = 8.0
 """How long a transport gets to prove the device is alerting.

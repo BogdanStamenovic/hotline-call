@@ -32,7 +32,7 @@ from collections.abc import Callable, Sequence
 
 from .base import CallDeclined, CallError, CallTarget, CallUnanswered, CallUnreachable
 
-log = logging.getLogger("hotline-ios.ring.chain")
+log = logging.getLogger("hotline-call.ring.chain")
 
 
 class RingChain:

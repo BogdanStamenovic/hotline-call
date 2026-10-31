@@ -18,8 +18,8 @@ import time
 import numpy as np
 import pytest
 
-from hotline_ios import duplexcall
-from hotline_ios.media import codec, duplex, pcm, rtp, srtp
+from hotline_call import duplexcall
+from hotline_call.media import codec, duplex, pcm, rtp, srtp
 
 needs_opus = pytest.mark.skipif(codec.opus_library() is None, reason="no libopus")
 

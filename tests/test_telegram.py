@@ -12,8 +12,8 @@ import asyncio
 
 import pytest
 
-from hotline_ios.ring.base import CallTarget, CallUnanswered, CallUnreachable
-from hotline_ios.ring.telegram import TelegramTransport
+from hotline_call.ring.base import CallTarget, CallUnanswered, CallUnreachable
+from hotline_call.ring.telegram import TelegramTransport
 
 WHO = CallTarget(device="phone", reason="the build is stuck", caller_id="the ios build")
 
@@ -114,9 +114,9 @@ async def test_privacy_restrictions_are_unreachable_so_the_chain_falls_through()
 
 
 async def test_it_composes_with_the_chain_and_falls_through_when_telegram_is_down():
-    from hotline_ios.ring.chain import RingChain
-    from hotline_ios.ring.loopback import LoopbackTransport
-    from hotline_ios.ring.watch import ConfirmedRing
+    from hotline_call.ring.chain import RingChain
+    from hotline_call.ring.loopback import LoopbackTransport
+    from hotline_call.ring.watch import ConfirmedRing
 
     sip = LoopbackTransport()
     sip.name = "sip"
@@ -155,7 +155,7 @@ async def test_a_privacy_refusal_names_the_setting_to_change():
 
 
 def test_the_privacy_errors_are_looked_up_not_assumed():
-    from hotline_ios.ring.telegram import _privacy_errors
+    from hotline_call.ring.telegram import _privacy_errors
 
     names = {e.__name__ for e in _privacy_errors()}
     assert "UserPrivacyRestrictedError" in names

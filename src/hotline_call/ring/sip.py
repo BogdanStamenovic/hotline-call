@@ -96,7 +96,7 @@ from collections.abc import Callable
 from ..media import codec, srtp
 from .base import CallDeclined, CallTarget, CallUnanswered, CallUnreachable
 
-log = logging.getLogger("hotline-ios.ring.sip")
+log = logging.getLogger("hotline-call.ring.sip")
 
 AnswerHandler = Callable[[str, "socket.socket | None", bytes, bytes], None]
 """What runs when he picks up: the whole 200 OK (SDP included), the media

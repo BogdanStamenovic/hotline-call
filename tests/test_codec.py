@@ -14,7 +14,7 @@ import time
 import numpy as np
 import pytest
 
-from hotline_ios.media import codec, pcm, rtp, srtp, voicecall
+from hotline_call.media import codec, pcm, rtp, srtp, voicecall
 
 needs_opus = pytest.mark.skipif(codec.opus_library() is None, reason="no libopus")
 
@@ -84,7 +84,7 @@ def test_without_libopus_the_offer_is_g711_and_nothing_breaks(monkeypatch):
 
 @needs_opus
 def test_the_sip_invite_carries_the_codec_offer():
-    from hotline_ios.ring.sip import SipTransport
+    from hotline_call.ring.sip import SipTransport
 
     t = SipTransport(user="bogdan", password="x", peer="sip:him@sip.linphone.org")
     t._local = ("10.0.0.1", 5060)
@@ -313,7 +313,7 @@ def test_a_recording_is_written_at_the_lines_own_rate(tmp_path):
     import wave
     from pathlib import Path
 
-    from hotline_ios.media.record import Recorder
+    from hotline_call.media.record import Recorder
 
     rec = Recorder(str(tmp_path))
     rec.rate, rec.codec = 48000, "Opus 48 kHz mono, 32 kbit/s"

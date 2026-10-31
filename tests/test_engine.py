@@ -17,11 +17,11 @@ import threading
 
 import pytest
 
-from hotline_ios.daemon import Service
-from hotline_ios.events import EventLog
-from hotline_ios.gpu_handoff import GpuHandoff
-from hotline_ios.ring.base import CallUnreachable
-from hotline_ios.ring.loopback import LoopbackTransport
+from hotline_call.daemon import Service
+from hotline_call.events import EventLog
+from hotline_call.gpu_handoff import GpuHandoff
+from hotline_call.ring.base import CallUnreachable
+from hotline_call.ring.loopback import LoopbackTransport
 
 
 class FakeHandoff:

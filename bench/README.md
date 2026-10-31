@@ -7,7 +7,7 @@ without costing him a phone call.
 The audio is **not** here and never will be: it is his voice and this repo is
 public. `recordings/` is gitignored. Point these at a call directory with
 `HOTLINE_IOS_BENCH_DIR`, which defaults to
-`~/data/hotline-ios/recordings/20260910-asr-benchmark`.
+`~/data/hotline-call/recordings/20260910-asr-benchmark`.
 
 A call directory is what `media/record.py` writes when `HOTLINE_IOS_RECORD_DIR`
 is set — `turn-NN.wav` at the line's rate (8 kHz on G.711, 48 kHz on Opus;

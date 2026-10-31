@@ -26,13 +26,13 @@ import wave
 
 import numpy as np
 
-sys.path.insert(0, "/home/bodas/data/hotline-ios/server/src")
-from hotline_ios.media import pcm
-from hotline_ios.media.voicecall import FRAME_SAMPLES, WIRE_RATE, VoiceCall
+sys.path.insert(0, "/home/bodas/data/hotline-call/src")
+from hotline_call.media import pcm
+from hotline_call.media.voicecall import FRAME_SAMPLES, WIRE_RATE, VoiceCall
 
 BENCH = os.environ.get(
     "HOTLINE_IOS_BENCH_DIR",
-    os.path.expanduser("~/data/hotline-ios/recordings/20260910-asr-benchmark"))
+    os.path.expanduser("~/data/hotline-call/recordings/20260910-asr-benchmark"))
 """Where the call audio and reference live. NOT in the repo: it is his voice
 and this repo is public. Override with HOTLINE_IOS_BENCH_DIR."""
 rng = np.random.default_rng(20260910)

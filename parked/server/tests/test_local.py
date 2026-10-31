@@ -11,9 +11,9 @@ import asyncio
 
 import pytest
 
-from hotline_ios.ring.base import CallDeclined, CallTarget, CallUnanswered, CallUnreachable
-from hotline_ios.ring.local import ACK_WINDOW, LocalTransport
-from hotline_ios.ring.watch import ConfirmedRing
+from hotline_call.ring.base import CallDeclined, CallTarget, CallUnanswered, CallUnreachable
+from hotline_call.ring.local import ACK_WINDOW, LocalTransport
+from hotline_call.ring.watch import ConfirmedRing
 
 WHO = CallTarget(device="phone", agent="hotline-80", reason="the build is stuck",
                  caller_id="the ios build")
@@ -64,7 +64,7 @@ async def test_an_app_that_takes_the_ring_but_never_acks_is_unreachable():
         await transport.poll(timeout=5)              # takes it, never acks
 
     task = asyncio.create_task(app())
-    import hotline_ios.ring.local as local
+    import hotline_call.ring.local as local
     original = local.ACK_WINDOW
     local.ACK_WINDOW = 0.2
     try:
@@ -104,7 +104,7 @@ async def test_presence_goes_stale_rather_than_latching():
     transport = LocalTransport()
     await transport.poll(timeout=0.01)
     assert transport.present
-    import hotline_ios.ring.local as local
+    import hotline_call.ring.local as local
     original = local.PRESENCE_WINDOW
     local.PRESENCE_WINDOW = 0.05
     try:

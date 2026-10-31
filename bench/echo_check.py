@@ -36,8 +36,8 @@ import numpy as np
 
 BENCH = os.environ.get(
     "HOTLINE_IOS_BENCH_DIR",
-    os.path.expanduser("~/data/hotline-ios/recordings"))
-sys.path.insert(0, "/home/bodas/data/hotline-ios/server/src")
+    os.path.expanduser("~/data/hotline-call/recordings"))
+sys.path.insert(0, "/home/bodas/data/hotline-call/src")
 
 WIRE_RATE = 8000
 FRAME = 160

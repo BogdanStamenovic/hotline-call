@@ -50,7 +50,7 @@ def turns():
 
 
 def measure(model: str) -> None:
-    from hotline_ios.media.ears import Ears
+    from hotline_call.media.ears import Ears
 
     ears = Ears(model=model, language="sr")
     t = time.perf_counter()

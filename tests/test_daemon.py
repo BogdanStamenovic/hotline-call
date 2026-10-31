@@ -19,10 +19,10 @@ hotline_httpd = pytest.importorskip(
     reason="hotline not on sys.path -- run with PYTHONPATH=/home/bodas/data/hotline/src",
 )
 
-from hotline_ios.daemon import Service, build_server
-from hotline_ios.ring.loopback import LoopbackTransport
-from hotline_ios.ring.watch import ConfirmedRing
-from hotline_ios.store import UNATTRIBUTED
+from hotline_call.daemon import Service, build_server
+from hotline_call.ring.loopback import LoopbackTransport
+from hotline_call.ring.watch import ConfirmedRing
+from hotline_call.store import UNATTRIBUTED
 
 
 class Utterance:
@@ -364,7 +364,7 @@ async def test_dismissing_a_conversation_closes_it_and_is_idempotent():
 
 def test_the_doorbell_is_assembled_from_a_list_in_order():
     # "We will do both" as a configuration rather than a fork.
-    from hotline_ios.daemon import build_transport
+    from hotline_call.daemon import build_transport
 
     one = build_transport(["loopback"], allow_fake=True)
     assert one.name == "loopback+confirmed"
@@ -376,15 +376,15 @@ def test_the_doorbell_is_assembled_from_a_list_in_order():
 def test_each_link_is_confirmed_individually_not_the_chain_as_a_whole():
     # Wrapping the outside would let a silent failure inside look like success,
     # and the chain can only fall through on evidence.
-    from hotline_ios.daemon import build_transport
-    from hotline_ios.ring.watch import ConfirmedRing
+    from hotline_call.daemon import build_transport
+    from hotline_call.ring.watch import ConfirmedRing
 
     chain = build_transport(["loopback", "loopback"], allow_fake=True)
     assert all(isinstance(link, ConfirmedRing) for link in chain.links)
 
 
 def test_an_unknown_or_empty_doorbell_is_refused_at_startup():
-    from hotline_ios.daemon import build_transport
+    from hotline_call.daemon import build_transport
 
     with pytest.raises(SystemExit):
         build_transport(["carrier-pigeon"])
@@ -440,7 +440,7 @@ def test_both_doorbells_assemble_in_order():
     This value -- telegram,sip -- is the one build_transport's own docstring
     uses as the example, and for a while it was also the one it refused.
     """
-    from hotline_ios.daemon import build_transport
+    from hotline_call.daemon import build_transport
 
     chain = build_transport(["telegram", "sip"])
     assert [link.inner.name for link in chain.links] == ["telegram", "sip"]
@@ -458,8 +458,8 @@ def test_both_doorbells_assemble_in_order():
 
 
 def test_loopback_declares_itself_fake() -> None:
-    from hotline_ios.ring.loopback import LoopbackTransport
-    from hotline_ios.ring.watch import ConfirmedRing
+    from hotline_call.ring.loopback import LoopbackTransport
+    from hotline_call.ring.watch import ConfirmedRing
 
     assert LoopbackTransport().is_fake is True
     # Confirmation must not launder it: ConfirmedRing proves the doorbell said
@@ -469,9 +469,9 @@ def test_loopback_declares_itself_fake() -> None:
 
 def test_a_chain_with_any_fake_link_is_fake() -> None:
     """ANY, not ALL -- the fake link answers first and the real one never runs."""
-    from hotline_ios.ring.chain import RingChain
-    from hotline_ios.ring.loopback import LoopbackTransport
-    from hotline_ios.ring.watch import ConfirmedRing
+    from hotline_call.ring.chain import RingChain
+    from hotline_call.ring.loopback import LoopbackTransport
+    from hotline_call.ring.watch import ConfirmedRing
 
     class Real:
         name = "real"
@@ -486,7 +486,7 @@ def test_a_chain_with_any_fake_link_is_fake() -> None:
 def test_build_transport_refuses_loopback_unless_told_twice() -> None:
     import pytest
 
-    from hotline_ios.daemon import build_transport
+    from hotline_call.daemon import build_transport
 
     with pytest.raises(SystemExit) as caught:
         build_transport(["loopback"], allow_fake=False)
@@ -496,8 +496,8 @@ def test_build_transport_refuses_loopback_unless_told_twice() -> None:
 
 
 def test_outcome_reports_a_fake_doorbell() -> None:
-    from hotline_ios.daemon import Service
-    from hotline_ios.ring.loopback import LoopbackTransport
+    from hotline_call.daemon import Service
+    from hotline_call.ring.loopback import LoopbackTransport
 
     service = Service(LoopbackTransport(), pool=None)
     assert service._outcome("c1", "answered", 0.0)["fake"] is True
@@ -508,8 +508,8 @@ def test_unknown_transport_is_refused_not_ignored() -> None:
     import pytest
     from hotline.httpd import HttpError
 
-    from hotline_ios.daemon import Service
-    from hotline_ios.ring.loopback import LoopbackTransport
+    from hotline_call.daemon import Service
+    from hotline_call.ring.loopback import LoopbackTransport
 
     default = LoopbackTransport()
     service = Service(default, pool=None)
@@ -531,8 +531,8 @@ def test_open_calls_ignores_closed_ones_and_reap_drops_them() -> None:
     """
     import time as _time
 
-    from hotline_ios.daemon import Service
-    from hotline_ios.ring.loopback import LoopbackTransport
+    from hotline_call.daemon import Service
+    from hotline_call.ring.loopback import LoopbackTransport
 
     service = Service(LoopbackTransport(), pool=None)
     old = _time.time() - 7200
@@ -639,7 +639,7 @@ async def test_a_conversation_is_filed_under_the_agent_that_opened_it():
 async def test_the_daemon_is_reachable_on_loopback_as_well_as_its_own_address():
     """`0.0.0.0` would also have fixed the hook. It would also have put a shell
     with bypassed permissions on whatever wifi this machine is on."""
-    from hotline_ios.endpoint import LOOPBACK
+    from hotline_call.endpoint import LOOPBACK
 
     service = Service(LoopbackTransport(), FakePool())
     # 127.0.0.2 stands in for the tailnet address: a second loopback-range
@@ -693,8 +693,8 @@ async def test_an_unreachable_hook_url_is_a_degradation_not_silence():
 async def test_the_hook_installer_and_the_daemon_agree_on_the_url():
     """They were two independent constants that happened to disagree. This fails
     if anyone writes the address down a second time."""
-    from hotline_ios import hooks
-    from hotline_ios.endpoint import local_url
+    from hotline_call import hooks
+    from hotline_call.endpoint import local_url
 
     assert hooks.DEFAULT_URL == local_url(hooks.HOOK_PATH)
 
@@ -815,9 +815,9 @@ def test_await_transcript_returns_both_sides_and_stops_when_the_call_ends() -> N
     """
     import asyncio
 
-    from hotline_ios.daemon import Service
-    from hotline_ios.events import EventLog
-    from hotline_ios.ring.loopback import LoopbackTransport
+    from hotline_call.daemon import Service
+    from hotline_call.events import EventLog
+    from hotline_call.ring.loopback import LoopbackTransport
 
     class Spoken:
         turns = 2
@@ -853,9 +853,9 @@ def test_await_transcript_gives_up_at_the_deadline_if_the_call_never_ends() -> N
     import asyncio
     import time
 
-    from hotline_ios.daemon import Service
-    from hotline_ios.events import EventLog
-    from hotline_ios.ring.loopback import LoopbackTransport
+    from hotline_call.daemon import Service
+    from hotline_call.events import EventLog
+    from hotline_call.ring.loopback import LoopbackTransport
 
     class Spoken:
         turns = 1
@@ -991,7 +991,7 @@ async def test_a_registry_call_refuses_rather_than_ringing_him_by_fallback():
     the caller would be told it was delivered. Refusing out loud is the only
     honest option.
     """
-    from hotline_ios.ring.loopback import LoopbackTransport
+    from hotline_call.ring.loopback import LoopbackTransport
 
     inner = LoopbackTransport()
     service = Service(inner, FakePool())
@@ -1016,7 +1016,7 @@ async def test_a_registry_call_refuses_rather_than_ringing_him_by_fallback():
 
 
 async def test_a_registry_call_goes_to_the_sip_link_not_the_configured_chain():
-    from hotline_ios.ring.loopback import LoopbackTransport
+    from hotline_call.ring.loopback import LoopbackTransport
 
     rung: list[object] = []
 
@@ -1045,7 +1045,7 @@ async def test_a_registry_call_goes_to_the_sip_link_not_the_configured_chain():
 
 
 async def test_a_call_with_no_address_is_still_addressed_to_him():
-    from hotline_ios.ring.loopback import LoopbackTransport
+    from hotline_call.ring.loopback import LoopbackTransport
 
     rung: list[object] = []
 
@@ -1085,7 +1085,7 @@ class RecordingAgent:
 
 @pytest.fixture
 def recording_agent(monkeypatch):
-    from hotline_ios import callagent
+    from hotline_call import callagent
     RecordingAgent.made = []
     monkeypatch.setattr(callagent, "CallAgent", RecordingAgent)
     monkeypatch.setenv("HOTLINE_IOS_INBOUND_ENGINE", "classic")
@@ -1114,7 +1114,7 @@ async def test_his_call_is_told_he_called_not_that_an_agent_rang_him(recording_a
 
 
 async def test_his_call_is_busy_while_personaplex_holds_the_gpu(recording_agent):
-    from hotline_ios.ring.inbound import Busy
+    from hotline_call.ring.inbound import Busy
 
     service = Service(LoopbackTransport(), FakePool(), transcriber=FakeTranscriber(),
                       speaker=FakeSpeaker())
@@ -1140,7 +1140,7 @@ async def test_the_sip_thread_gets_its_handler_from_the_loop(recording_agent):
 
 
 def test_inbound_switched_off_starts_nothing(monkeypatch):
-    from hotline_ios.daemon import start_inbound
+    from hotline_call.daemon import start_inbound
 
     monkeypatch.setenv("HOTLINE_IOS_INBOUND", "0")
     service = Service(LoopbackTransport(), FakePool())
@@ -1149,7 +1149,7 @@ def test_inbound_switched_off_starts_nothing(monkeypatch):
 
 
 def test_inbound_that_cannot_start_is_a_degradation_not_a_crash(monkeypatch):
-    from hotline_ios.daemon import start_inbound
+    from hotline_call.daemon import start_inbound
 
     monkeypatch.setenv("HOTLINE_IOS_INBOUND", "1")
     for name in ("SIP_USER", "SIP_PASSWORD", "SIP_PEER"):

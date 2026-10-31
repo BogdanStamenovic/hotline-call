@@ -7,8 +7,8 @@ import json
 
 import pytest
 
-from hotline_ios import haikuagent
-from hotline_ios.haikuagent import HaikuAgent, HaikuUnavailable
+from hotline_call import haikuagent
+from hotline_call.haikuagent import HaikuAgent, HaikuUnavailable
 
 
 def sse(*texts, stop=True):
@@ -129,7 +129,7 @@ def test_a_lookup_flushes_first_then_answers_from_the_result(monkeypatch, tmp_pa
 
 
 def test_tools_refuse_secrets_and_paths_outside_the_root(monkeypatch, tmp_path):
-    from hotline_ios import calltools
+    from hotline_call import calltools
 
     (tmp_path / ".env").write_text("API_KEY=x")
     (tmp_path / "notes.md").write_text("API_KEY=x")
@@ -145,7 +145,7 @@ def test_tools_refuse_secrets_and_paths_outside_the_root(monkeypatch, tmp_path):
 def test_git_log_answers_what_changed(monkeypatch, tmp_path):
     import subprocess
 
-    from hotline_ios import calltools
+    from hotline_call import calltools
 
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     (tmp_path / "a").write_text("x")

@@ -46,12 +46,12 @@ def load_whisper():
 
 
 def main() -> int:
-    from hotline_ios.media import voicecall
-    from hotline_ios.ring.sip import SipTransport
-    from hotline_ios.ring.base import CallTarget
+    from hotline_call.media import voicecall
+    from hotline_call.ring.sip import SipTransport
+    from hotline_call.ring.base import CallTarget
 
     os.environ.setdefault("SIP_MEDIA_HOST", "100.72.2.62")
-    for line in open("/home/bodas/data/hotline-ios/.env"):
+    for line in open("/home/bodas/data/hotline-call/.env"):
         line = line.strip()
         if line.startswith("SIP_") and "=" in line:
             k, v = line.split("=", 1); os.environ.setdefault(k, v.strip().strip('"'))

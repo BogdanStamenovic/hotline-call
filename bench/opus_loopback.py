@@ -27,9 +27,9 @@ import time
 
 import numpy as np
 
-from hotline_ios.media import codec, pcm, rtp, srtp, voicecall
-from hotline_ios.ring.base import CallTarget
-from hotline_ios.ring.sip import SipTransport, header_of
+from hotline_call.media import codec, pcm, rtp, srtp, voicecall
+from hotline_call.ring.base import CallTarget
+from hotline_call.ring.sip import SipTransport, header_of
 
 TONES = [1000, 6000, 10000, 14000]
 

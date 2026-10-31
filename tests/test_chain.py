@@ -9,10 +9,10 @@ rather than silently trusted.
 
 import pytest
 
-from hotline_ios.ring.base import CallDeclined, CallTarget, CallUnanswered, CallUnreachable
-from hotline_ios.ring.chain import RingChain
-from hotline_ios.ring.loopback import LoopbackTransport
-from hotline_ios.ring.watch import ConfirmedRing
+from hotline_call.ring.base import CallDeclined, CallTarget, CallUnanswered, CallUnreachable
+from hotline_call.ring.chain import RingChain
+from hotline_call.ring.loopback import LoopbackTransport
+from hotline_call.ring.watch import ConfirmedRing
 
 WHO = CallTarget(device="phone", agent="hotline-80")
 

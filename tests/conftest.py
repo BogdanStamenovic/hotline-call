@@ -23,7 +23,7 @@ if str(_SRC) not in sys.path:
 
 # Alongside this repo, which is where it lives on archserver. A relative guess
 # rather than an absolute path so a clone elsewhere still works.
-_HOTLINE = Path(__file__).resolve().parents[3] / "hotline" / "src"
+_HOTLINE = Path(__file__).resolve().parents[2] / "hotline" / "src"
 if _HOTLINE.is_dir() and str(_HOTLINE) not in sys.path:
     sys.path.insert(0, str(_HOTLINE))
 

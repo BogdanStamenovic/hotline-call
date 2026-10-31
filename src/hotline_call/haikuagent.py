@@ -38,7 +38,7 @@ from collections.abc import Iterator
 from . import calltools
 from .callagent import default_context
 
-log = logging.getLogger("hotline-ios.haikuagent")
+log = logging.getLogger("hotline-call.haikuagent")
 
 API = "https://api.anthropic.com/v1/messages"
 DEFAULT_MODEL = os.environ.get("HOTLINE_IOS_HAIKU_MODEL", "claude-haiku-5-5")

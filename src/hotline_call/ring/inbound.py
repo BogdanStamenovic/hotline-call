@@ -87,7 +87,7 @@ from .sip import (
     uri_of,
 )
 
-log = logging.getLogger("hotline-ios.ring.inbound")
+log = logging.getLogger("hotline-call.ring.inbound")
 
 T1 = 0.5
 T2 = 4.0

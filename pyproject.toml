@@ -3,10 +3,10 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "hotline-ios"
+name = "hotline-call"
 version = "0.1.0"
-description = "Real ringing calls from a Claude Code session to an iPhone"
-readme = "../README.md"
+description = "Phone calls between Claude Code sessions and people: the SIP ring, the voice on the line, and hotline-call"
+readme = "README.md"
 # Matches hotline's floor for the same reasons -- this process imports hotline's
 # audio stack in-process, so it has to live in the same interpreter it does.
 requires-python = ">=3.12"
@@ -26,7 +26,14 @@ telegram = ["telethon>=1.44"]
 # 24 kHz speech to 8 kHz with no anti-aliasing and folds the noise straight into
 # the band Whisper listens to. The TTS is cvoiced over HTTP and needs nothing.
 # websockets: cvoiced's /speak/ws, for the streamed (`--engine haiku`) voice.
-voice = ["numpy>=2", "soxr>=0.5", "faster-whisper>=1.1", "websockets>=12"]
+# cryptography: SRTP (AES-CM + HMAC-SHA1) on every call that negotiates it.
+voice = [
+  "numpy>=2",
+  "soxr>=0.5",
+  "faster-whisper>=1.1",
+  "websockets>=12",
+  "cryptography>=42",
+]
 dev = [
   "pytest>=8.0,<10",
   "pytest-asyncio>=0.23,<2",
@@ -35,12 +42,11 @@ dev = [
 ]
 
 [project.scripts]
-hotline-call = "hotline_ios.call_cli:main"
-hotline-iosd = "hotline_ios.daemon:main"
-hotline-ios-hooks = "hotline_ios.hooks:main"
+hotline-call = "hotline_call.call_cli:main"
+hotline-calld = "hotline_call.daemon:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/hotline_ios"]
+packages = ["src/hotline_call"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

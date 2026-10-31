@@ -30,9 +30,9 @@ import wave
 import numpy as np
 
 sys.path[:0] = [str(pathlib.Path(__file__).resolve().parents[1] / "src"), "/home/bodas/data/hotline/src"]
-from hotline_ios.media.ears import Ears  # noqa: E402
+from hotline_call.media.ears import Ears  # noqa: E402
 
-RECORDINGS = pathlib.Path(__file__).resolve().parents[2] / "recordings"
+RECORDINGS = pathlib.Path(__file__).resolve().parents[1] / "recordings"
 SR = 16000
 FRAME = SR // 50
 

@@ -16,11 +16,11 @@ import time
 
 import pytest
 
-from hotline_ios.media import pcm, rtp, srtp
-from hotline_ios.media.voicecall import VoiceCall, parse_sdp_answer
-from hotline_ios.ring import inbound
-from hotline_ios.ring.inbound import Busy, OfferError, SipInbound, answer_offer
-from hotline_ios.ring.sip import header_of, status_of
+from hotline_call.media import pcm, rtp, srtp
+from hotline_call.media.voicecall import VoiceCall, parse_sdp_answer
+from hotline_call.ring import inbound
+from hotline_call.ring.inbound import Busy, OfferError, SipInbound, answer_offer
+from hotline_call.ring.sip import header_of, status_of
 
 NONCE = "HFE47gAAAADyW23QAAD253sZEAsAAAAA"
 HIM = "sip:him@127.0.0.1"

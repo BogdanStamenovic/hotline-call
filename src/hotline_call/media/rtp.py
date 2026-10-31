@@ -35,7 +35,7 @@ from collections import deque
 from ..ring.base import AudioFormat
 from .pcm import ulaw_decode, ulaw_encode
 
-log = logging.getLogger("hotline-ios.rtp")
+log = logging.getLogger("hotline-call.rtp")
 
 PT_PCMU = 0
 """Payload type 0 is G.711 µ-law. Fixed by RFC 3551; never negotiated away."""

@@ -13,9 +13,9 @@ from dataclasses import dataclass
 import numpy as np
 import pytest
 
-from hotline_ios.call import CallSession, TurnEvent
-from hotline_ios.ring.base import AudioFormat, CallDeclined, CallTarget, CallUnanswered
-from hotline_ios.ring.loopback import LoopbackTransport
+from hotline_call.call import CallSession, TurnEvent
+from hotline_call.ring.base import AudioFormat, CallDeclined, CallTarget, CallUnanswered
+from hotline_call.ring.loopback import LoopbackTransport
 
 FMT = AudioFormat(rate=16_000, channels=1, frame_ms=20)
 

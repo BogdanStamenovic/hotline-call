@@ -33,7 +33,7 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
-from hotline_ios.agentbridge import (  # noqa: E402
+from hotline_call.agentbridge import (  # noqa: E402
     AgentBridge, markdown_leaks, relay_note, speakable)
 
 TURNS = [
@@ -61,14 +61,14 @@ def main() -> int:
                                     "judged by it growing after the hangup")
     ap.add_argument("--resume-wait", type=float, default=90.0)
     ap.add_argument("--out", default=os.path.expanduser(
-        "~/data/hotline-ios/recordings/bench-results"))
+        "~/data/hotline-call/recordings/bench-results"))
     args = ap.parse_args()
 
     bridge = AgentBridge(mode=args.mode)
     haiku = None
     if args.mode == "relay":
-        from hotline_ios.callagent import default_context
-        from hotline_ios.haikuagent import MANNERS, HaikuAgent
+        from hotline_call.callagent import default_context
+        from hotline_call.haikuagent import MANNERS, HaikuAgent
 
         haiku = HaikuAgent(default_context(), manners=f"{MANNERS}\n- {bridge.manners()}",
                            extra_tools=bridge.tools())

@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/home/bodas/data/hotline-ios/server
 Environment=PYTHONPATH=/home/bodas/data/hotline-ios/server/src
-ExecStart=/home/bodas/data/hotline-ios/server/.venv/bin/python -m hotline_ios.sipprobe \
+ExecStart=/home/bodas/data/hotline-ios/server/.venv/bin/python -m hotline_call.sipprobe \
   --host 100.72.2.62 --port 5060 \
   --capture /home/bodas/data/hotline-ios/sip-capture.txt
 Restart=always

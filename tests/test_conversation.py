@@ -17,8 +17,8 @@ import time
 import numpy as np
 import pytest
 
-from hotline_ios.conversation import AnsweredCall, is_farewell, sentences
-from hotline_ios.media import pcm, rtp, srtp, voicecall
+from hotline_call.conversation import AnsweredCall, is_farewell, sentences
+from hotline_call.media import pcm, rtp, srtp, voicecall
 
 TONE_RATE = 8000
 
@@ -448,7 +448,7 @@ def test_a_recorded_turn_is_kept_as_it_arrived_not_as_whisper_saw_it(tmp_path):
     import json
     import wave
 
-    from hotline_ios.media.record import Recorder
+    from hotline_call.media.record import Recorder
 
     recorder = Recorder(str(tmp_path))
     handler, phone, reply = dial(recorder=recorder, model="large-v3", call_seconds=6.0,
@@ -491,7 +491,7 @@ def test_nothing_is_written_unless_a_recorder_was_asked_for(tmp_path):
 
 
 def test_a_recorder_that_cannot_write_does_not_cost_the_call(tmp_path):
-    from hotline_ios.media.record import Recorder
+    from hotline_call.media.record import Recorder
 
     blocked = tmp_path / "not-a-directory"
     blocked.write_text("in the way")

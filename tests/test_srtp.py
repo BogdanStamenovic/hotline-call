@@ -13,7 +13,7 @@ import struct
 
 import pytest
 
-from hotline_ios.media import srtp
+from hotline_call.media import srtp
 
 
 def h(s: str) -> bytes:

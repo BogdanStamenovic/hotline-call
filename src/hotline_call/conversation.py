@@ -50,7 +50,7 @@ import numpy as np
 
 from .media.voicecall import SdpError, VoiceCall, parse_sdp_answer
 
-log = logging.getLogger("hotline-ios.conversation")
+log = logging.getLogger("hotline-call.conversation")
 
 PRIME_SECONDS = 1.2
 """Silence before the first word, and the window barge-in is calibrated in.

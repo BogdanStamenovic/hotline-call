@@ -27,7 +27,7 @@ import subprocess
 import threading
 import time
 
-log = logging.getLogger("hotline-ios.callagent")
+log = logging.getLogger("hotline-call.callagent")
 
 DEFAULT_CWD = os.environ.get("HOTLINE_CWD", "/home/bodas/data")
 # His instruction, 2026-09-10 18:48Z: "somnets either way must be read only. As

@@ -21,11 +21,11 @@ import numpy as np
 
 BENCH = os.environ.get(
     "HOTLINE_IOS_BENCH_DIR",
-    os.path.expanduser("~/data/hotline-ios/recordings/20260910-asr-benchmark"))
+    os.path.expanduser("~/data/hotline-call/recordings/20260910-asr-benchmark"))
 """Where the call audio and reference live. NOT in the repo: it is his voice
 and this repo is public. Override with HOTLINE_IOS_BENCH_DIR."""
-sys.path.insert(0, "/home/bodas/data/hotline-ios/server/src")
-from hotline_ios.media.ears import preload_cuda
+sys.path.insert(0, "/home/bodas/data/hotline-call/src")
+from hotline_call.media.ears import preload_cuda
 
 CT2 = "/mnt/windows/Users/Korisnik/ai-models/hf-cache/ct2-converted"
 
