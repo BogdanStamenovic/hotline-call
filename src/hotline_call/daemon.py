@@ -292,6 +292,10 @@ class Service:
         self._last_stop_at: dict[str, float] = {}
         # Assistant output samples, in memory on purpose -- see `vitals.py`.
         self.rates = vitals.Rates()
+        # The running loop, for `inbound_call` on the SIP thread. Set in main().
+        self.loop: asyncio.AbstractEventLoop | None = None
+        # `ring.inbound.SipInbound` when he can call us, else None.
+        self.inbound: Any = None
         self._hydrate()
 
     # ---- where this daemon can be reached --------------------------------
@@ -792,7 +796,7 @@ class Service:
         return self.speaker is not None and self.transcriber is not None
 
     def _answered_call(self, target: CallTarget, conversation: str, link: Any,
-                       engine: str = "") -> Any:
+                       engine: str = "", *, inbound: bool = False) -> Any:
         """The handler `SipTransport` calls when he picks up.
 
         Everything crossing into it is a plain callable, so `conversation.py`
@@ -818,7 +822,18 @@ class Service:
             loop.call_soon_threadsafe(self._append, conversation, kind, text)
 
         agent = None
-        if os.environ.get("HOTLINE_IOS_CALL_SESSION", "1") != "0" and target.address:
+        if os.environ.get("HOTLINE_IOS_CALL_SESSION", "1") != "0" and inbound:
+            # He dialled us. Nobody rang him and nothing is waiting on an
+            # answer, so the "an agent rang you to ask X" brief would be a lie
+            # the voice repeats back to him.
+            agent = CallAgent(default_context(
+                "THIS CALL: Bogdan called YOU. He dialled hotline himself from his\n"
+                "phone; no agent rang him and there is no question waiting for an\n"
+                "answer. You have already greeted him -- let him say why he called,\n"
+                "and everything he says on this call is for you."
+            ))
+            agent.start()
+        elif os.environ.get("HOTLINE_IOS_CALL_SESSION", "1") != "0" and target.address:
             # Ringing somebody who is not him. Different manners, different
             # language, and no `call_context.txt` -- see `guest_agent`. The
             # calling agent's brief is the ONLY thing this voice knows.
@@ -879,7 +894,9 @@ class Service:
             # guest hears ~9 s of silence after picking up; `greet` itself names
             # Bogdan, so a guest gets its own.
             opening="greet_guest" if target.address else "greet",
-            greeting=str(speakable(
+            # Inbound: the clip ("Zdravo Bogdane, ovde hotline. Slušam te.") is
+            # the whole greeting. There is no question to read out.
+            greeting="" if inbound else str(speakable(
                 # Serbian, like the guest manners themselves. The TTS voice is a
                 # Serbian one and the ASR runs with a Serbian hint, so an English
                 # greeting is mispronounced on the way out and mis-heard on the
@@ -897,6 +914,51 @@ class Service:
             recorder=from_environment(f"{target.caller_id}: {target.reason}"),
             model=repr(transcriber),
         )
+
+    # ---- him calling us ---------------------------------------------------
+
+    def inbound_call(self, call: Any) -> Any:
+        """`SipInbound.on_call`. Runs on the SIP thread; the work runs on the loop.
+
+        `_answered_call` and `_open_conversation` touch loop-owned state, so
+        they are built there and handed back. Bounded, because the SIP thread
+        is also what keeps the registration alive.
+        """
+        if self.loop is None:
+            return None
+        future = asyncio.run_coroutine_threadsafe(self._inbound_leg(call), self.loop)
+        return future.result(timeout=10.0)
+
+    async def _inbound_leg(self, call: Any) -> Any:
+        from .ring.inbound import Busy
+
+        if self._gpu_lock.locked():
+            # A PersonaPlex call has cvoiced down and the card full; the
+            # inbound voice would have nothing to speak with.
+            raise Busy("a PersonaPlex call holds the GPU")
+        if not self.can_talk:
+            log.error("inbound call from %s: no voice or no ears here; not answering",
+                      call.caller)
+            return None
+        conversation, _events = self._open_conversation(None, "say")
+        self._append(conversation, "state", "he called hotline")
+        target = CallTarget(device="phone", agent=None, reason="Bogdan called hotline",
+                            caller_id="Bogdan", context="", address="", callee="Bogdan")
+        engine = os.environ.get("HOTLINE_IOS_INBOUND_ENGINE", "haiku").strip().lower()
+        if engine in ("classic", "auto"):
+            engine = ""
+        # Warmed while it rings, exactly as an outbound ring does, and released
+        # by `_InboundLeg` however the call ends -- answered or cancelled.
+        self._warm_models()
+        try:
+            handler = self._answered_call(target, conversation, call, engine, inbound=True)
+        except Exception:
+            self._cool_models()
+            self._close_conversation(conversation)
+            raise
+        log.info("inbound call %s from %s: engine %s", conversation, call.caller,
+                 engine or "classic")
+        return _InboundLeg(self, conversation, handler, asyncio.get_running_loop())
 
     async def place(self, body: dict[str, Any]) -> dict[str, Any]:
         """Ring him, then wait for him to answer in the app.
@@ -2684,6 +2746,48 @@ class Service:
         }
 
 
+class _InboundLeg:
+    """One inbound call's handler, plus the cleanup a ring gets from `_voice_leg`.
+
+    Called by `SipInbound` like any `on_answer` handler once it has answered;
+    `abandon` instead when he hangs up while it is still ringing. Either way the
+    models are released and the conversation closed exactly once.
+    """
+
+    def __init__(self, service: Service, conversation: str, handler: Any,
+                 loop: asyncio.AbstractEventLoop) -> None:
+        self.service = service
+        self.conversation = conversation
+        self.handler = handler
+        self.loop = loop
+        self._done = threading.Lock()
+        self._finished = False
+
+    def __call__(self, reply: str, media_sock: Any, key: bytes, salt: bytes) -> None:
+        try:
+            self.handler(reply, media_sock, key, salt)
+        finally:
+            ended = getattr(self.handler, "ended", "") or "ended"
+            self._finish(f"call over: {ended}")
+
+    def abandon(self, why: str) -> None:
+        self._finish(f"not answered: {why}")
+
+    def _finish(self, note: str) -> None:
+        with self._done:
+            if self._finished:
+                return
+            self._finished = True
+        self.service._cool_models()
+
+        def close() -> None:
+            self.service._append(self.conversation, "state", note)
+            self.service._close_conversation(self.conversation)
+
+        with contextlib.suppress(RuntimeError):  # the loop is gone: shutting down
+            self.loop.call_soon_threadsafe(close)
+
+
 def _declared_at(record: Any, session: Any, annotation: dict[str, Any]) -> float | None:
     declared = getattr(record, "declared_at", None)
     if isinstance(declared, int | float) and declared:
@@ -2866,6 +2970,9 @@ def build_server(service: Service, host: str | Sequence[str], port: int) -> Any:
             "transport": getattr(service.transport, "name", "?"),
             "rings_when_closed": bool(getattr(service.transport, "rings_when_closed", False)),
             "transports_available": sorted(service.links),
+            # He can call us: the persistent registration's own state, or null
+            # when inbound is switched off.
+            "inbound": service.inbound.status() if service.inbound is not None else None,
             "active_calls": service.open_calls(),
             "conversations_held": len(service.calls),
             "listening_on": [f"{h}:{service.listen_port}" for h in service.listen_hosts],
@@ -3262,6 +3369,31 @@ def build_links(names: Sequence[str], *, confirm_within: float = 8.0,
     return out
 
 
+def start_inbound(service: Service) -> None:
+    """Keep hotline's account registered so he can call it. Never fatal.
+
+    `HOTLINE_IOS_INBOUND=0` switches it off. Anything that goes wrong here --
+    no credentials, no network, a refused REGISTER -- is logged loudly and put
+    on /health, and the outbound doorbell carries on exactly as before: the
+    registration runs on its own thread and its own connection, and retries.
+    """
+    if os.environ.get("HOTLINE_IOS_INBOUND", "1") == "0":
+        log.info("inbound calls disabled by HOTLINE_IOS_INBOUND=0")
+        return
+    try:
+        from .ring.inbound import SipInbound
+
+        inbound = SipInbound(on_call=service.inbound_call)
+        inbound.start()
+    except Exception as exc:  # noqa: BLE001 - inbound must never cost outbound
+        note = f"inbound calls unavailable: {exc}"
+        log.error(note)
+        service.degradations.append(note)
+        return
+    service.inbound = inbound
+    log.info("inbound: registering %s@%s so he can call", inbound.user, inbound.domain)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="hotline-iosd")
     parser.add_argument(
@@ -3339,6 +3471,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     service.set_links(links)
 
     async def run() -> None:
+        service.loop = asyncio.get_running_loop()
         try:
             await transport.start()
             service.ring_ready = True
@@ -3369,6 +3502,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"on port {args.port}; the phone dials that address. "
                 "Is tailscaled up? Exiting so the service manager retries."
             )
+        start_inbound(service)
         # Started here rather than in Service.__init__ so a test can construct a
         # Service without a running loop, and so nothing sweeps the box during
         # the suite.
@@ -3402,6 +3536,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         asyncio.run(run())
     except KeyboardInterrupt:
         return 0
+    finally:
+        if service.inbound is not None:
+            service.inbound.stop()
     return 0
 
 

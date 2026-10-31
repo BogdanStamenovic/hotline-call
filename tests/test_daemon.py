@@ -1063,3 +1063,98 @@ async def test_a_call_with_no_address_is_still_addressed_to_him():
         assert rung[0].callee == "Bogdan"
     finally:
         await server.close()
+
+
+# -- him calling us ----------------------------------------------------------
+
+
+class FakeInboundCall:
+    caller = "sip:him@sip.linphone.org"
+    def __init__(self): self.over = False
+    def far_end_hung_up(self): return self.over
+
+
+class RecordingAgent:
+    made: list = []
+    def __init__(self, context="", **kw):
+        self.context = context
+        RecordingAgent.made.append(self)
+    def start(self): pass
+    def reply(self, heard): return "ok"
+
+
+@pytest.fixture
+def recording_agent(monkeypatch):
+    from hotline_ios import callagent
+    RecordingAgent.made = []
+    monkeypatch.setattr(callagent, "CallAgent", RecordingAgent)
+    monkeypatch.setenv("HOTLINE_IOS_INBOUND_ENGINE", "classic")
+    return RecordingAgent
+
+
+async def test_his_call_is_told_he_called_not_that_an_agent_rang_him(recording_agent):
+    service = Service(LoopbackTransport(), FakePool(), transcriber=FakeTranscriber(),
+                      speaker=FakeSpeaker(), fillers=FakeFillers())
+    leg = await service._inbound_leg(FakeInboundCall())
+    context = recording_agent.made[0].context
+    assert "Bogdan called YOU" in context
+    assert "rang him to ask" not in context
+    # The greeting clip is the whole opening: there is no question to read out.
+    assert leg.handler.opening == "greet"
+    assert leg.handler.greeting == ""
+    assert service._calls_holding_models == 1
+    assert len(service.calls) == 1
+    conversation = next(iter(service.calls))
+
+    leg.abandon("cancelled before answer")
+    leg.abandon("twice must not release twice")
+    await asyncio.sleep(0.05)
+    assert service._calls_holding_models == 0
+    assert service.calls[conversation].closed
+
+
+async def test_his_call_is_busy_while_personaplex_holds_the_gpu(recording_agent):
+    from hotline_ios.ring.inbound import Busy
+
+    service = Service(LoopbackTransport(), FakePool(), transcriber=FakeTranscriber(),
+                      speaker=FakeSpeaker())
+    async with service._gpu_lock:
+        with pytest.raises(Busy):
+            await service._inbound_leg(FakeInboundCall())
+
+
+async def test_a_daemon_that_cannot_talk_does_not_answer_him(recording_agent):
+    service = Service(LoopbackTransport(), FakePool())
+    assert await service._inbound_leg(FakeInboundCall()) is None
+    assert service.calls == {}
+
+
+async def test_the_sip_thread_gets_its_handler_from_the_loop(recording_agent):
+    service = Service(LoopbackTransport(), FakePool(), transcriber=FakeTranscriber(),
+                      speaker=FakeSpeaker())
+    service.loop = asyncio.get_running_loop()
+    leg = await asyncio.get_running_loop().run_in_executor(
+        None, service.inbound_call, FakeInboundCall())
+    assert callable(leg) and hasattr(leg, "abandon")
+    leg.abandon("test over")
+
+
+def test_inbound_switched_off_starts_nothing(monkeypatch):
+    from hotline_ios.daemon import start_inbound
+
+    monkeypatch.setenv("HOTLINE_IOS_INBOUND", "0")
+    service = Service(LoopbackTransport(), FakePool())
+    start_inbound(service)
+    assert service.inbound is None
+
+
+def test_inbound_that_cannot_start_is_a_degradation_not_a_crash(monkeypatch):
+    from hotline_ios.daemon import start_inbound
+
+    monkeypatch.setenv("HOTLINE_IOS_INBOUND", "1")
+    for name in ("SIP_USER", "SIP_PASSWORD", "SIP_PEER"):
+        monkeypatch.delenv(name, raising=False)
+    service = Service(LoopbackTransport(), FakePool())
+    start_inbound(service)
+    assert service.inbound is None
+    assert any("inbound calls unavailable" in note for note in service.degradations)
