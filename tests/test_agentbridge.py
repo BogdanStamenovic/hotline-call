@@ -338,3 +338,8 @@ def test_may_speculate_false_means_no_speculation_is_started():
     phone.stop()
     assert handler.speculation["started"] == 0 and asked == []
     assert "Važi." in " ".join(spoken)
+
+
+def test_a_reply_in_cyrillic_is_spoken_in_latin():
+    assert speakable("Последњи је осамсто, četrdeset други. Џеп, љубав, њива.") == \
+        "Poslednji je osamsto, četrdeset drugi. Džep, ljubav, njiva."

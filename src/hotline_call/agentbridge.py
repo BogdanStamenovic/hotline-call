@@ -297,12 +297,28 @@ _URL = re.compile(r"https?://\S+")
 _PATH = re.compile(r"(?<![\w.])(?:~|\.{0,2})?/(?:[\w.@-]+/)+[\w.@-]*")
 
 
+_CYR = dict(zip("абвгдђежзијклљмнњопрстћуфхцчџшАБВГДЂЕЖЗИЈКЛЉМНЊОПРСТЋУФХЦЧЏШ",
+                ["a", "b", "v", "g", "d", "đ", "e", "ž", "z", "i", "j", "k", "l", "lj",
+                 "m", "n", "nj", "o", "p", "r", "s", "t", "ć", "u", "f", "h", "c", "č",
+                 "dž", "š", "A", "B", "V", "G", "D", "Đ", "E", "Ž", "Z", "I", "J", "K",
+                 "L", "Lj", "M", "N", "Nj", "O", "P", "R", "S", "T", "Ć", "U", "F", "H",
+                 "C", "Č", "Dž", "Š"]))
+
+
+def latin(text: str) -> str:
+    """Serbian Cyrillic to Latin. Measured: a Sonnet agent told "Latin script"
+    answered six of seven turns in Cyrillic, some mixed mid-sentence; the
+    voice and its tests are Latin, and the mapping is exact, so it is done
+    here rather than hoped for."""
+    return "".join(_CYR.get(ch, ch) for ch in text)
+
+
 def speakable(text: str, limit: int = MAX_SPOKEN) -> str:
     """The agent's written reply, made sayable. Strips markup and drops what a
     voice cannot carry (code blocks, URLs, paths); never adds a claim. This is
     the last line of defence behind the phone manners, not a substitute."""
     lines, in_code = [], False
-    for raw in text.splitlines():
+    for raw in latin(text).splitlines():
         line = raw.strip()
         if line.startswith("```"):
             in_code = not in_code
