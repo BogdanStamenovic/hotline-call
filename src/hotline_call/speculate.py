@@ -185,6 +185,19 @@ the answer to "ćao" is "ćao", and a thinking noise in front of it sounds wrong
 The clips are rendered locally (see media/tts.Fillers), not committed."""
 
 
+GREETING = re.compile(r"\b(ćao|cao|čao|zdravo|hej|halo|dobar dan|dobro jutro|dobro veče|dobro vece|pozdrav)\b")
+
+
 def intent_filler(speculator: "Speculator", said: str) -> str | None:
+    """The thinking sound for this turn, or None for a plain greeting.
+
+    "Plain greeting" is narrow on purpose: short AND containing a greeting
+    word. The classifier alone called all three turns of the 2026-10-31 22:37
+    call greetings ("Ja, ja je brat.", margins 0.03-0.08), so none of them got
+    a sound and he heard nothing."""
     intent, _margin = speculator.intent(said)
-    return INTENT_FILLERS.get(intent)
+    if intent == "POZDRAV":
+        if len(said.split()) <= 5 and GREETING.search(said.lower()):
+            return None
+        return INTENT_FILLERS["PITANJE"]
+    return INTENT_FILLERS.get(intent, INTENT_FILLERS["PITANJE"])

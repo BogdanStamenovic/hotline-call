@@ -105,3 +105,20 @@ def test_the_embedder_is_fast_enough_to_sit_inside_a_turn():
     # It runs between chunks of his speech; anything near a tenth of a second
     # would be competing with the audio it is meant to be hiding.
     assert per_call < 0.15, f"{per_call*1000:.0f} ms per classification"
+
+
+def test_only_a_short_real_greeting_goes_without_a_thinking_sound():
+    from hotline_call.speculate import intent_filler
+
+    class Always:
+        def __init__(self, intent):
+            self.it = intent
+
+        def intent(self, said):
+            return self.it, 0.05
+
+    greeting = Always("POZDRAV")
+    assert intent_filler(greeting, "Ćao, kako si") is None
+    assert intent_filler(greeting, "Ja, ja je brat.") == "intent_pitanje"
+    assert intent_filler(greeting, "Ćao, želim da pozdraviš moj druga Dragića Mihajla") == "intent_pitanje"
+    assert intent_filler(Always("ZADATAK"), "Pokreni ponovo cvoiced") == "intent_zadatak"
