@@ -117,6 +117,11 @@ class HaikuUnavailable(RuntimeError):
     pass
 
 
+READ_ONLY_EXTRA = frozenset({"list_agents"})
+"""Extra (bridge) tools that only read, and so are as safe in a speculative
+fork as calltools' lookups are."""
+
+
 def _not_while_speculating(**_args) -> str:
     raise RuntimeError("not available before he has finished speaking")
 
@@ -237,8 +242,12 @@ class HaikuAgent:
         # world cannot be: connecting an agent interrupts it. So in a fork those
         # tools refuse. The schemas stay, because the tool list is the front of
         # the prompt cache and a fork with a different one pays for a cold read.
-        twin.extra_tools = {name: (schema, _not_while_speculating)
-                            for name, (schema, _fn) in self.extra_tools.items()}
+        # Only tools with side effects refuse. Blocking the read-only ones too
+        # (list_agents) made a speculative answer read the refusal out to him:
+        # "not available before he has finished speaking" -> "Završio sam govor"
+        # (live call, 2026-10-31 18:31).
+        twin.extra_tools = {name: (schema, fn if name in READ_ONLY_EXTRA else _not_while_speculating)
+                            for name, (schema, fn) in self.extra_tools.items()}
         return twin
 
     def adopt(self, twin: "HaikuAgent") -> None:

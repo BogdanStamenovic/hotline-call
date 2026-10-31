@@ -164,3 +164,16 @@ def test_a_fork_changes_nothing_until_adopted(sent):
     assert agent.history == []
     agent.adopt(twin)
     assert [m["role"] for m in agent.history] == ["user", "assistant"]
+
+
+def test_a_fork_may_read_but_not_act():
+    calls = []
+    agent = HaikuAgent("ctx", key="k", extra_tools={
+        "list_agents": ({"name": "list_agents"}, lambda: calls.append("list") or "manager-5"),
+        "connect_agent": ({"name": "connect_agent"}, lambda name: calls.append(name) or "ok"),
+    })
+    twin = agent.fork()
+    assert twin.extra_tools["list_agents"][1]() == "manager-5"
+    with pytest.raises(RuntimeError):
+        twin.extra_tools["connect_agent"][1](name="manager-5")
+    assert calls == ["list"]
