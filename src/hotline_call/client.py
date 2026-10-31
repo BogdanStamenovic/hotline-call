@@ -199,9 +199,23 @@ def place_call(
 
 
 def status(*, url: str = DEFAULT_URL, timeout: float = 5.0) -> dict[str, Any]:
-    request = urllib.request.Request(f"{url.rstrip('/')}/health", method="GET")
-    try:
+    """hotline-calld's /health -- or hotline-iosd's, under the same rule as
+    `place_call`: unconfigured, and the connection to 8792 refused."""
+    def fetch(where: str) -> dict[str, Any]:
+        request = urllib.request.Request(f"{where.rstrip('/')}/health", method="GET")
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return dict(json.loads(response.read() or b"{}"))
+
+    try:
+        return fetch(url)
+    except urllib.error.URLError as exc:
+        refused = isinstance(getattr(exc, "reason", None), ConnectionRefusedError)
+        if not (refused and url == CALLD_URL and not _CONFIGURED):
+            raise DaemonError(f"cannot reach hotline-calld at {url}: {exc}") from exc
     except Exception as exc:
         raise DaemonError(f"cannot reach hotline-calld at {url}: {exc}") from exc
+    try:
+        return fetch(LEGACY_URL)
+    except Exception as exc:
+        raise DaemonError(f"cannot reach hotline-calld at {url} or hotline-iosd at "
+                          f"{LEGACY_URL}: {exc}") from exc
