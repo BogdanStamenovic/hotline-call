@@ -863,6 +863,7 @@ class Service:
             agent.start()
 
         ask_stream = speak_stream = ask_fork = None
+        bridge = None
         if engine == "haiku" and agent is not None and not target.address:
             # His test, 2026-10-30: Haiku 5.5 over the API, its tokens streamed
             # straight into cvoiced. The CallAgent seeded above stays as the
@@ -870,7 +871,19 @@ class Service:
             # nothing he hears, it runs while the phone rings.
             from .haikuagent import HaikuAgent
 
-            haiku = HaikuAgent(agent.context)   # already call_context.txt + this call
+            # "spoji me sa <agent>": his request, 2026-10-31. Only on his own
+            # calls (not a guest's), and only with the Haiku voice, which is
+            # what understands the name. See agentbridge.py.
+            from .haikuagent import MANNERS
+
+            manners, extra = MANNERS, None
+            if os.environ.get("HOTLINE_IOS_BRIDGE", "1") != "0":
+                from .agentbridge import AgentBridge
+
+                bridge = AgentBridge()
+                manners, extra = f"{MANNERS}\n- {bridge.manners()}", bridge.tools()
+            haiku = HaikuAgent(agent.context, manners=manners,   # already call_context.txt + this call
+                               extra_tools=extra)
             if haiku.failed:
                 log.error("call %s: haiku engine unavailable (%s); classic voice instead",
                           conversation, haiku.failed)
@@ -880,6 +893,8 @@ class Service:
                 log.error("call %s: the TTS client cannot stream; classic voice instead", conversation)
             else:
                 ask_stream, speak_stream = haiku.reply_stream, speaker.stream
+                if bridge is not None:
+                    ask_stream = bridge.stream_for(haiku)
                 haiku.start()   # opens the API connection while the phone rings
 
                 def ask_fork(haiku=haiku):
@@ -910,6 +925,13 @@ class Service:
             speak_stream=speak_stream,
             ask_fork=ask_fork,
             hung_up=getattr(link, "far_end_hung_up", None),
+            may_speculate=bridge.may_speculate if bridge is not None else None,
+            # Generous only when an agent is (or is being) put on the line: a
+            # Claude session's turn is tens of seconds, not Haiku's one or two.
+            answer_seconds=(lambda b=bridge: (b.answer_seconds if b.connected
+                                              else b.connect_seconds) + 20.0)
+            if bridge is not None else None,
+            on_end=(lambda why, b=bridge: b.release(why)) if bridge is not None else None,
             note=append,
             recorder=from_environment(f"{target.caller_id}: {target.reason}"),
             model=repr(transcriber),

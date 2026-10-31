@@ -92,6 +92,10 @@ class HaikuUnavailable(RuntimeError):
     pass
 
 
+def _not_while_speculating(**_args) -> str:
+    raise RuntimeError("not available before he has finished speaking")
+
+
 def _lines(response):
     while True:
         line = response.readline()
@@ -170,7 +174,8 @@ class HaikuAgent:
     `CallAgent`, plus `reply_stream`, which is the point."""
 
     def __init__(self, context: str = "", *, model: str = DEFAULT_MODEL,
-                 manners: str = MANNERS, key: str = "", tools: bool = True) -> None:
+                 manners: str = MANNERS, key: str = "", tools: bool = True,
+                 extra_tools: dict | None = None) -> None:
         # The date, because call_context.txt narrates "today" as of the day it
         # was written; on the 2026-10-30 test call the voice offered a seven-week-old
         # fix as current news.
@@ -181,6 +186,10 @@ class HaikuAgent:
         self.key = key or api_key()
         self.history: list[dict] = []
         self.tools = tools
+        # name -> (schema, fn): tools with side effects, from outside this
+        # module (the agent bridge). Kept apart from `calltools`, which stays
+        # read-only, and never handed to a fork -- see `fork`.
+        self.extra_tools = dict(extra_tools or {})
         self.failed = "" if self.key else f"no API key (ANTHROPIC_API_KEY or {KEY_FILE})"
 
     def start(self) -> None:
@@ -195,6 +204,12 @@ class HaikuAgent:
         twin = HaikuAgent.__new__(HaikuAgent)
         twin.__dict__.update(self.__dict__)
         twin.history = list(self.history)
+        # A speculative answer may be thrown away, but a tool that acted on the
+        # world cannot be: connecting an agent interrupts it. So in a fork those
+        # tools refuse. The schemas stay, because the tool list is the front of
+        # the prompt cache and a fork with a different one pays for a cold read.
+        twin.extra_tools = {name: (schema, _not_while_speculating)
+                            for name, (schema, _fn) in self.extra_tools.items()}
         return twin
 
     def adopt(self, twin: "HaikuAgent") -> None:
@@ -203,7 +218,7 @@ class HaikuAgent:
     def reply(self, heard: str) -> str:
         return "".join(d for d in self.reply_stream(heard) if d)
 
-    def reply_stream(self, heard: str) -> Iterator[str | None]:
+    def reply_stream(self, heard: str, *, lookups: bool = True) -> Iterator[str | None]:
         """Text deltas of the answer to `heard`, as they arrive.
 
         `None` is a flush: everything said so far should be spoken now rather
@@ -226,7 +241,7 @@ class HaikuAgent:
                 blocks: list[dict] = []
                 stop = ""
                 for event in self._stream(self.history + turn,
-                                          tools=self.tools and _ < MAX_LOOKUPS):
+                                          tools=lookups and self.tools and _ < MAX_LOOKUPS):
                     if isinstance(event, str):
                         said.append(event)
                         yield event
@@ -241,7 +256,7 @@ class HaikuAgent:
                 for block in blocks:
                     if block.get("type") != "tool_use":
                         continue
-                    text, failed = calltools.run(block["name"], block.get("input") or {})
+                    text, failed = self._run_tool(block["name"], block.get("input") or {})
                     log.info("lookup %s(%s) -> %d chars%s", block["name"],
                              json.dumps(block.get("input"), ensure_ascii=False)[:200],
                              len(text), " (error)" if failed else "")
@@ -255,6 +270,18 @@ class HaikuAgent:
             elif said:
                 self.history += [turn[0], {"role": "assistant", "content": "".join(said)}]
 
+    def _run_tool(self, name: str, args: dict) -> tuple[str, bool]:
+        extra = self.extra_tools.get(name)
+        if extra is None:
+            return calltools.run(name, args)
+        try:
+            return str(extra[1](**args)), False
+        except TypeError as exc:
+            return f"TypeError: {exc}", True
+        except Exception as exc:  # noqa: BLE001 - said out loud, never a dropped call
+            log.exception("tool %s failed", name)
+            return f"{type(exc).__name__}: {exc}", True
+
     def _stream(self, messages: list[dict], *, tools: bool = False) -> Iterator:
         """Yields text deltas, then one final (content blocks, stop_reason)."""
         body: dict = {
@@ -267,7 +294,7 @@ class HaikuAgent:
             "messages": messages,
         }
         if tools:
-            body["tools"] = calltools.SCHEMAS
+            body["tools"] = calltools.SCHEMAS + [s for s, _ in self.extra_tools.values()]
         headers = {"x-api-key": self.key, "anthropic-version": "2023-06-01",
                    "content-type": "application/json"}
         conn, response = _POOL.post(json.dumps(body).encode(), headers)

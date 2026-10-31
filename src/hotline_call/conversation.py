@@ -200,6 +200,9 @@ class AnsweredCall:
         speak_stream: Callable[[Iterable[str | None]], Iterator[tuple[np.ndarray, int, str]]] | None = None,
         ask_fork: Callable[[], tuple[Callable[[str], Iterator[str | None]], Callable[[], None]]] | None = None,
         hung_up: Callable[[], bool] | None = None,
+        may_speculate: Callable[[str], bool] | None = None,
+        answer_seconds: Callable[[], float] | None = None,
+        on_end: Callable[[str], None] | None = None,
         note: Callable[[str, str], None] | None = None,
         recorder: Any = None,
         model: str = "",
@@ -232,6 +235,16 @@ class AnsweredCall:
         self._spec_lock = threading.Lock()
         self._pause_gen = 0
         self.speculation = {"started": 0, "used": 0, "dropped": 0}
+        # Asked before each speculation. The agent bridge says no while an
+        # agent is on the line, or when the turn may be asking for one: a
+        # speculative turn that reached an agent cannot be taken back.
+        self.may_speculate = may_speculate
+        # How long a streamed answer may take, asked per turn. `turn_seconds`
+        # unless something says otherwise; a connected agent takes minutes.
+        self.answer_seconds = answer_seconds
+        # Called once with `ended` however the call ends, so whatever the call
+        # borrowed (an interrupted agent) is always handed back.
+        self.on_end = on_end
         self.hung_up = hung_up
         self.note = note or (lambda kind, text: None)
         # Off unless something handed one in. See `media/record.py` for why an
@@ -295,6 +308,11 @@ class AnsweredCall:
                     inbound_at=call.inbound_clock())
             log.info("call ended (%s) after %d turn(s): %s",
                      self.ended, self.turns, self.stats)
+            if self.on_end is not None:
+                try:
+                    self.on_end(self.ended)
+                except Exception:
+                    log.exception("the end-of-call hook failed")
 
     # -- the conversation -------------------------------------------------
 
@@ -492,6 +510,8 @@ class AnsweredCall:
             return
         if len(text) < 3 or is_farewell(text) or gen != self._pause_gen:
             return
+        if self.may_speculate is not None and not self.may_speculate(text):
+            return
         ask_stream, commit = self.ask_fork()
         spec = Speculation(text, ask_stream, self.speak_stream, commit)
         with self._spec_lock:
@@ -601,12 +621,18 @@ class AnsweredCall:
         began = time.monotonic()
         spoken: list[str] = []
         held = nudged = False
+        limit = self.turn_seconds
+        if self.answer_seconds is not None:
+            try:
+                limit = float(self.answer_seconds())
+            except Exception:
+                log.exception("answer_seconds raised; using %.0f s", limit)
         while True:
             waited = time.monotonic() - began
             try:
                 kind, item = chunks.get(timeout=0.05)
             except queue.Empty:
-                if waited > self.turn_seconds:
+                if waited > limit:
                     kind, item = "err", "the stream did not answer in time"
                 elif spoken:
                     continue
