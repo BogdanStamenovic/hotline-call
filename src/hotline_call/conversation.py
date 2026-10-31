@@ -202,6 +202,7 @@ class AnsweredCall:
         hung_up: Callable[[], bool] | None = None,
         may_speculate: Callable[[str], bool] | None = None,
         stream_fixed_lines: bool = True,
+        intent_filler: Callable[[str], str | None] | None = None,
         answer_seconds: Callable[[], float] | None = None,
         on_end: Callable[[str], None] | None = None,
         note: Callable[[str, str], None] | None = None,
@@ -241,6 +242,9 @@ class AnsweredCall:
         # speculative turn that reached an agent cannot be taken back.
         self.may_speculate = may_speculate
         self.stream_fixed_lines = stream_fixed_lines
+        # His turn -> the name of a pre-rendered thinking sound ("Hm, pa...") to
+        # play the instant he stops, while the answer is produced behind it.
+        self.intent_filler = intent_filler
         # How long a streamed answer may take, asked per turn. `turn_seconds`
         # unless something says otherwise; a connected agent takes minutes.
         self.answer_seconds = answer_seconds
@@ -623,6 +627,17 @@ class AnsweredCall:
         began = time.monotonic()
         spoken: list[str] = []
         held = nudged = False
+        clip = None
+        if self.intent_filler is not None and self.fillers is not None:
+            try:
+                clip = self.intent_filler(said)
+            except Exception:
+                log.exception("intent filler failed; answering without one")
+        if clip and clip in self.fillers:
+            # Blocking on purpose: it is a word, and half a word is worse than none.
+            # The answer keeps being produced behind it.
+            self.play(call, clip)
+            held = True
         limit = self.turn_seconds
         if self.answer_seconds is not None:
             try:

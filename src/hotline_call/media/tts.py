@@ -343,23 +343,36 @@ class Fillers:
         self.texts: dict[str, str] = {}
 
     def load(self) -> int:
-        index = self.directory / "index.json"
+        """The repo's clips, then the local overlay on top of them.
+
+        The overlay (~/.local/share/hotline-call/fillers, or
+        $HOTLINE_CALL_FILLERS_LOCAL) holds clips rendered on this box and never
+        committed: they are his cloned voice, and the repo is public."""
+        count = self._load_dir(self.directory)
+        local = pathlib.Path(os.path.expanduser(os.environ.get(
+            "HOTLINE_CALL_FILLERS_LOCAL", "~/.local/share/hotline-call/fillers")))
+        if local != self.directory and (local / "index.json").exists():
+            count += self._load_dir(local)
+        return len(self.clips)
+
+    def _load_dir(self, directory: pathlib.Path) -> int:
+        index = directory / "index.json"
         try:
             entries = json.loads(index.read_text())
         except (OSError, ValueError) as exc:
             log.warning("no fillers at %s (%s); holding phrases will be silence",
-                        self.directory, exc)
+                        directory, exc)
             return 0
         for name, meta in entries.items():
             try:
-                audio = np.load(self.directory / f"{name}.npy")
+                audio = np.load(directory / f"{name}.npy")
             except OSError:
                 log.warning("filler %r is in the index but not on disk", name)
                 continue
             self.clips[name] = (audio, int(meta.get("rate", 24_000)))
             self.texts[name] = str(meta.get("text", ""))
-        log.info("%d fillers from %s", len(self.clips), self.directory)
-        return len(self.clips)
+        log.info("%d fillers from %s", len(entries), directory)
+        return len(entries)
 
     def get(self, name: str) -> tuple[np.ndarray, int] | None:
         return self.clips.get(name)

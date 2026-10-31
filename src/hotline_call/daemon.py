@@ -430,6 +430,28 @@ class Service:
         speak is the silence this whole path exists to end."""
         return self.speaker is not None and self.transcriber is not None
 
+    def _intent_filler(self):
+        """The turn -> thinking-sound picker, warmed once per process (the seed
+        embeddings are a few hundred ms the first time; ollama keeps bge-m3)."""
+        from .speculate import Speculator, intent_filler
+
+        if getattr(self, "_speculator", None) is None:
+            self._speculator = Speculator()
+
+            def warm(spec=self._speculator):
+                # The first embed loads bge-m3 into ollama: 3 s was not enough on
+                # a busy GPU (2026-10-31), so the warm-up alone gets 30. Until it
+                # lands, and if it never does, the keyword fallback picks.
+                spec.timeout, short = 30.0, spec.timeout
+                try:
+                    spec.warm()
+                finally:
+                    spec.timeout = short
+
+            threading.Thread(target=warm, daemon=True, name="speculator-warm").start()
+        spec = self._speculator
+        return lambda said: intent_filler(spec, said)
+
     def _answered_call(self, target: CallTarget, conversation: str, link: Any,
                        engine: str = "", *, inbound: bool = False) -> Any:
         """The handler `SipTransport` calls when he picks up.
@@ -519,9 +541,11 @@ class Service:
             # what understands the name. See agentbridge.py.
             from .haikuagent import manners as build_manners
 
+            # With a thinking sound already played for him, the voice must not
+            # add its own "Važi," on top: it answers directly.
             base = build_manners(openers=feat["opener_nudge"], tools=feat["tools"],
                                  context_rules=feat["context_rules"],
-                                 fillers=feat["filler_words"])
+                                 fillers=feat["filler_words"] and not feat["intent_fillers"])
             manners, extra = base, None
             if os.environ.get("HOTLINE_IOS_BRIDGE", "1") != "0" and feat["bridge"]:
                 from .agentbridge import AgentBridge
@@ -586,6 +610,7 @@ class Service:
             ask_fork=ask_fork,
             hung_up=getattr(link, "far_end_hung_up", None),
             stream_fixed_lines=feat["streamed_greeting"],
+            intent_filler=self._intent_filler() if (feat["intent_fillers"] and ask_stream is not None) else None,
             may_speculate=bridge.may_speculate if bridge is not None else None,
             # Generous only when an agent is (or is being) put on the line: a
             # Claude session's turn is tens of seconds, not Haiku's one or two.

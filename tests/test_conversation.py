@@ -659,3 +659,30 @@ def test_a_pause_he_talks_through_drops_the_speculation_and_answers_all_of_it():
     assert answered == full, (answered, full, handler.speculation)
     assert len(full.split()) > len(_words_by_length(speech(1.0, rate=16000)).split()), full
     assert len(committed) == handler.speculation["used"]
+
+
+def test_the_intent_filler_plays_the_moment_he_stops_then_the_answer():
+    spoken, picked = [], []
+    fillers = _Fillers()
+    fillers.clips = {"intent_pitanje": None}
+
+    class Picky(_Fillers):
+        def __contains__(self, name):
+            return name == "intent_pitanje"
+
+    fillers = Picky()
+
+    def pick(said):
+        picked.append(said)
+        return "intent_pitanje"
+
+    handler, phone, reply = dial(fillers=fillers, ask_stream=_token_stream("Server radi."),
+                                 speak_stream=_voice_stream(spoken), intent_filler=pick)
+    phone.say_after(0.05, quiet(1.4))
+    phone.say_after(1.7, np.concatenate([speech(1.0), quiet(1.6)]))
+    thread = run(handler, phone, reply)
+    thread.join(timeout=20)
+    phone.stop()
+    assert picked == ["da samo napred"]
+    assert "intent_pitanje" in fillers.played
+    assert spoken[-1] == "Server radi."

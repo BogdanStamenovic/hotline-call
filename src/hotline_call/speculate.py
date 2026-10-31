@@ -175,3 +175,16 @@ class Speculator:
 def _normalise(vec: list[float]) -> list[float]:
     norm = sum(x * x for x in vec) ** 0.5
     return [x / norm for x in vec] if norm else list(vec)
+
+
+INTENT_FILLERS = {"PITANJE": "intent_pitanje", "ZALBA": "intent_pitanje",
+                  NEUTRAL: "intent_pitanje", "ZADATAK": "intent_zadatak"}
+"""His picks from the 2026-10-31 listening test: "Hm, pa..." (clip 11) for a
+question, "Aha, ahhh..." (clip 10) for something to do. A greeting gets none:
+the answer to "ćao" is "ćao", and a thinking noise in front of it sounds wrong.
+The clips are rendered locally (see media/tts.Fillers), not committed."""
+
+
+def intent_filler(speculator: "Speculator", said: str) -> str | None:
+    intent, _margin = speculator.intent(said)
+    return INTENT_FILLERS.get(intent)

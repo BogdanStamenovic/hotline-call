@@ -36,6 +36,7 @@ FEATURES = (
     Feature("join", "roomtone", ("roomtone", "zeros", "library"), "how voice chunks are joined: room tone / silent pauses / library padding (first call)"),
     Feature("openers", True, (), "cached pre-rendered openers + one-word first chunk"),
     Feature("opener_nudge", True, (), "Haiku told to open with a cached opener"),
+    Feature("intent_fillers", True, (), "play 'Hm, pa...' (question) / 'Aha, ahhh...' (directive) the moment he stops; the voice then answers directly"),
     Feature("filler_words", True, (), "let Haiku open with 'Važi,' / 'Samo sekund,' (off: answer directly, no fillers)"),
     Feature("thinking", False, (), "let Haiku think before answering (on doubles the tokens)"),
     Feature("tools", True, (), "read-only lookups: read_file / grep / glob / git_log"),
