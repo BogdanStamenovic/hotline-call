@@ -72,9 +72,9 @@ import os
 import re
 from dataclasses import dataclass, field
 
-import numpy as np
-
-from . import pcm
+# numpy and `pcm` (which is numpy) are imported where they are used, not here:
+# the fallback answerer on the Pi (`fallback.py`) negotiates through this module
+# and must import without numpy, which that box does not have.
 
 log = logging.getLogger(__name__)
 
@@ -132,8 +132,13 @@ def _catalogue() -> dict[str, _Known]:
     }
 
 
-def preferred(env: str | None = None) -> list[_Known]:
-    """What we offer, in order: configured, and only what can actually run."""
+def preferred(env: str | None = None, *, opus: bool | None = None) -> list[_Known]:
+    """What we offer, in order: configured, and only what can actually run.
+
+    `opus` overrides the libopus probe: True for a caller that carries Opus
+    without encoding it here (the fallback sends payloads pre-encoded on
+    archserver), False to rule it out. None asks `opus_library()`.
+    """
     wanted = env if env is not None else os.environ.get("HOTLINE_IOS_CODECS", "opus,pcmu,pcma")
     known = _catalogue()
     out: list[_Known] = []
@@ -141,7 +146,8 @@ def preferred(env: str | None = None) -> list[_Known]:
         entry = known.get(name)
         if entry is None or entry in out:
             continue
-        if entry.name == "opus" and opus_library() is None:
+        if entry.name == "opus" and not (opus if opus is not None
+                                         else opus_library() is not None):
             continue
         out.append(entry)
     if not any(entry.name == "PCMU" for entry in out):
@@ -197,7 +203,8 @@ def _identify(pt: int, maps: dict[int, tuple[str, int]]) -> tuple[str, int] | No
     return _STATIC.get(pt)
 
 
-def negotiate(answer_sdp: str, env: str | None = None) -> Choice | None:
+def negotiate(answer_sdp: str, env: str | None = None, *,
+              opus: bool | None = None) -> Choice | None:
     """The codec an answer settled on, or None when it shares nothing with us.
 
     Matched by encoding name and clock, never by number alone: a dynamic payload
@@ -205,7 +212,7 @@ def negotiate(answer_sdp: str, env: str | None = None) -> Choice | None:
     Taken in the ANSWER's order, because the answerer's first format is the one
     it intends to send (RFC 3264 6.1).
     """
-    ours = {(entry.name.lower(), entry.clock) for entry in preferred(env)}
+    ours = {(entry.name.lower(), entry.clock) for entry in preferred(env, opus=opus)}
     pts, maps, params = _media_section(answer_sdp)
     for pt in pts:
         found = _identify(pt, maps)
@@ -218,7 +225,8 @@ def negotiate(answer_sdp: str, env: str | None = None) -> Choice | None:
     return None
 
 
-def answer_lines(offer_sdp: str, env: str | None = None) -> tuple[Choice, str, list[str]] | None:
+def answer_lines(offer_sdp: str, env: str | None = None, *,
+                 opus: bool | None = None) -> tuple[Choice, str, list[str]] | None:
     """Answer an offer: our most preferred codec that it contains.
 
     The answerer's preference, not the offerer's order -- which is what lets a
@@ -233,7 +241,7 @@ def answer_lines(offer_sdp: str, env: str | None = None) -> tuple[Choice, str, l
         found = _identify(pt, maps)
         if found is not None:
             offered.setdefault((found[0].lower(), found[1]), pt)
-    for entry in preferred(env):
+    for entry in preferred(env, opus=opus):
         found_pt = offered.get((entry.name.lower(), entry.clock))
         if found_pt is None:
             continue
@@ -261,6 +269,8 @@ class G711:
         self.pt = choice.pt
         self.frame_samples = self.rate * FRAME_MS // 1000
         self.ts_step = self.clock * FRAME_MS // 1000
+        from . import pcm
+
         alaw = choice.name == "PCMA"
         self._enc = pcm.alaw_encode if alaw else pcm.ulaw_encode
         self._dec = pcm.alaw_decode if alaw else pcm.ulaw_decode
@@ -448,6 +458,8 @@ def silence(codec: G711 | Opus) -> bytes:
 
 def level(frame: bytes) -> float:
     """RMS of a linear-PCM frame in [0, 1]."""
+    import numpy as np
+
     samples = np.frombuffer(frame, dtype="<i2")
     if not samples.size:
         return 0.0

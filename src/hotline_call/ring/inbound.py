@@ -135,13 +135,16 @@ class OfferError(Exception):
 
 
 def answer_offer(offer: str, media_host: str, media_port: int, key: bytes, salt: bytes,
-                 env: str | None = None) -> tuple[str, str]:
+                 env: str | None = None, *, opus: bool | None = None) -> tuple[str, str]:
     """Our SDP answer to his offer, and the same offer reduced to what was agreed.
 
     The second string is what `AnsweredCall` is handed in place of a 200 OK: his
     address and port, his crypto line, and ONLY the codec we answered with.
     `parse_sdp_answer` takes the answerer's order, which on an offer would be
     his preference rather than our decision, so it must not see the rest.
+
+    `opus` is `codec.preferred`'s override: the fallback answerer has no libopus
+    and still carries Opus, from payloads encoded ahead of time.
     """
     body = offer.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in offer else offer
     lines = [line.strip() for line in body.replace("\r\n", "\n").split("\n") if line.strip()]
@@ -187,7 +190,7 @@ def answer_offer(offer: str, media_host: str, media_port: int, key: bytes, salt:
     if not c_line:
         raise OfferError("no c=IN IP4 line: nowhere to send audio")
 
-    agreed = codec.answer_lines("\r\n".join(audio), env)
+    agreed = codec.answer_lines("\r\n".join(audio), env, opus=opus)
     if agreed is None:
         raise OfferError("no codec in common (not even PCMU)")
     choice, pt, attrs = agreed
@@ -292,6 +295,8 @@ class SipInbound:
         keepalive: float = KEEPALIVE_EVERY,
         server_hostname: str | None = None,
         verify_tls: bool = True,
+        opus: bool | None = None,
+        user_agent: str = "hotline-ios inbound",
     ) -> None:
         self.user = user or os.environ.get("SIP_USER", "")
         self.password = password or os.environ.get("SIP_PASSWORD", "")
@@ -320,6 +325,8 @@ class SipInbound:
         self.keepalive = keepalive
         self.server_hostname = server_hostname or self.domain
         self.verify_tls = verify_tls
+        self.opus = opus
+        self.user_agent = user_agent
 
         self.registered = threading.Event()
         self.registered_until = 0.0
@@ -518,7 +525,7 @@ class SipInbound:
             f"Expires: {self.expires if expires is None else expires}",
             "Supported: outbound, path",
             "Max-Forwards: 70",
-            "User-Agent: hotline-ios inbound",
+            f"User-Agent: {self.user_agent}",
             "Allow: INVITE, ACK, CANCEL, BYE, OPTIONS, UPDATE, INFO, NOTIFY",
         ]
         if auth:
@@ -570,7 +577,7 @@ class SipInbound:
             elif record_route and name == "record-route":
                 lines.append(line)
         lines.extend(extra)
-        lines.append("User-Agent: hotline-ios inbound")
+        lines.append(f"User-Agent: {self.user_agent}")
         if body:
             lines.append("Content-Type: application/sdp")
         lines.append(f"Content-Length: {len(body.encode())}")
@@ -592,7 +599,7 @@ class SipInbound:
             f"CSeq: {self._local_cseq} {method}",
             self._contact(),
             "Max-Forwards: 70",
-            "User-Agent: hotline-ios inbound",
+            f"User-Agent: {self.user_agent}",
             "Content-Length: 0",
         ]) + "\r\n\r\n"
 
@@ -737,7 +744,7 @@ class SipInbound:
         try:
             call.answer_sdp, call.agreed_offer = answer_offer(
                 invite, self.media_host or self._local[0], media.getsockname()[1],
-                call.key, call.salt)
+                call.key, call.salt, opus=self.opus)
         except OfferError as exc:
             media.close()
             log.error("inbound: cannot carry his offer: %s", exc)

@@ -21,10 +21,11 @@ for it.** See `watch.py`.
 from __future__ import annotations
 
 import enum
-
-import numpy as np
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 class CallError(Exception):
@@ -159,8 +160,10 @@ def frames(pcm: bytes, fmt: AudioFormat) -> list[bytes]:
     return out
 
 
-def as_int16(audio: "np.ndarray") -> bytes:
+def as_int16(audio: np.ndarray) -> bytes:
     """Float32 in [-1, 1] to little-endian int16, clipped."""
     if audio.size == 0:
         return b""
+    import numpy as np  # here, not at the top: see `fallback.py`, which has none
+
     return (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
