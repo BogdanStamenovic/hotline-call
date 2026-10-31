@@ -1,25 +1,18 @@
 .venv/
 __pycache__/
 *.pyc
-.env
-build/
-*.ipa
-*.app/
-server/.venv/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
 
-# SwiftPM build output and xtool packaging output. .gitignore already had
-# "build/", which never matches ".build/" -- 1840 object files and dSYMs went
-# in before that was noticed.
-.build/
-app/HotlineCall/xtool/
+# SIP and Telegram credentials and the API key. ownbox.sh setup writes them to
+# ~/.config/hotline-call/env; a development checkout may keep a .env here.
+.env
 
-# Generated on the CI runner by xcodegen, never checked in.
-ci/HotlineCall.xcodeproj/
-ci/Info.plist
-DerivedData/
-out/
-drop/
-
-# Call audio: his voice, on a PUBLIC repo. Never commit these.
+# Call audio and transcripts: his voice and his words, on a PUBLIC repo. Never
+# commit these, and never commit bench results computed from them either.
 recordings/
+bench-results/
+*.wav

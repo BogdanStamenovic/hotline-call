@@ -1,0 +1,40 @@
+# Rendered by `ownbox.sh setup` into ~/.config/systemd/user/@UNIT@.service.
+# Edit this template, not the rendered file: `ownbox update hotline-call`
+# renders it again.
+[Unit]
+Description=hotline-calld (rings Bogdan's phone, holds the call, answers when he dials)
+Documentation=file://@DIR@/README.md
+After=network-online.target
+Wants=network-online.target
+# Never give up restarting; see the note by Restart= below.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=@DIR@
+# hotline_call imports hotline's httpd, config and agent registry; hotline is
+# read from its source tree rather than installed into this venv, as it always
+# was for hotline-iosd.
+Environment=PYTHONPATH=@DIR@/src:@HOTLINE_SRC@
+@ENVIRONMENT@
+# Secrets are NOT here on purpose: the daemon reads ~/.config/hotline-call/env
+# at startup, so SIP_* and HOTLINE_API_KEY never get written into a unit file.
+#
+# Bounded, always-exit-0 wait so the voice leg is up before build_voice()
+# probes cvoiced exactly once. TimeoutStartSec is above the wait's own
+# deadline: with both at 90 s, systemd killed the start job mid-wait and the
+# daemon restart-looped with no doorbell at all (2026-09-11 08:00-08:07).
+ExecStartPre=-@DIR@/systemd/wait-for-cvoiced 60
+TimeoutStartSec=180
+ExecStart=@DIR@/.venv/bin/python -m hotline_call.daemon --host @HOST@ --port @PORT@
+# The bind address is the tailscale IP, which does not exist until tailscaled
+# has come up, so at boot that races. Losing it does not raise -- loopback still
+# binds -- so the daemon checks the sockets and exits on purpose, and this is
+# what turns that exit into a retry. Do not "clean this up" into
+# Restart=on-failure with a start limit: a slow tailscale would then mean no
+# doorbell until someone notices by hand.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

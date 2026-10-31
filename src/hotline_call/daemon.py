@@ -1243,6 +1243,21 @@ def start_inbound(service: Service) -> None:
 
 
 
+def env_files() -> list[pathlib.Path]:
+    """Where SIP_*, TELEGRAM_* and HOTLINE_API_KEY come from, first one wins.
+
+    Not the checkout: an ownbox install lives in a directory `ownbox uninstall`
+    deletes whole, and the SIP password must not go with it. `ownbox.sh setup`
+    writes `~/.config/hotline-call/env`; a `.env` beside the code is still read
+    after it, for a development checkout.
+    """
+    config = pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or pathlib.Path.home() / ".config")
+    chosen = os.environ.get("HOTLINE_CALL_ENV", "")
+    out = [pathlib.Path(chosen)] if chosen else [config / "hotline-call" / "env"]
+    out.append(pathlib.Path(__file__).resolve().parents[2] / ".env")
+    return out
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="hotline-calld")
     parser.add_argument(
@@ -1270,9 +1285,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     # hotline's load_env() defaults to hotline's OWN .env, which has no SIP_* or
     # TELEGRAM_* in it. Without this the daemon starts, reports a sip doorbell,
     # and only says "sip is not configured" in a degradations field nobody was
-    # reading. Loaded second so this repo's values win: load_env never
-    # overwrites what is already set.
-    load_env(pathlib.Path(__file__).resolve().parents[2] / ".env")
+    # reading. load_env never overwrites what is already set, so a key present
+    # in both files keeps hotline's value -- the order hotline-iosd has always
+    # used, kept so the two daemons agree on HOTLINE_API_KEY.
+    for env_file in env_files():
+        load_env(env_file)
     names = args.ring.split(",")
     # Build each doorbell ONCE and compose the default from those same objects,
     # so `--transport sip` selects the very transport the chain would use rather

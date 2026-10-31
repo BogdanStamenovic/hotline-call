@@ -1,9 +1,9 @@
 #!/bin/sh
-# Bounded wait for cvoiced to be REACHABLE before hotline-ios builds its voice.
+# Bounded wait for cvoiced to be REACHABLE before hotline-calld builds its voice.
 #
-# Why: on a cold boot hotline-ios.service starts one second BEFORE
-# cvoiced.service (15:03:57 vs 15:03:58, 2026-09-10) and cvoiced is not
-# listening yet. build_voice() (daemon.py:2781) constructs Voice() and calls
+# Why: on a cold boot the call daemon's unit (then hotline-ios.service) started
+# one second BEFORE cvoiced.service (15:03:57 vs 15:03:58, 2026-09-10) and
+# cvoiced is not listening yet. build_voice() (daemon.py:2781) constructs Voice() and calls
 # .health() exactly once; if that raises, `speaker` stays None, `can_talk` is
 # False for the life of the process, and the phone rings him and cannot talk.
 # Nothing retries. /health reports it honestly and nobody reads it.
@@ -15,7 +15,7 @@
 # it to speak. Waiting for model_loaded therefore never returns. The first
 # version of this script did exactly that, and on 2026-09-11 it burned the full
 # 90 s in ExecStartPre every time; systemd's default TimeoutStartSec is also
-# 90 s, so the start job was killed before ExecStart ever ran and hotline-ios
+# 90 s, so the start job was killed before ExecStart ever ran and the daemon
 # restart-looped from 08:00 with no doorbell at all. Its own comment below had
 # the rule right and the condition wrong.
 #
