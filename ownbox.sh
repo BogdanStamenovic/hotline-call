@@ -443,21 +443,27 @@ fb_clip() {
     fi
 }
 
+# Settings the fallback reads itself, so `hotline-call-fallback status` and
+# `wol` from a shell see exactly what the service sees. No secrets in here.
+fb_write_settings() {
+    local line
+    {
+        echo "# Written by hotline-call's ownbox.sh (fallback role); rewritten by update."
+        echo "HOTLINE_CALL_FALLBACK_CALLD=$CALLD_URL"
+        [ -n "$WOL_MAC" ] && echo "HOTLINE_CALL_FALLBACK_WOL_MAC=$WOL_MAC"
+        while IFS= read -r line; do
+            case "$line" in HOTLINE_CALL_FALLBACK_*) echo "$line" ;; esac
+        done <<< "$EXTRA_ENV"
+    } > "$CONFIG/fallback.env"
+}
+
 fb_render_unit() {
     mkdir -p "$UNIT_DIR"
-    local environment="" line python
+    local python out="$UNIT_DIR/$UNIT.service" tmp
     python=$(command -v "$PYTHON")
-    for line in "HOTLINE_CALL_FALLBACK_CALLD=$CALLD_URL" ${WOL_MAC:+"HOTLINE_CALL_FALLBACK_WOL_MAC=$WOL_MAC"}; do
-        environment+="Environment=$line"$'\n'
-    done
-    while IFS= read -r line; do
-        case "$line" in HOTLINE_CALL_FALLBACK_*) environment+="Environment=$line"$'\n' ;; esac
-    done <<< "$EXTRA_ENV"
-    local out="$UNIT_DIR/$UNIT.service" tmp
     tmp=$(mktemp)
-    awk -v dir="$DIR" -v py="$python" -v env="${environment%$'\n'}" '
+    awk -v dir="$DIR" -v py="$python" '
         { gsub(/@DIR@/, dir); gsub(/@PYTHON@/, py) }
-        /^@ENVIRONMENT@$/ { if (env != "") print env; next }
         { print }' "$DIR/systemd/hotline-call-fallback.service.in" > "$tmp"
     if [ -f "$out" ] && cmp -s "$tmp" "$out"; then
         rm -f "${tmp:?}"
@@ -486,6 +492,7 @@ fb_setup() {
     fb_write_env
     fb_find_mac
     save_settings
+    fb_write_settings
     fb_clip
     fb_render_unit || say "unit: $UNIT_DIR/$UNIT.service already current"
     systemctl --user enable "$UNIT" >/dev/null 2>&1 && say "unit: enabled $UNIT"
@@ -498,6 +505,7 @@ fb_update() {
     [ -f "$CONFIG/env" ] || fb_write_env
     fb_find_mac
     save_settings
+    fb_write_settings
     # The clip and the callback state are data: the clip is re-rendered only
     # when the text or its format changed (and kept if that fails), the state
     # file is never touched. An older revision's update after a rollback finds

@@ -697,8 +697,10 @@ def _health(url: str) -> dict[str, Any]:
 # ---- the command -------------------------------------------------------------
 
 def _load_env() -> None:
+    """Credentials, then the fallback's settings. The real environment wins."""
     chosen = os.environ.get("HOTLINE_CALL_ENV", "")
     load_env_file(Path(chosen) if chosen else config_dir() / "env")
+    load_env_file(config_dir() / "fallback.env")
 
 
 def cmd_serve(args: argparse.Namespace) -> int:

@@ -14,9 +14,10 @@ WorkingDirectory=@DIR@
 # fit the box (415 MB of RAM, ~90 MB free).
 Environment=PYTHONPATH=@DIR@/src
 Environment=PYTHONUNBUFFERED=1
-@ENVIRONMENT@
-# SIP credentials are read from ~/.config/hotline-call/env by the process, not
-# put here, so they never show in `systemctl show`.
+# Configuration is read by the process, not put here: SIP credentials from
+# ~/.config/hotline-call/env (so they never show in `systemctl show`), and the
+# fallback's own settings from ~/.config/hotline-call/fallback.env, so that
+# `hotline-call-fallback status` in a shell sees what the service sees.
 ExecStart=@PYTHON@ -m hotline_call.fallback serve
 Restart=always
 RestartSec=10
