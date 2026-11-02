@@ -20,13 +20,12 @@ declined. It is a real answer and worth distinguishing from ringing out: a
 decline means he saw it and said not now, so escalating again immediately is
 the wrong move.
 
-**Who talks on the call** (Bogdan, 2026-11-03: change the default engine from
-PersonaPlex to "the current thing"). A call to HIM is held by the Haiku voice:
+**Who talks on the call** (Bogdan, 2026-11-03: the default engine is "the
+current thing"). A call to HIM is held by the Haiku voice:
 Haiku 5.5 over the API streamed into his cloned voice, with read-only lookups and
 "spoji me sa <agent>". `--engine classic` asks for the older Serbian ASR + Claude
 + TTS loop. A call to anyone else (a registry guest, `to=` in the API) stays
-classic. PersonaPlex is no longer used; `--engine personaplex` works only while
-it is still installed, and falls back to the classic path if it cannot start.
+classic.
 
 **Falling back is the default.** If the call cannot be delivered at all -- the
 daemon is down, no transport is registered, the phone is off the network -- this
@@ -120,14 +119,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--engine",
         default="",
-        choices=["", "personaplex", "classic", "haiku"],
-        help="who talks on the call. Default: 'haiku' for a call to Bogdan (since "
-        "2026-11-03; PersonaPlex is no longer used), "
-        "'classic' for a call to anyone else. 'personaplex': an English full-duplex "
-        "speech model (PersonaPlex-7B on the local GPU) holds the whole call; the reason "
-        "and --context become its brief; it returns after he hangs up, with a "
-        "transcript of both sides ('him:' / 'voice:'), not a single answer. If it "
-        "cannot start, the call goes out on the classic path and stderr says so. "
+        # No argparse `choices`: a usage error would place no call at all, while the
+        # daemon rings an unknown name on the default engine and says so in a note.
+        metavar="{classic,haiku}",
+        help="who talks on the call. Default: 'haiku' for a call to Bogdan, "
+        "'classic' for a call to anyone else; any other name rings on the default "
+        "and stderr says so. "
         "'classic': the Serbian ASR + Claude + TTS loop, which returns his answer. "
         "'haiku': classic, but the voice is Haiku 5.5 over the API with its tokens "
         "streamed into cvoiced, so it starts speaking before the reply is written; "

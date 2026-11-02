@@ -47,6 +47,22 @@ def test_answered_prints_only_his_reply(monkeypatch, capsys):
     assert out.out == "yes, go ahead\n"
 
 
+def test_an_engine_the_cli_does_not_list_still_places_the_call(monkeypatch, capsys):
+    """`--engine personaplex` from an agent written before 2026-11-03 must not be
+    a usage error: the daemon rings it on the default engine and says why."""
+    seen = {}
+
+    def place(*a, **kw):
+        seen.update(kw)
+        return CallOutcome(state="answered", reply="da", transport="sip", engine="haiku",
+                           note="unknown engine 'personaplex'; the call used the default engine instead")
+
+    monkeypatch.setattr(call_cli, "place_call", place)
+    assert call_cli.main(["--engine", "personaplex", "status?"]) == call_cli.EXIT_ANSWERED
+    assert seen["engine"] == "personaplex"
+    assert "unknown engine" in capsys.readouterr().err
+
+
 def test_declined_is_its_own_exit_code_and_does_not_fall_back(monkeypatch, fake_page):
     monkeypatch.setattr(
         call_cli, "place_call",

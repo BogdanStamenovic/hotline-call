@@ -32,9 +32,8 @@ agent ──hotline-call──▶ hotline-calld :8792 ──SIP INVITE──▶ 
 | `conversation.py` | one answered call: listen, transcribe, ask, speak, barge-in |
 | `callagent.py`, `haikuagent.py`, `calltools.py` | who talks: a Claude session, or Haiku 5.5 streamed into cvoiced, with read-only lookups |
 | `agentbridge.py` | "spoji me sa <agent>": puts a live hotline agent on his call |
-| `duplexcall.py`, `gpu_handoff.py` | PersonaPlex (English full duplex) and handing the 8 GiB card over to it and back |
 | `speculate.py` | guessing how a sentence ends while he is still saying it |
-| `daemon.py` | `hotline-calld`: the HTTP API, the model refcount, the GPU lock |
+| `daemon.py` | `hotline-calld`: the HTTP API, the model refcount, the GPU lease (`gpulease.py`) |
 | `calllog.py` | the call's own in-memory record, which `place()` waits on |
 | `appmirror.py` | copies every call into hotline-iosd's store so the app shows it |
 | `client.py`, `call_cli.py` | `hotline-call`, standard library only |
@@ -114,7 +113,7 @@ answer=$(hotline-call --source "the deploy script" "Staging is green. Push to pr
 
 Exit codes are `hotline-page`'s: 0 answered, 1 undeliverable, 2 usage, 3
 unanswered, plus 4 he declined. When the call cannot be delivered it falls back
-to `hotline-page` by itself. `--engine personaplex|classic|haiku` picks who talks;
+to `hotline-page` by itself. `--engine classic|haiku` picks who talks (an unknown name rings on the default, with a note);
 `hotline-call --help` has the rest.
 
 The client talks to `HOTLINE_CALL_URL`, else `HOTLINE_IOS_URL`, else
@@ -139,7 +138,7 @@ has always used, so `HOTLINE_ALLOW_IPS` there still wins), then
 | `SIP_USER`, `SIP_PASSWORD`, `SIP_DOMAIN`, `SIP_PEER` | | the account that rings, and his |
 | `HOTLINE_IOS_RING` | `sip` | doorbells in order: `sip`, `telegram`, `loopback` |
 | `HOTLINE_IOS_INBOUND` | `1` | `0`: do not register, he cannot dial in |
-| `HOTLINE_IOS_DEFAULT_ENGINE` | `personaplex` | who talks on a call to him |
+| `HOTLINE_IOS_DEFAULT_ENGINE` | `haiku` | who talks on a call to him: `haiku` or `classic` |
 | `HOTLINE_IOS_VOICE` | `1` | `0`: ring only, no voice leg |
 | `HOTLINE_IOS_RECORD_DIR` | unset | record calls (his voice: never into git) |
 | `HOTLINE_CALL_HOST`, `HOTLINE_CALL_PORT` | `100.72.2.62`, `8792` | where hotline-calld listens |
@@ -222,8 +221,8 @@ No GPU, no models: the suite fakes Whisper, cvoiced and the SIP peer.
 PYTHONPATH=src:$HOME/data/hotline/src .venv/bin/python -m pytest -q tests
 ```
 
-378 passed in about 245 s on archserver (2026-10-31), both in the venv `ownbox install`
-builds and in hotline-ios's old one.
+396 passed, 1 skipped in about 252 s on archserver (2026-11-03), in the venv
+`ownbox install` builds.
 
 ## Limitations
 
@@ -258,6 +257,9 @@ builds and in hotline-ios's old one.
   did; the RTP socket lives in the process.
 - **The `HOTLINE_IOS_*` names are a leftover**, kept for the existing `.env`.
   Renaming them is a separate change.
+- **There is no English full-duplex engine any more.** PersonaPlex was removed on
+  2026-11-03: Bogdan no longer used it, and its weights and venvs were deleted.
+  A request for `engine=personaplex` rings on the default engine with a note.
 - **The SIP User-Agent and the inbound `+sip.instance` still say hotline-ios.**
   That is wire identity: a new instance id would register a second contact for
   the same account instead of refreshing the one linphone.org holds.

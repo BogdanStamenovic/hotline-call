@@ -662,16 +662,6 @@ async def test_his_call_is_told_he_called_not_that_an_agent_rang_him(recording_a
     assert service.calls[conversation].closed
 
 
-async def test_his_call_is_busy_while_personaplex_holds_the_gpu(recording_agent):
-    from hotline_call.ring.inbound import Busy
-
-    service = Service(LoopbackTransport(), transcriber=FakeTranscriber(),
-                      speaker=FakeSpeaker())
-    async with service._gpu_lock:
-        with pytest.raises(Busy):
-            await service._inbound_leg(FakeInboundCall())
-
-
 async def test_a_daemon_that_cannot_talk_does_not_answer_him(recording_agent):
     service = Service(LoopbackTransport())
     assert await service._inbound_leg(FakeInboundCall()) is None

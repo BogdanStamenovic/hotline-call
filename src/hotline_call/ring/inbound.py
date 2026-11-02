@@ -31,8 +31,7 @@ connection, and answers what arrives on it.
   direction, ours encrypts what we send, his decrypts what he sends.
 - **Only him.** The From URI has to be `SIP_PEER`. Anything else is `403` and a
   warning in the log naming the address that tried.
-- **One call at a time.** A second INVITE while one is up -- or while the daemon
-  says it is busy, e.g. PersonaPlex holding the GPU -- is `486 Busy Here`.
+- **One call at a time.** A second INVITE while one is up is `486 Busy Here`.
 - **BYE both ways, CANCEL before answer** (`200` to the CANCEL, `487` to the
   INVITE), in-dialog re-INVITE/UPDATE answered with the same SDP, OPTIONS 200.
 
@@ -98,10 +97,6 @@ consumer NAT and of proxies that reap quiet TLS flows."""
 REGISTER_TIMEOUT = 15.0
 BACKOFF = (2.0, 5.0, 15.0, 30.0, 60.0)
 SUPPORTED_PROFILES = ("RTP/SAVP", "RTP/SAVPF")
-
-
-class Busy(Exception):
-    """Raised by `on_call` to have the INVITE answered 486."""
 
 
 def _same_account(a: str, b: str) -> bool:
@@ -756,12 +751,6 @@ class SipInbound:
         handler = None
         try:
             handler = self.on_call(call) if self.on_call is not None else None
-        except Busy as exc:
-            media.close()
-            self.counts["busy"] += 1
-            log.warning("inbound: busy (%s): 486", exc)
-            self._reply(invite, "486 Busy Here", local_tag=local_tag)
-            return
         except Exception:
             log.exception("inbound: building the call handler raised")
         if handler is None:

@@ -89,10 +89,10 @@ class CallOutcome:
     # True when the doorbell was a test double. Not a detail: it is the
     # difference between "he was rung" and "nothing happened".
     fake: bool = False
-    # Who held the call: "personaplex" (English duplex model) or "classic" (the
-    # Serbian ASR + Claude + TTS loop); empty from a daemon that predates engines.
+    # Who held the call: "haiku" (the Haiku voice) or "classic" (the Serbian
+    # ASR + Claude + TTS loop); empty from a daemon that predates engines.
     engine: str = ""
-    # Why the call is not what was asked for, e.g. PersonaPlex fell back to classic.
+    # Why the call is not what was asked for, e.g. an unknown engine was asked for.
     note: str = ""
 
 

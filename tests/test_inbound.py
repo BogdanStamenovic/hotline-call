@@ -19,7 +19,7 @@ import pytest
 from hotline_call.media import pcm, rtp, srtp
 from hotline_call.media.voicecall import VoiceCall, parse_sdp_answer
 from hotline_call.ring import inbound
-from hotline_call.ring.inbound import Busy, OfferError, SipInbound, answer_offer
+from hotline_call.ring.inbound import OfferError, SipInbound, answer_offer
 from hotline_call.ring.sip import header_of, status_of
 
 NONCE = "HFE47gAAAADyW23QAAD253sZEAsAAAAA"
@@ -463,16 +463,6 @@ def test_a_second_call_while_one_is_up_is_busy(proxy, listener):
     first.bye()
     sock.close()
     other.close()
-
-
-def test_the_daemon_saying_busy_is_486(proxy, listener):
-    def busy(call):
-        raise Busy("PersonaPlex holds the GPU")
-    listener.on_call = busy
-    sock, key, salt = phone_media()
-    Call(proxy, offer(sock.getsockname()[1], key, salt)).invite()
-    proxy.expect(status(486))
-    sock.close()
 
 
 def test_plain_rtp_from_him_is_488_with_the_reason(proxy, listener):
