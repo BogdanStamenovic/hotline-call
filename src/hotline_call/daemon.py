@@ -260,6 +260,15 @@ class Service:
         follows and the reason a mute call beats a silent one.
         """
         def work() -> None:
+            # Before Whisper: gpu-share frees the call's VRAM budget while we load.
+            # Fast or absent, never a delay to the ring (see gpulease.py).
+            from . import features as _features
+            if _features.load()["gpu_lease"]:
+                from .gpulease import GpuLease
+
+                lease = GpuLease()
+                if lease.begin():
+                    self._gpu_lease = lease
             for name, thing in (("ears", self.transcriber), ("voice", self.speaker)):
                 loader = getattr(thing, "load", None)
                 if loader is None:
@@ -307,6 +316,9 @@ class Service:
         things = [("ears", self.transcriber)] + ([] if keep_voice else [("voice", self.speaker)])
 
         def work() -> None:
+            lease, self._gpu_lease = getattr(self, "_gpu_lease", None), None
+            if lease is not None:
+                lease.end()
             for name, thing in things:
                 unloader = getattr(thing, "unload", None)
                 if unloader is None:

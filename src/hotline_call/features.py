@@ -46,6 +46,7 @@ FEATURES = (
     Feature("streamed_greeting", True, (), "greeting and apologies through the streamed voice"),
     Feature("bridge", True, (), "'spoji me sa <agent>' puts a live agent on the call"),
     Feature("bridge_mode", "direct", ("direct", "relay"), "connected agent speaks as-is, or re-spoken by Haiku"),
+    Feature("gpu_lease", True, (), "ask gpu-share to make room on the GPU for the call (no broker: no effect)"),
     Feature("inbound_engine", "haiku", ("haiku", "classic"), "who answers when he calls hotline"),
 )
 BY_NAME = {f.name: f for f in FEATURES}
