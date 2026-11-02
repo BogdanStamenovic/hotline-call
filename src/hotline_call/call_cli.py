@@ -20,14 +20,13 @@ declined. It is a real answer and worth distinguishing from ringing out: a
 decline means he saw it and said not now, so escalating again immediately is
 the wrong move.
 
-**Who talks on the call** (Bogdan, 2026-10-16: "Hotline-call uses stock
-personaplex from now on"). A call to HIM is held by PersonaPlex, an English
-full-duplex speech model, unless `--engine classic` asks for the Serbian
-ASR + Claude + TTS loop. A call to anyone else (a registry guest, `to=` in the API) stays
-classic unless `--engine personaplex` is given. If PersonaPlex cannot start, the
-call goes out on the classic path and stderr says so. With PersonaPlex the call
-returns after he hangs up, with a transcript of both sides (`him:` / `voice:`)
-made after the call, not a single answer.
+**Who talks on the call** (Bogdan, 2026-11-03: change the default engine from
+PersonaPlex to "the current thing"). A call to HIM is held by the Haiku voice:
+Haiku 5.5 over the API streamed into his cloned voice, with read-only lookups and
+"spoji me sa <agent>". `--engine classic` asks for the older Serbian ASR + Claude
++ TTS loop. A call to anyone else (a registry guest, `to=` in the API) stays
+classic. PersonaPlex is no longer used; `--engine personaplex` works only while
+it is still installed, and falls back to the classic path if it cannot start.
 
 **Falling back is the default.** If the call cannot be delivered at all -- the
 daemon is down, no transport is registered, the phone is off the network -- this
@@ -122,7 +121,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--engine",
         default="",
         choices=["", "personaplex", "classic", "haiku"],
-        help="who talks on the call. Default: 'personaplex' for a call to Bogdan, "
+        help="who talks on the call. Default: 'haiku' for a call to Bogdan (since "
+        "2026-11-03; PersonaPlex is no longer used), "
         "'classic' for a call to anyone else. 'personaplex': an English full-duplex "
         "speech model (PersonaPlex-7B on the local GPU) holds the whole call; the reason "
         "and --context become its brief; it returns after he hangs up, with a "

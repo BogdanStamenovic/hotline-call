@@ -1405,7 +1405,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         api_key=os.environ.get("HOTLINE_API_KEY", ""),
         # Bogdan, 2026-10-16: "Hotline-call uses stock personaplex from now on." Calls
         # to him only; guests stay on the Serbian path. "" restores the old default.
-        default_engine=os.environ.get("HOTLINE_IOS_DEFAULT_ENGINE", "personaplex").strip().lower(),
+        # Haiku since 2026-11-03, his call: PersonaPlex is no longer used (the
+        # operator removes it and its venvs). Asking for it still works only
+        # while it exists; if it cannot start, the call falls back as before.
+        default_engine=os.environ.get("HOTLINE_IOS_DEFAULT_ENGINE", "haiku").strip().lower(),
         gpu_handoff=lambda: GpuHandoff(health=speaker.health if speaker is not None else None),
     )
     if not service.can_talk:
