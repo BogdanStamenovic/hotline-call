@@ -89,6 +89,23 @@ def _is_invented(text: str) -> bool:
     return text.lower().strip(" .,!?…").strip() in HALLUCINATIONS
 
 
+def _trim() -> None:
+    """Hand freed heap back to the OS.
+
+    Dropping the model frees its memory to glibc, which keeps it: measured
+    2026-11-02, five load/transcribe/unload cycles of large-v3 left RSS at
+    ~1,950 MB after every unload, and `malloc_trim(0)` brought it to 513 MB (the
+    CUDA libraries) every time. Without this a daemon that loads Whisper per
+    call holds ~1.5 GB of nothing between calls, and grew to 4.5 GB in swap.
+    Best effort: not glibc, no trim."""
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
 class Ears:
     """One Whisper model, and the phone-call settings around it."""
 
@@ -117,6 +134,10 @@ class Ears:
         self.compute_type = compute_type
         self.language = language
         self._model: Any = None
+        # What was asked for. A CPU fallback changes the three fields above for
+        # that one load only: it used to stick, so one moment of a full GPU left
+        # every later call on `small` until the daemon restarted.
+        self._wanted = (model, device, compute_type)
 
     def __repr__(self) -> str:
         return f"Ears({self.model_name} on {self.device}/{self.compute_type}, {self.language})"
@@ -125,6 +146,8 @@ class Ears:
         if self._model is not None:
             return
         from faster_whisper import WhisperModel
+
+        self.model_name, self.device, self.compute_type = self._wanted
 
         if self.device == "cuda":
             found = preload_cuda()
@@ -140,6 +163,7 @@ class Ears:
             # call. `small` on this CPU is 0.36x realtime, which is slow and
             # usable; no transcriber at all is a phone call that cannot hear.
             log.warning("GPU transcriber unavailable (%s); falling back to CPU", exc)
+            _trim()        # what the failed GPU load allocated, before loading another
             self.device, self.compute_type = "cpu", "int8"
             self.model_name = os.environ.get("HOTLINE_IOS_ASR_CPU_MODEL", "small")
             self._model = WhisperModel(self.model_name, device="cpu", compute_type="int8")
@@ -163,6 +187,7 @@ class Ears:
             return False
         self._model = None
         gc.collect()
+        _trim()
         log.info("%r unloaded", self)
         return True
 
