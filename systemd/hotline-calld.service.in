@@ -35,6 +35,12 @@ ExecStart=@DIR@/.venv/bin/python -m hotline_call.daemon --host @HOST@ --port @PO
 # doorbell until someone notices by hand.
 Restart=always
 RestartSec=5
+# A backstop, not a budget. A Whisper load peaks at ~3.4 GB of host RAM
+# (measured 2026-11-02) and Ears hands it back after every call; 5 GB only
+# trips on a real runaway, and then this daemon restarts instead of the box
+# going OOM and taking something unrelated with it (11-01 03:24). Lower would
+# kill it in the middle of the very load a call needs.
+MemoryMax=5G
 
 [Install]
 WantedBy=default.target
