@@ -71,6 +71,10 @@ async def test_health_reports_whether_the_ring_survives_a_locked_phone():
         # endpoint rather than buried in a doc.
         assert "rings_when_closed" in body
         assert body["transport"] == "loopback"
+        assert body["voice_legs"] == 0
+        service._calls_holding_models = 1          # a ring or a call in progress
+        body = await asyncio.to_thread(get, 18790, "/health")
+        assert body["voice_legs"] == 1
     finally:
         await server.close()
 

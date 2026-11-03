@@ -980,6 +980,11 @@ def build_server(service: Service, host: str | Sequence[str], port: int) -> Any:
             # when inbound is switched off.
             "inbound": service.inbound.status() if service.inbound is not None else None,
             "active_calls": service.open_calls(),
+            # Rings in progress plus calls on the line, either direction: the
+            # models' refcount. Unlike `active_calls`, which counts open
+            # conversations (an answered call's stays open), this is zero
+            # exactly when restarting cannot cut anyone off.
+            "voice_legs": service._calls_holding_models,
             "default_engine": service.default_engine or "classic",
             "listening_on": [f"{h}:{service.listen_port}" for h in service.listen_hosts],
             # Whether the app is getting its copy of each call.
