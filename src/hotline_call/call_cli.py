@@ -128,7 +128,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "'classic': the Serbian ASR + Claude + TTS loop, which returns his answer. "
         "'haiku': classic, but the voice is Haiku 5.5 over the API with its tokens "
         "streamed into cvoiced, so it starts speaking before the reply is written; "
-        "it cannot look anything up. Falls back to classic without an API key",
+        "it has read-only lookups (files, grep, git log, a sandboxed read-only "
+        "bash) and can relay to or connect agents. Falls back to classic without "
+        "an API key",
     )
     parser.add_argument("-q", "--quiet", action="store_true", help="suppress non-error output")
     return parser
