@@ -70,7 +70,8 @@ def test_a_spoken_name_finds_the_agent_with_spaces_for_hyphens():
 
 
 @pytest.mark.parametrize("name", ["manager-6", "hotline 80"])
-def test_the_operator_and_the_deploying_manager_are_never_connected(name):
+def test_a_denied_agent_is_never_connected(name):
+    # The fake still denies manager-6 so a non-operator deny entry stays covered.
     b, hot = bridge()
     with pytest.raises(BridgeError, match="cannot be connected"):
         b.connect(name)
@@ -91,9 +92,10 @@ def test_an_unknown_name_says_who_is_live():
     assert "tells-09" in str(err.value) and "hotline-80" not in str(err.value)
 
 
-def test_the_real_deny_list_defaults_to_the_operator_and_manager_6(monkeypatch):
+def test_the_real_deny_list_defaults_to_only_the_operator(monkeypatch):
+    # manager-6 left the default on 2026-11-04: he asked to be put through to it.
     monkeypatch.delenv("HOTLINE_IOS_BRIDGE_DENY", raising=False)
-    assert set(agentbridge.Hotline().deny) == {"manager-6", "hotline-80"}
+    assert agentbridge.Hotline().deny == ("hotline-80",)
     monkeypatch.setenv("HOTLINE_IOS_BRIDGE_DENY", "a, B")
     assert agentbridge.Hotline().deny == ("a", "b")
 
@@ -369,3 +371,61 @@ def test_message_agent_queues_without_interrupting_even_a_denied_agent():
                                              his_words="reci manageru 6 da sve radi")
     assert out.startswith("SENT") and interrupted == []
     assert sent and "Sve radi." in sent[0][1] and "Whisper" in sent[0][1]
+
+
+# -- leaving the agent, and what Haiku is told ----------------------------------
+
+
+@pytest.mark.parametrize("said", [
+    "Super, odvežimo je.",          # Whisper, live call 2026-11-04 20:38
+    "Одвежиме.",                    # same call, same phrase, in Cyrillic
+    "odveži me", "Odvezi me molim te", "odjavi me", "Одјави ме.",
+    "dobro, prekini vezu sa njim", "otkači ga", "vrati me na haiku",
+    "završio sam sa njim", "ok disconnect", "log me out",
+])
+def test_leaving_the_agent_is_recognised(said):
+    b, hot = bridge()
+
+    class Haiku:
+        def reply_stream(self, text, lookups=True):
+            yield "haiku"
+
+    ask = b.stream_for(Haiku())
+    b.connect("tells")
+    assert list(ask(said)) == ["haiku"], said
+    assert not b.connected
+    assert "CALL ENDED" in hot.log[-1][2]
+
+
+@pytest.mark.parametrize("said", [
+    "odvezi auto do garaže", "javi mi kad završiš", "vrati vrednost iz funkcije",
+    "proveri log fajl", "izađi iz foldera",
+])
+def test_ordinary_speech_does_not_release_the_agent(said):
+    b, _ = bridge()
+
+    class Haiku:
+        def reply_stream(self, text, lookups=True):
+            yield "haiku"
+
+    ask = b.stream_for(Haiku())
+    b.connect("tells")
+    list(ask(said))
+    assert b.connected, said
+
+
+def test_the_roster_says_a_denied_agent_can_still_be_messaged():
+    # 2026-11-04: "NOT CONNECTABLE" made Haiku refuse to message hotline-80.
+    b, _ = bridge()
+    roster = b.roster()
+    line = next(x for x in roster.splitlines() if x.startswith("hotline-80"))
+    assert "message_agent works" in line and "NOT CONNECTABLE" not in roster
+    manners = b.manners()
+    assert "EVERY agent" in manners and "hotline-80" in manners
+    assert "odveži me" in manners
+
+
+def test_the_connected_agent_is_told_how_he_leaves():
+    b, hot = bridge()
+    b.connect("tells")
+    assert "odveži me" in hot.log[-1][2]

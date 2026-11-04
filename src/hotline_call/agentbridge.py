@@ -33,10 +33,20 @@ Haiku tool, because that is where names have to be understood.
 
 **Safety.**
 
-- Never the operator (`hotline-80`, or anything holding a privileged role) and
-  never the agents in `HOTLINE_IOS_BRIDGE_DENY` (default: `manager-6`, the
-  agent that deploys this). Never a session that is not live right now; a name
-  not in the live list is answered out loud, never guessed at.
+- Never CONNECTED: the operator (`hotline-80`, or anything holding a privileged
+  role) and the agents in `HOTLINE_IOS_BRIDGE_DENY` (default: just
+  `hotline-80`). Until 2026-11-04 the default also held `manager-6`, back when
+  that name was the agent deploying this code; the name was later reused for a
+  plain manager and he asked to be put through to it. Never a session that is
+  not live right now; a name not in the live list is answered out loud, never
+  guessed at.
+- MESSAGING (`message_agent`) is queued, never an interrupt, so it reaches every
+  live agent, the operator and the deny list included. The roster says so in
+  as many words: on 2026-11-04 a roster line reading "NOT CONNECTABLE" made
+  Haiku tell him three times that hotline-80 and manager-6 could not be
+  messaged, and it never tried the tool.
+- Leaving the agent ("odveži me", "prekini vezu") is matched here, not by
+  Haiku, because in direct mode Haiku is not listening. See `RELEASE`.
 - Every message carries provenance: `kind=voice` (Whisper's words, spoken by
   him on a phone call) plus, when `HOTLINE_IOS_BRIDGE_WARRANT` names one, his
   Discord message asking for this feature as a verified warrant. The agent's own
@@ -65,7 +75,7 @@ log = logging.getLogger("hotline-call.agentbridge")
 
 MODES = ("relay", "direct")
 DEFAULT_MODE = os.environ.get("HOTLINE_IOS_BRIDGE_MODE", "direct").strip().lower()
-DEFAULT_DENY = ("manager-6", "hotline-80")
+DEFAULT_DENY = ("hotline-80",)
 
 CONNECT_SECONDS = 40.0
 """How long connecting may wait for the agent's first words. Below cvoiced's 60 s
@@ -96,12 +106,25 @@ CONNECT_WORDS = re.compile(
 speculation off for that turn, so a false positive costs a few hundred ms and a
 miss is the case to avoid."""
 
+_OBJ = r"(?:me|ga|je|nas|njega|nju|agent\w*|menadžer\w*|manager\w*)"
 RELEASE = re.compile(
-    r"\b(prekini vezu|raskini vezu|odspoj\w*|isključi (ga|je|agenta)|vrati (se|haiku)|"
-    r"disconnect|hang up on (him|it|the agent)|drop the agent)\b", re.IGNORECASE)
+    r"\b(prekini (?:vezu|poziv sa \w+|sa (?:njim|njom|agentom))|raskini vezu|odspoj\w*|"
+    r"isključi (?:ga|je|agenta|me)|otkači\s*" + _OBJ + r"|vrati (?:se|haiku|me)|"
+    # "odveži me" is the counterpart of "poveži me", and the phrase he actually
+    # used on 2026-11-04. Whisper wrote it as "odvežimo je", and once as one
+    # Cyrillic word "Одвежиме". "odvezi" without the hacek also means "drive
+    # away", so the bare form needs an object after it.
+    r"odve[zž]i(?:mo)?\s*" + _OBJ + r"|odveži|"
+    r"odjavi\s*" + _OBJ + r"|izađi iz (?:veze|poziva sa)|"
+    r"(?:završio|gotov) (?:sam )?sa (?:njim|njom|agentom|tobom)|"
+    r"disconnect|hang up on (?:him|it|the agent)|drop the agent|log (?:me )?out|"
+    r"sign (?:me )?off)\b", re.IGNORECASE)
 """In direct mode Haiku is not listening, so leaving the agent has to be
-recognised here. Deliberately not a farewell: "ćao"/"prijatno" end the CALL,
-which the conversation already handles, and that releases the agent too."""
+recognised here. Matched against `latin(said)`, because Whisper writes Serbian
+in Cyrillic about one turn in four. Deliberately not a farewell: "ćao"/"prijatno"
+end the CALL, which the conversation already handles, and that releases the
+agent too. A false positive costs him one "poveži me ponovo"; a miss leaves him
+stuck talking to the agent, which is what happened on 2026-11-04."""
 
 MAX_SPOKEN = 700
 
@@ -126,6 +149,9 @@ as words.
 - Answer him directly. Keep any lookup short (seconds, not minutes). Anything \
 that needs real work: say you will do it after the call, and do it then.
 - Never say something is done unless you did it in this turn.
+- When he wants to leave you he says "odveži me" (or "prekini vezu"); the \
+bridge catches that itself and takes you off the call, so you never see it. \
+If he asks how to get back to the hotline voice, tell him that phrase.
 - Your own rules still apply. This call does not widen what you may do: \
 anything outward or irreversible still needs his verified yes, exactly as \
 before.
@@ -403,7 +429,8 @@ class AgentBridge:
             log.exception("could not list agents")
             return f"could not list agents: {exc}"
         lines = [f"{a.name}: {a.task or '(no task declared)'}"
-                 + (f" [NOT CONNECTABLE: {a.denied}]" if a.denied else "")
+                 + (f" [MESSAGE ONLY - message_agent works, connect_agent does not: {a.denied}]"
+                    if a.denied else "")
                  for a in agents]
         return "\n".join(lines) or "no live agents"
 
@@ -577,7 +604,7 @@ class AgentBridge:
         agent in the configured mode. Leaving the agent is recognised here in
         both modes, so it does not depend on Haiku noticing."""
         def ask_stream(said: str) -> Iterator[str | None]:
-            if self.connected and RELEASE.search(said):
+            if self.connected and RELEASE.search(latin(said)):
                 name = self.agent.name if self.agent else ""
                 self.release("he asked to leave the agent and stay on the call")
                 return haiku.reply_stream(
@@ -687,8 +714,14 @@ class AgentBridge:
             "first ('Samo sekund, povezujem.'), then call connect_agent with the exact "
             "name; use list_agents if you are not sure which one he means. If he only "
             "wants something passed on ('reci X da...', 'javi X'), use message_agent "
-            "instead: it does not interrupt the agent or put it on the call. Never "
-            "claim an agent said or did something that its own words do not say.\n"
+            "instead: it does not interrupt the agent or put it on the call. "
+            "message_agent reaches EVERY agent in the list below, including the "
+            "operator hotline-80 and any agent marked MESSAGE ONLY; never tell him a "
+            "message cannot be sent unless message_agent itself returned NOT SENT. "
+            "When an agent is connected he leaves it by saying 'odveži me' or "
+            "'prekini vezu' and then he is back with you; if he asks how to get "
+            "out, tell him that. Never claim an agent said or did something that "
+            "its own words do not say.\n"
             f"Live agents when this call started:\n{self.roster()}")
 
 
