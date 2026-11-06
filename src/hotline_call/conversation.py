@@ -292,7 +292,15 @@ class AnsweredCall:
             log.error("answered call has no media socket to speak on")
             return
         log.info("ANSWERED -- his media at %s:%d", answer.host, answer.port)
-        call = VoiceCall(media_sock, answer, srtp_key, srtp_salt)
+        self.hold(VoiceCall(media_sock, answer, srtp_key, srtp_salt))
+
+    def hold(self, call: VoiceCall) -> None:
+        """Run the conversation on a call whose media is already up.
+
+        The SIP entry point above gets here after parsing SDP and keying SRTP. A
+        transport that terminates its own protocol -- WhatsApp through wa-call --
+        builds the `VoiceCall` itself (`VoiceCall.over`) and calls this directly.
+        """
         if self.recorder is not None:
             call.record()
             self.recorder.rate, self.recorder.codec = call.rate, call.codec.describe()

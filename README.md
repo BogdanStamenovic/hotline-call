@@ -26,6 +26,7 @@ agent ──hotline-call──▶ hotline-calld :8792 ──SIP INVITE──▶ 
 | piece | what it does |
 |---|---|
 | `ring/sip.py`, `ring/telegram.py` | the doorbells: an outbound SIP INVITE with digest auth, or a Telegram user-account call |
+| `ring/whatsapp.py`, `media/pcmlink.py` | a WhatsApp call through [wa-call](https://github.com/BogdanStamenovic/wa-call)'s daemon, its audio as raw PCM over a Unix socket |
 | `ring/watch.py`, `ring/chain.py` | a ring counts only with evidence it rang (`180 Ringing`); a chain falls through on that evidence |
 | `ring/inbound.py` | keeps the account registered so he can dial hotline, answers his INVITE |
 | `media/` | RTP, SRTP, Opus and G.711, jitter buffer, Whisper ears, the cvoiced TTS client, recording |
@@ -52,16 +53,69 @@ it is only missing from the app, and `/health` says so under `app_mirror`.
 
 | route | who calls it | body → reply |
 |---|---|---|
-| `POST /api/v1/call` | `hotline-call`, `hotline-registry`, any agent | unchanged from hotline-iosd: `{reason, context, source, agent, to, callee, engine, transport, ring_timeout, timeout, wait}` → `{call_id, conversation, state, reply, transcript, detail, waited_seconds, transport, rings_when_closed, fake, engine, note}` |
+| `POST /api/v1/call` | `hotline-call`, `hotline-registry`, any agent | unchanged from hotline-iosd: `{reason, context, source, agent, to, whatsapp, via, via_order, callee, engine, transport, ring_timeout, timeout, wait}` → `{call_id, conversation, state, reply, transcript, detail, waited_seconds, transport, via, rings_when_closed, fake, engine, note}` (see [WhatsApp](#whatsapp) for `whatsapp`/`via`) |
 | `POST /api/v1/call/reply` | hotline-iosd | `{conversation, text}` → `{conversation, known, waiting?}` |
 | `POST /api/v1/call/hangup` | hotline-iosd | `{call_id}` → `{call_id, ended}` |
-| `GET /health` | anyone | `ok` (false for a fake doorbell or one that did not start), `ring_ready`, `can_talk`, `transport`, `transports_available`, `inbound`, `active_calls`, `app_mirror`, `degradations` |
+| `GET /health` | anyone | `ok` (false for a fake doorbell or one that did not start), `ring_ready`, `can_talk`, `transport`, `transports_available`, `inbound`, `active_calls`, `app_mirror`, `whatsapp` (wa-call's daemon and link state, or null), `degradations` |
 | `GET /api/v1/ping` | probes | `{ok: true}` |
 
 Same gate as hotlined and hotline-iosd: loopback always allowed, otherwise the
 `HOTLINE_ALLOW_IPS` allowlist, plus `X-Hotline-Key` when `HOTLINE_API_KEY` is set.
 It binds `127.0.0.1` and the tailnet address `100.72.2.62` on port 8792 (8790
 and 8791 are taken there); if the tailnet bind fails it exits so systemd retries.
+
+## WhatsApp
+
+Bogdan's request, 2026-11-06: ring a person on the channel they prefer, WhatsApp
+included. The protocol stack is not here. `wa-call daemon` (his Rust repo, on
+whatsapp-rust) is a linked companion device of a WhatsApp account. hotline-calld
+asks it over its control socket to dial, and to carry the call's audio on a Unix
+socket that hotline-calld listens on (`wa-call --socket`). That socket becomes the
+same `VoiceCall` a SIP call has, through `VoiceCall.over(PcmPump)`, so the same
+voice, ears, barge-in and recording hold the call.
+
+```
+place() ─▶ WhatsAppTransport ─dial {to, spec.audio.socket}─▶ wa-call daemon ─▶ WhatsApp
+               ▲  peer-ringing / accepted / rejected / ended          │
+               └── $XDG_RUNTIME_DIR/hotline-call/wa-<id>.sock ◀─ s16le 16 kHz ─┘
+```
+
+**Routing.** `via` on `POST /api/v1/call`:
+
+| request | rings |
+|---|---|
+| no `to`, no `whatsapp` (a call to him) | the configured doorbell, as before; `via: whatsapp` uses `HOTLINE_CALL_WA_BOGDAN` |
+| `to` and/or `whatsapp`, `via` empty or `auto` | the channels they have an address on, in `via_order` (default `sip, whatsapp`), falling through on unreachable |
+| `via: sip` or `via: whatsapp` | that channel only; refused (400) without an address for it, never swapped for the other |
+
+A guest is never rung on a doorbell that can only reach him (Telegram,
+loopback): with no usable channel the call is a 503. `hotline-registry call` sends
+the person's numbers and their order; the daemon knows nothing about the registry.
+
+**Evidence that it rang.** `peer-ringing` is the callee's device sending
+`<preaccept>`, the WhatsApp counterpart of SIP's `180`, and it is what
+`ConfirmedRing` waits for (8 s). wa-call's `connected` is not used, since it fires
+on relay allocation, which can happen while the phone is offline. A WhatsApp ring
+with no `peer-ringing` is `CallUnreachable`: the dial is hung up and `auto` moves on
+to SIP, with a line in `degradations`.
+
+**Degrading.** No wa-call daemon, an unlinked one, or a refused dial is
+`CallUnreachable`, so an `auto` call rings SIP instead. `/health` has a `whatsapp`
+object (`daemon`, `logged_in`, `error`). While WhatsApp is not usable,
+`degradations` also says so.
+
+**Inbound.** It is opt-in, by number (`HOTLINE_CALL_WA_ANSWER`). The linked account
+may be his personal one, and then every caller would reach this daemon. Calls
+from other numbers are left alone and ring his phone as they would without
+wa-call. An answered inbound call is the same "he called hotline" leg that SIP
+inbound gets.
+
+**Why a socket and not PipeWire.** wa-call's `--live` mode with two null sinks
+would have needed no wa-call change. Measured here on 2026-11-06 with 20 ms frames
+written in real time, one `pw-cat` playback-to-monitor-capture hop took 135-255 ms
+(median 191 ms, n=11) and crept up about 24 ms/s. A bridge needs one hop per
+direction, plus nodes to clean up after a crash. The Unix socket measured
+0.005 ms median and 0.1 ms max (n=200).
 
 ## Install
 
@@ -144,6 +198,10 @@ has always used, so `HOTLINE_ALLOW_IPS` there still wins), then
 | `HOTLINE_CALL_HOST`, `HOTLINE_CALL_PORT` | `100.72.2.62`, `8792` | where hotline-calld listens |
 | `HOTLINE_CALL_APP_URL` | `http://127.0.0.1:8789` | hotline-iosd, for the mirror |
 | `HOTLINE_CALL_APP_MIRROR` | `1` | `0`: keep calls out of the app |
+| `HOTLINE_CALL_WHATSAPP` | `1` | `0`: no WhatsApp transport at all |
+| `HOTLINE_CALL_WA_BOGDAN` | unset | his WhatsApp number, for `--via whatsapp` on a call to him |
+| `HOTLINE_CALL_WA_ANSWER` | unset | comma-separated numbers whose WhatsApp calls hotline answers; unset answers none |
+| `WA_CALL_SOCKET` | `$XDG_RUNTIME_DIR/wa-call.sock` | wa-call's control socket |
 
 ## The fallback on pigion
 
@@ -221,7 +279,7 @@ No GPU, no models: the suite fakes Whisper, cvoiced and the SIP peer.
 PYTHONPATH=src:$HOME/data/hotline/src .venv/bin/python -m pytest -q tests
 ```
 
-396 passed, 1 skipped in about 252 s on archserver (2026-11-03), in the venv
+442 passed, 2 skipped in about 262 s on archserver (2026-11-06), in the venv
 `ownbox install` builds.
 
 ## Limitations
@@ -242,6 +300,20 @@ PYTHONPATH=src:$HOME/data/hotline/src .venv/bin/python -m pytest -q tests
   path that was measured; a call that bypassed the relay would need his phone
   to reach pigion's tailnet address.
 
+- **WhatsApp calls are untested against WhatsApp.** No account is linked on
+  archserver. Everything above is exercised against a fake wa-call daemon that
+  speaks its real control protocol and audio socket (`tests/test_whatsapp.py`),
+  and the conversation loop has been run over the PCM link. The real call
+  path, from the dial through to whether `preaccept` arrives and how the audio
+  sounds, has not been run.
+- **Calls from the linked account come from that account's number.** If it is
+  his personal WhatsApp, a guest sees Bogdan calling. The voice says it calls
+  on his behalf, but the caller ID is his. Calling him over WhatsApp from his
+  own account is impossible, which is why `via: whatsapp` to him needs a
+  number of its own.
+- **Inbound matching needs a phone number.** WhatsApp may identify a caller
+  only by a LID; wa-call passes `caller_pn` when the offer has one. A call that
+  carries neither is not answered.
 - **It depends on hotline's source tree being at `~/data/hotline/src`.** hotline
   is not packaged; this reads it over PYTHONPATH like hotline-iosd did.
 - **Whisper on CUDA borrows cvoice's cuBLAS/cuDNN wheels.** Without cvoice

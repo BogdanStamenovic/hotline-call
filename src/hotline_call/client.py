@@ -94,6 +94,8 @@ class CallOutcome:
     engine: str = ""
     # Why the call is not what was asked for, e.g. an unknown engine was asked for.
     note: str = ""
+    # The channel that carried the call ("sip", "whatsapp"); empty from an older daemon.
+    via: str = ""
 
 
 def _post(path: str, payload: dict[str, Any], *, url: str, timeout: float) -> dict[str, Any]:
@@ -146,6 +148,9 @@ def place_call(
     to: str = "",
     callee: str = "",
     engine: str = "",
+    via: str = "",
+    whatsapp: str = "",
+    via_order: list[str] | None = None,
     url: str = DEFAULT_URL,
 ) -> CallOutcome:
     """Ring a phone and, unless `wait` is false, come back with what was said.
@@ -170,7 +175,15 @@ def place_call(
         payload["engine"] = engine
     if to:
         payload["to"] = to
+    if whatsapp:
+        # E.164. With `to` as well, `via`/`via_order` say which is tried first.
+        payload["whatsapp"] = whatsapp
+    if to or whatsapp:
         payload["callee"] = callee or "them"
+    if via:
+        payload["via"] = via
+    if via_order:
+        payload["via_order"] = list(via_order)
     # The HTTP timeout has to outlive the call itself, or a long conversation
     # looks to the caller exactly like a dead daemon.
     try:
@@ -195,6 +208,7 @@ def place_call(
         detail=str(data.get("detail", "")),
         engine=str(data.get("engine", "")),
         note=str(data.get("note", "")),
+        via=str(data.get("via", "")),
     )
 
 

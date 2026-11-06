@@ -238,6 +238,99 @@ class Service:
         known = ", ".join(sorted(self.links)) or "none"
         raise HttpError(400, f"unknown transport {requested!r}; this daemon has: {known}")
 
+    def _route(self, body: dict[str, Any], to: str, whatsapp: str,
+               via: str) -> tuple[Any, str]:
+        """Pick the doorbell for one call from `via`, `to`, `whatsapp` and `transport`.
+
+        Bogdan, 2026-11-06: a person who prefers WhatsApp is rung on WhatsApp.
+        `via` says how: `sip`, `whatsapp`, or `auto`/empty. For a guest, auto
+        rings in `via_order` (the registry sends the person's preference;
+        default sip first) over the channels they have an address on, falling
+        through to the next on `CallUnreachable` -- WhatsApp unlinked, wa-call
+        down, no sign the phone rang. An explicit `via` is never silently
+        swapped for another channel: it works or it is refused.
+
+        Returns (doorbell, note); the note says when a requested channel had to
+        be left out, so the caller can tell.
+        """
+        from hotline.httpd import HttpError
+
+        if via not in ("", "auto", "sip", "whatsapp"):
+            raise HttpError(400, f"unknown via {via!r}; use sip, whatsapp or auto")
+        transport = str(body.get("transport", "")).strip().lower()
+        guest = bool(to or whatsapp)
+        if not guest:
+            # Him. Unchanged unless asked: --transport, or the configured chain.
+            if via == "whatsapp":
+                link = self.links.get("whatsapp")
+                if link is None:
+                    raise HttpError(503, "this daemon has no whatsapp transport")
+                return link, ""
+            if via == "sip":
+                return self._resolve_transport("sip"), ""
+            return self._resolve_transport(transport), ""
+
+        # Somebody else. SIP and WhatsApp are the only transports that can dial
+        # an arbitrary person. Every other one -- Telegram, loopback -- reaches
+        # exactly one person, and that person is HIM: falling through to one of
+        # those would ring Bogdan with a question meant for somebody else and
+        # report it as delivered. So only these two, and only with an address.
+        if transport not in ("", "auto", "sip", "whatsapp"):
+            raise HttpError(400, "'to' can only be rung over the sip or whatsapp transport")
+        if not via and transport in ("sip", "whatsapp"):
+            via = transport
+        have = {"sip": bool(to), "whatsapp": bool(whatsapp)}
+        if via in ("sip", "whatsapp"):
+            order = [via]
+        else:
+            raw = body.get("via_order") or ["sip", "whatsapp"]
+            if isinstance(raw, str):
+                raw = raw.split(",")
+            order = [str(v).strip().lower() for v in raw]
+            order = [v for v in dict.fromkeys(order) if v in have]
+            order += [v for v in ("sip", "whatsapp") if v not in order]
+        usable = [v for v in order if have[v] and v in self.links]
+        if not usable:
+            wanted = order[0]
+            if not have[wanted]:
+                raise HttpError(400, f"via {wanted} needs an address: "
+                                     + ("'to' (a SIP address)" if wanted == "sip" else "'whatsapp' (E.164)"))
+            raise HttpError(
+                503,
+                f"calling someone other than Bogdan needs the {wanted} transport, "
+                f"and this daemon has: {', '.join(sorted(self.links)) or 'none'}",
+            )
+        note = ""
+        missing = [v for v in order if have[v] and v not in self.links]
+        if missing:
+            note = f"no {', '.join(missing)} transport on this daemon; rang {usable[0]}"
+        if len(usable) == 1:
+            return self.links[usable[0]], note
+        from .ring.chain import RingChain
+
+        def fell(name: str, why: str) -> None:
+            self.degradations.append(f"{name} could not ring this call ({why}); trying the next channel")
+
+        return RingChain([self.links[v] for v in usable], on_fallthrough=fell), note
+
+    def whatsapp_status(self) -> dict[str, Any] | None:
+        link = self.links.get("whatsapp")
+        if link is None:
+            return None
+        inner = getattr(link, "inner", link)
+        status = getattr(inner, "status", None)
+        return status() if status is not None else None
+
+    def whatsapp_inbound(self, number: str, hung_up: Any) -> Any:
+        """`WhatsAppTransport.on_call`. Runs on a wa-call thread; built on the loop."""
+        if self.loop is None:
+            return None
+        import types
+
+        call = types.SimpleNamespace(caller=number, far_end_hung_up=hung_up)
+        future = asyncio.run_coroutine_threadsafe(self._inbound_leg(call), self.loop)
+        return future.result(timeout=10.0)
+
     # ---- giving an answered ring a voice ---------------------------------
 
     def _warm_models(self) -> None:
@@ -665,27 +758,22 @@ class Service:
         reply_timeout = float(body.get("timeout", 900.0))
         wait = bool(body.get("wait", True))
 
-        doorbell = self._resolve_transport(str(body.get("transport", "")))
-        if to:
-            # SIP is the only transport that can dial an arbitrary address. Every
-            # other one -- Telegram, the local app socket, loopback -- reaches
-            # exactly one person, and that person is HIM. Falling through to one
-            # of those on a registry call would ring Bogdan with a question meant
-            # for somebody else and report it as delivered, which is the worst
-            # failure this endpoint has available to it. So: resolve to the bare
-            # SIP link, or refuse out loud.
-            from hotline.httpd import HttpError
+        note = ""
+        via = str(body.get("via", "") or "").strip().lower()
+        whatsapp = _whatsapp_number(body.get("whatsapp", ""))
+        if whatsapp:
+            target.metadata["whatsapp"] = whatsapp
+            if not to:
+                # A guest only on WhatsApp still has to read as a guest: everything
+                # that decides "is this him?" looks at `address`.
+                from .ring.whatsapp import ADDRESS_PREFIX
 
-            sip_link = self.links.get("sip")
-            if sip_link is None:
-                raise HttpError(
-                    503,
-                    "calling someone other than Bogdan needs the sip transport, "
-                    f"and this daemon has: {', '.join(sorted(self.links)) or 'none'}",
-                )
-            if str(body.get("transport", "")).strip().lower() not in ("", "auto", "sip"):
-                raise HttpError(400, "'to' can only be rung over the sip transport")
-            doorbell = sip_link
+                target.address = ADDRESS_PREFIX + whatsapp
+                if not str(body.get("callee", "")).strip():
+                    target.callee = "someone"
+        doorbell, via_note = self._route(body, to, whatsapp, via)
+        if via_note:
+            note = via_note
 
         conversation, events = self._open_conversation(agent, "ring")
         # Put the question in the conversation before ringing, so that whenever
@@ -705,11 +793,10 @@ class Service:
         cursor = events.latest
 
         engine = str(body.get("engine", "") or "").strip().lower()
-        note = ""
         if engine not in ENGINES:
             # An agent written against an engine that no longer exists (PersonaPlex,
             # removed 2026-11-03) or a typo. Neither is worth failing a call over.
-            note = f"unknown engine {engine!r}; the call used the default engine instead"
+            note = "; ".join(filter(None, [note, f"unknown engine {engine!r}; the call used the default engine instead"]))
             log.warning("call %s: %s", conversation, note)
             engine = ""
         if engine in ("", "auto"):
@@ -847,6 +934,9 @@ class Service:
             "detail": detail,
             "waited_seconds": round(time.monotonic() - began, 1),
             "transport": getattr(used, "name", "?"),
+            # The channel that actually carried it: a chain's `used` link, or the
+            # one transport. "whatsapp", "sip", ...
+            "via": str(getattr(used, "used", None) or getattr(used, "name", "?")).split("+")[0],
             "rings_when_closed": bool(getattr(used, "rings_when_closed", False)),
             # Callers cannot otherwise tell a ring from a no-op: "answered via
             # loopback+confirmed" and "answered via sip+confirmed" are the same
@@ -917,6 +1007,14 @@ class _InboundLeg:
             ended = getattr(self.handler, "ended", "") or "ended"
             self._finish(f"call over: {ended}")
 
+    def hold(self, call: Any) -> None:
+        """The same, for a transport that hands over a `VoiceCall` (WhatsApp)."""
+        try:
+            self.handler.hold(call)
+        finally:
+            ended = getattr(self.handler, "ended", "") or "ended"
+            self._finish(f"call over: {ended}")
+
     def abandon(self, why: str) -> None:
         self._finish(f"not answered: {why}")
 
@@ -934,6 +1032,12 @@ class _InboundLeg:
         with contextlib.suppress(RuntimeError):  # the loop is gone: shutting down
             self.loop.call_soon_threadsafe(close)
 
+
+
+def _whatsapp_number(raw: Any) -> str:
+    from .ring.whatsapp import normalise_number
+
+    return normalise_number(str(raw or ""))
 
 
 def _speakable():
@@ -964,6 +1068,13 @@ def build_server(service: Service, host: str | Sequence[str], port: int) -> Any:
     async def health(request: Any) -> tuple[int, dict[str, Any]]:
         fake = bool(getattr(service.transport, "is_fake", False))
         service.reap()
+        # A local socket round trip with a 5 s ceiling; off the loop regardless.
+        whatsapp = await asyncio.get_running_loop().run_in_executor(None, service.whatsapp_status)
+        degradations = service.degradations[-5:]
+        if whatsapp is not None and not whatsapp.get("logged_in"):
+            degradations = [*degradations,
+                            (f"whatsapp calls unavailable ({whatsapp.get('error', 'unknown')}); "
+                             "calls preferring whatsapp fall back to sip")]
         return 200, {
             # NOT ok when the doorbell is fake. A health check that reports ok
             # while the pager rings nothing is the exact failure this endpoint
@@ -989,7 +1100,9 @@ def build_server(service: Service, host: str | Sequence[str], port: int) -> Any:
             "listening_on": [f"{h}:{service.listen_port}" for h in service.listen_hosts],
             # Whether the app is getting its copy of each call.
             "app_mirror": service.mirror.status() if service.mirror is not None else None,
-            "degradations": service.degradations[-5:],
+            # wa-call's state, or null when this daemon has no whatsapp transport.
+            "whatsapp": whatsapp,
+            "degradations": degradations,
         }
 
     @server.route("POST", "/api/v1/call")
@@ -1143,6 +1256,10 @@ def build_transport(
             from .ring.sip import SipTransport
 
             links.append(SipTransport())
+        elif name == "whatsapp":
+            from .ring.whatsapp import WhatsAppTransport
+
+            links.append(WhatsAppTransport())
         elif name == "loopback":
             from .ring.loopback import LoopbackTransport
 
@@ -1158,7 +1275,7 @@ def build_transport(
         else:
             raise SystemExit(
                 f"hotline-calld: unknown ring transport {name!r}; "
-                "known: telegram, sip, loopback"
+                "known: telegram, sip, whatsapp, loopback"
             )
     if not links:
         raise SystemExit("hotline-calld: no ring transport configured; set HOTLINE_IOS_RING")
@@ -1300,6 +1417,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "answered calls carry no audio: this daemon can ring him but not talk"
         )
 
+    if "whatsapp" not in links and os.environ.get("HOTLINE_CALL_WHATSAPP", "1") != "0":
+        # Addressable, not part of the chain that rings him: a call reaches it
+        # only with via=whatsapp, or as a guest's channel. With no wa-call
+        # installed it costs nothing but a line on /health.
+        links["whatsapp"] = build_transport(["whatsapp"])
+    wa_link = links.get("whatsapp")
+    if wa_link is not None:
+        getattr(wa_link, "inner", wa_link).on_call = service.whatsapp_inbound
     service.set_links(links)
 
     async def run() -> None:
@@ -1312,6 +1437,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             # should be visible on /health rather than fatal at boot.
             log.error("ring transport did not start: %s", exc)
             service.degradations.append(str(exc))
+        if wa_link is not None and wa_link is not transport and \
+                wa_link not in getattr(transport, "links", []):
+            try:
+                await wa_link.start()
+            except Exception:  # whatsapp must never cost the doorbell
+                log.exception("whatsapp transport did not start")
         server = build_server(service, args.host, args.port)
         await server.start()
         # `asyncio.start_server` over a list binds what it can and raises only

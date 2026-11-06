@@ -106,6 +106,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "(auto, sip, apns, page, loopback)",
     )
     parser.add_argument(
+        "--via",
+        default="",
+        choices=["", "auto", "sip", "whatsapp"],
+        metavar="{auto,sip,whatsapp}",
+        help="which channel rings him. Default: the configured doorbell (SIP). "
+        "'whatsapp' needs HOTLINE_CALL_WA_BOGDAN on the daemon and a linked wa-call "
+        "on an account that is not his own",
+    )
+    parser.add_argument(
         "--no-wait",
         action="store_true",
         help="ring and exit without waiting for him to answer",
@@ -220,6 +229,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             wait=not args.no_wait,
             transport=args.transport,
             engine=args.engine,
+            via=args.via,
         )
     except CallTimeout as exc:
         # The request outlived its deadline. If the daemon answered a fresh

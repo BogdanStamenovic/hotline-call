@@ -370,6 +370,27 @@ class VoiceCall:
         self.rx = srtp.SrtpSession(answer.srtp_key, answer.srtp_salt)
         self.ssrc = ssrc if ssrc is not None else int.from_bytes(
             struct.pack("!I", id(self) & 0xFFFFFFFF), "big")
+        codec = codecs.open_codec(answer.choice())
+        self._begin(codec, MediaPump(media_sock, self.tx, self.rx, self.remote, self.ssrc, codec))
+
+    @classmethod
+    def over(cls, pump: MediaPump) -> VoiceCall:
+        """A call whose wire is something other than SRTP: `pump` already owns it.
+
+        WhatsApp is the first (`media/pcmlink.py`): wa-call terminates the
+        protocol and hands over raw PCM, so there is no SDP, no key and no
+        socket address here -- only a pump that keeps the same 20 ms clock and
+        fills the same inbox, which is all the rest of this class touches.
+        """
+        self = cls.__new__(cls)
+        self.sock = getattr(pump, "sock", None)
+        self.remote = getattr(pump, "remote", None)
+        self.tx = self.rx = None
+        self.ssrc = 0
+        self._begin(pump.codec, pump)
+        return self
+
+    def _begin(self, codec, pump: MediaPump) -> None:
         # Frames that arrived while WE were speaking. On a barge-in these are
         # the opening of his sentence, so they are kept and handed to the next
         # receive_turn rather than dropped -- discarding them loses the first
@@ -386,12 +407,11 @@ class VoiceCall:
         self.his_voice: np.ndarray | None = None
         # The pump owns the socket and the 20 ms clock from here on. Nothing
         # else in this class touches the wire.
-        self.codec = codecs.open_codec(answer.choice())
+        self.codec = codec
         # The rate everything on this call is carried at, both directions.
         self.rate = self.codec.rate
         self.frame_samples = self.codec.frame_samples
-        self.pump = MediaPump(media_sock, self.tx, self.rx, self.remote, self.ssrc,
-                              self.codec)
+        self.pump = pump
         log.info("call carries %s (payload type %d)", self.codec.describe(), self.codec.pt)
         self.pump.start()
 
