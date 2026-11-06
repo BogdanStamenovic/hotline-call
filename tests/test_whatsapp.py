@@ -561,3 +561,27 @@ def test_the_real_conversation_runs_over_the_pcm_link():
     print(f"held {time.monotonic() - began:.1f}s, ended: {call.ended}")
     samples = np.frombuffer(bytes(heard[: len(heard) // 2 * 2]), dtype="<i2")
     assert np.abs(samples).max() > 3000, "the greeting never reached wa-call"
+
+
+async def test_an_unlinked_whatsapp_is_a_notice_not_a_degradation():
+    import urllib.request
+
+    from hotline_call.daemon import build_server
+
+    class Unlinked(Rec):
+        def status(self):
+            return {"daemon": True, "logged_in": False, "error": "not linked"}
+
+    service, _ = service_with(sip=Rec("sip"), whatsapp=Unlinked("whatsapp"))
+    server = build_server(service, "127.0.0.1", 18797)
+    await server.start()
+    try:
+        def get():
+            with urllib.request.urlopen("http://127.0.0.1:18797/health", timeout=10) as r:
+                return json.loads(r.read())
+        body = await asyncio.to_thread(get)
+    finally:
+        await server.close()
+    # Checks read a non-empty `degradations` as "the audio path is broken".
+    assert body["degradations"] == []
+    assert any("whatsapp calls unavailable" in n for n in body["notices"])

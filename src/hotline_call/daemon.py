@@ -1070,11 +1070,15 @@ def build_server(service: Service, host: str | Sequence[str], port: int) -> Any:
         service.reap()
         # A local socket round trip with a 5 s ceiling; off the loop regardless.
         whatsapp = await asyncio.get_running_loop().run_in_executor(None, service.whatsapp_status)
-        degradations = service.degradations[-5:]
+        # An unlinked WhatsApp is an optional channel being absent, not the
+        # audio path breaking, so it goes in `notices`: checks treat a
+        # non-empty `degradations` as "something is broken" (hotline-80,
+        # 2026-11-06). Kept a list of strings because the app decodes
+        # `degradations` as [String].
+        notices: list[str] = []
         if whatsapp is not None and not whatsapp.get("logged_in"):
-            degradations = [*degradations,
-                            (f"whatsapp calls unavailable ({whatsapp.get('error', 'unknown')}); "
-                             "calls preferring whatsapp fall back to sip")]
+            notices.append(f"whatsapp calls unavailable ({whatsapp.get('error', 'unknown')}); "
+                           "calls preferring whatsapp fall back to sip")
         return 200, {
             # NOT ok when the doorbell is fake. A health check that reports ok
             # while the pager rings nothing is the exact failure this endpoint
@@ -1102,7 +1106,8 @@ def build_server(service: Service, host: str | Sequence[str], port: int) -> Any:
             "app_mirror": service.mirror.status() if service.mirror is not None else None,
             # wa-call's state, or null when this daemon has no whatsapp transport.
             "whatsapp": whatsapp,
-            "degradations": degradations,
+            "degradations": service.degradations[-5:],
+            "notices": notices,
         }
 
     @server.route("POST", "/api/v1/call")
