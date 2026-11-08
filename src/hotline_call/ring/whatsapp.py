@@ -192,11 +192,11 @@ def _readline(sock: socket.socket) -> str:
 class _AudioListener:
     """The socket wa-call connects to for one call's audio, removed however it ends."""
 
-    def __init__(self) -> None:
+    def __init__(self, prefix: str = "wa") -> None:
         directory = runtime_dir() / "hotline-call"
         directory.mkdir(parents=True, exist_ok=True)
         os.chmod(directory, 0o700)
-        self.path = directory / f"wa-{uuid.uuid4().hex[:12]}.sock"
+        self.path = directory / f"{prefix}-{uuid.uuid4().hex[:12]}.sock"
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.bind(str(self.path))
         os.chmod(self.path, 0o600)

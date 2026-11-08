@@ -26,6 +26,7 @@ agent ──hotline-call──▶ hotline-calld :8792 ──SIP INVITE──▶ 
 | piece | what it does |
 |---|---|
 | `ring/sip.py`, `ring/telegram.py` | the doorbells: an outbound SIP INVITE with digest auth, or a Telegram user-account call |
+| `ring/webcall.py` | a call from a web page: its audio as raw PCM over a Unix socket, optionally connected straight to an agent |
 | `ring/whatsapp.py`, `media/pcmlink.py` | a WhatsApp call through [wa-call](https://github.com/BogdanStamenovic/wa-call)'s daemon, its audio as raw PCM over a Unix socket |
 | `ring/watch.py`, `ring/chain.py` | a ring counts only with evidence it rang (`180 Ringing`); a chain falls through on that evidence |
 | `ring/inbound.py` | keeps the account registered so he can dial hotline, answers his INVITE |
@@ -54,6 +55,7 @@ it is only missing from the app, and `/health` says so under `app_mirror`.
 | route | who calls it | body → reply |
 |---|---|---|
 | `POST /api/v1/call` | `hotline-call`, `hotline-registry`, any agent | unchanged from hotline-iosd: `{reason, context, source, agent, to, whatsapp, via, via_order, callee, engine, transport, ring_timeout, timeout, wait}` → `{call_id, conversation, state, reply, transcript, detail, waited_seconds, transport, via, rings_when_closed, fake, engine, note}` (see [WhatsApp](#whatsapp) for `whatsapp`/`via`) |
+| `POST /api/v1/webcall` | a web page's server | `{agent, asked}` → `{socket, conversation}`; see [Browser calls](#browser-calls) |
 | `POST /api/v1/call/reply` | hotline-iosd | `{conversation, text}` → `{conversation, known, waiting?}` |
 | `POST /api/v1/call/hangup` | hotline-iosd | `{call_id}` → `{call_id, ended}` |
 | `GET /health` | anyone | `ok` (false for a fake doorbell or one that did not start), `ring_ready`, `can_talk`, `transport`, `transports_available`, `inbound`, `active_calls`, `app_mirror`, `whatsapp` (wa-call's daemon and link state, or null), `degradations` |
@@ -63,6 +65,12 @@ Same gate as hotlined and hotline-iosd: loopback always allowed, otherwise the
 `HOTLINE_ALLOW_IPS` allowlist, plus `X-Hotline-Key` when `HOTLINE_API_KEY` is set.
 It binds `127.0.0.1` and the tailnet address `100.72.2.62` on port 8792 (8790
 and 8791 are taken there); if the tailnet bind fails it exits so systemd retries.
+
+## Browser calls
+
+`POST /api/v1/webcall` `{agent, asked}` → `{socket, conversation}` opens a call for a web page with a microphone, such as [room-studio](https://github.com/BogdanStamenovic/room-studio). The caller connects to the returned Unix socket within 15 s and exchanges s16le 16 kHz both ways; closing it ends the call. It is the same `VoiceCall.over(PcmPump)` a WhatsApp call uses, built like an inbound call because he started it.
+
+With `agent` set, that live agent is connected as the media starts, through the same `AgentBridge` as "spoji me sa <agent>", interrupting it if it is mid-turn. His first turn waits for the connection. If the agent cannot be connected, the error goes on the call's record and the Haiku voice keeps the call. The page and its microphone are the caller's job, not this daemon's.
 
 ## WhatsApp
 

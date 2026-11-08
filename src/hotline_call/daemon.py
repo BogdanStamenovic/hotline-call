@@ -627,6 +627,13 @@ class Service:
                 ask_stream = haiku.reply_stream
                 if bridge is not None:
                     ask_stream = bridge.stream_for(haiku)
+                    connect_to = getattr(link, "connect_agent", "")
+                    if connect_to:
+                        from .ring.webcall import connect_first
+
+                        ask_stream, link.on_media = connect_first(
+                            bridge, connect_to, ask_stream, getattr(link, "asked", ""),
+                            lambda text: append("error", text))
                 haiku.start()   # opens the API connection while the phone rings
                 if feat["streaming"]:
                     speak_stream = voice_stream
@@ -720,6 +727,23 @@ class Service:
         log.info("inbound call %s from %s: engine %s", conversation, call.caller,
                  engine or "classic")
         return _InboundLeg(self, conversation, handler, asyncio.get_running_loop())
+
+    async def web_call(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Open a call from a browser. See `ring/webcall.py`."""
+        from hotline.httpd import HttpError
+
+        from .ring.webcall import WebCall
+
+        if not self.can_talk:
+            raise HttpError(503, "this daemon has no voice or no ears")
+        call = WebCall(agent=str(body.get("agent", "")).strip(),
+                       asked=str(body.get("asked", "")).strip())
+        leg = await self._inbound_leg(call)
+        if leg is None:
+            call.close()
+            raise HttpError(503, "could not prepare the call")
+        call.start(leg)
+        return {"socket": str(call.path), "conversation": leg.conversation}
 
     async def place(self, body: dict[str, Any]) -> dict[str, Any]:
         """Ring him, then wait for him to answer in the app.
@@ -1114,6 +1138,11 @@ def build_server(service: Service, host: str | Sequence[str], port: int) -> Any:
     async def place(request: Any) -> tuple[int, dict[str, Any]]:
         service.authorise(request)
         return 200, await service.place(request.json())
+
+    @server.route("POST", "/api/v1/webcall")
+    async def web_call(request: Any) -> tuple[int, dict[str, Any]]:
+        service.authorise(request)
+        return 200, await service.web_call(request.json())
 
     @server.route("POST", "/api/v1/call/reply")
     async def typed_reply(request: Any) -> tuple[int, dict[str, Any]]:
