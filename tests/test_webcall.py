@@ -129,6 +129,7 @@ def test_a_failed_connect_is_reported_and_the_voice_keeps_the_call():
 def test_inbound_web_call_reaches_the_same_listener_contract():
     call = WebCall(agent="x", asked="y")
     assert call.caller == "web"
+    assert call.call_seconds > 1800, "a working session must outlast a phone call's cap"
     assert call.path.name.startswith("web-")
     assert not call.far_end_hung_up()
     call.close()

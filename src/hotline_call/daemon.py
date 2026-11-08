@@ -648,7 +648,11 @@ class Service:
                     agent = _Whole(lambda heard, f=whole: "".join(d for d in f(heard) if d))
                     ask_stream = None
 
+        extra_args = {}
+        if getattr(link, "call_seconds", None):
+            extra_args["call_seconds"] = link.call_seconds
         return AnsweredCall(
+            **extra_args,
             speak=speak,
             transcribe=lambda audio: str(transcriber.transcribe(audio)),
             fillers=self.fillers,

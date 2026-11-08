@@ -70,7 +70,7 @@ and 8791 are taken there); if the tailnet bind fails it exits so systemd retries
 
 `POST /api/v1/webcall` `{agent, asked}` → `{socket, conversation}` opens a call for a web page with a microphone, such as [room-studio](https://github.com/BogdanStamenovic/room-studio). The caller connects to the returned Unix socket within 15 s and exchanges s16le 16 kHz both ways; closing it ends the call. It is the same `VoiceCall.over(PcmPump)` a WhatsApp call uses, built like an inbound call because he started it.
 
-With `agent` set, that live agent is connected as the media starts, through the same `AgentBridge` as "spoji me sa <agent>", interrupting it if it is mid-turn. His first turn waits for the connection. If the agent cannot be connected, the error goes on the call's record and the Haiku voice keeps the call. The page and its microphone are the caller's job, not this daemon's.
+With `agent` set, that live agent is connected as the media starts, through the same `AgentBridge` as "spoji me sa <agent>", interrupting it if it is mid-turn. His first turn waits for the connection. If the agent cannot be connected, the error goes on the call's record and the Haiku voice keeps the call. The page and its microphone are the caller's job, not this daemon's. A browser call is capped at 2 hours rather than a phone call's 30 minutes, because it is a working session; his first two hit the shorter cap mid-design.
 
 ## WhatsApp
 

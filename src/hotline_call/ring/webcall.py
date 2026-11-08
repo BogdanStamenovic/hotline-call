@@ -27,6 +27,11 @@ log = logging.getLogger("hotline-call.ring.webcall")
 ACCEPT_WITHIN = 15.0
 """How long the page's server has to connect, after asking for the call."""
 
+CALL_SECONDS = 7200.0
+"""Longer than a phone call's 30-minute cap. His first two site calls both hit that cap
+mid-design (2026-11-08, 72 turns in the first): a working session, with pauses to go and
+measure, not a question."""
+
 _POLL = 0.25
 
 
@@ -35,6 +40,7 @@ class WebCall:
 
     def __init__(self, agent: str = "", asked: str = "") -> None:
         self.caller = "web"
+        self.call_seconds = CALL_SECONDS
         self.connect_agent = agent
         self.asked = asked
         self.on_media: Callable[[], None] | None = None
